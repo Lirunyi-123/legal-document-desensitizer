@@ -118,8 +118,9 @@ class Desensitizer:
         text = self._mask_bank_card(text)       # 16-19位数字（排除了已匹配的）
         text = self._mask_case_number(text)     # 案号
         text = self._mask_license_plate(text)  # 车牌号
-        text = self._mask_date(text)           # 日期
-        text = self._mask_person_name(text)    # 人名（角色词上下文）
+        # 人名和日期由LLM层处理（规则层不脱敏，避免误杀和结构破坏）
+        # text = self._mask_date(text)           # 日期（已移至LLM层）
+        # text = self._mask_person_name(text)    # 人名（已移至LLM层）
         text = self._mask_company_name(text)   # 公司名
         text = self._mask_address(text)        # 地址
         text = self._mask_amount(text)         # 金额（带单位的大额数字）
@@ -585,61 +586,21 @@ def read_text_from_file(filepath: str) -> str:
     elif ext == '.docx':
         try:
             from docx import Document
-            from docx.opc.constants import RELATIONSHIP_TYPE as RT
         except ImportError:
             sys.exit('❌ 需要安装 python-docx: pip3 install python-docx')
         doc = Document(filepath)
+        # 只提取正文段落文本（每段一行，保持结构映射）
         paragraphs = [p.text for p in doc.paragraphs]
-
-        # 提取页眉/页脚文本
-        header_footer_text = []
-        try:
-            for section in doc.sections:
-                if section.header:
-                    for p in section.header.paragraphs:
-                        if p.text.strip():
-                            header_footer_text.append(p.text)
-                if section.footer:
-                    for p in section.footer.paragraphs:
-                        if p.text.strip():
-                            header_footer_text.append(p.text)
-        except Exception:
-            pass  # 页眉页脚提取失败不影响主内容
-
-        # 提取批注文本
-        comments_text = []
-        try:
-            from docx.opc.part import Part
-            for rel in doc.part.rels.values():
-                if 'comment' in str(rel.reltype).lower():
-                    comment_part = rel.target_part
-                    if hasattr(comment_part, 'blob'):
-                        import xml.etree.ElementTree as ET
-                        root = ET.fromstring(comment_part.blob)
-                        ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-                        for text_elem in root.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
-                            if text_elem.text:
-                                comments_text.append(text_elem.text)
-        except Exception:
-            pass
-
-        # 也提取表格中的文本
+        # 表格文本附加在末尾
         tables_text = []
         for table in doc.tables:
             for row in table.rows:
                 cells = [cell.text for cell in row.cells]
                 tables_text.append(' | '.join(cells))
-
-        # 合并所有文本
-        parts = []
-        if header_footer_text:
-            parts.append('【页眉页脚】\n' + '\n'.join(header_footer_text))
-        parts.append('\n'.join(paragraphs))
-        if comments_text:
-            parts.append('【批注】\n' + '\n'.join(comments_text))
+        all_text = '\n'.join(paragraphs)
         if tables_text:
-            parts.append('【表格】\n' + '\n'.join(tables_text))
-        return '\n\n'.join(parts)
+            all_text += '\n\n' + '\n'.join(tables_text)
+        return all_text
 
     elif ext == '.pdf':
         try:

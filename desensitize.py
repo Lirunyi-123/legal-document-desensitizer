@@ -544,6 +544,55 @@ def read_text_from_file(filepath: str) -> str:
 
 
 # ============================================================
+# 文件写入（保留原格式 .txt → .txt, .docx → .docx）
+# ============================================================
+
+def write_desensitized_file(input_path: str, output_path: str, masked_text: str):
+    """将脱敏后的文本写出，尽量保留原文件格式"""
+    in_ext = os.path.splitext(input_path)[1].lower()
+    out_ext = os.path.splitext(output_path)[1].lower()
+
+    if out_ext == '.docx' or (out_ext == '' and in_ext == '.docx'):
+        # 输出为 .docx：基于原文档逐段替换，保留结构
+        try:
+            from docx import Document
+        except ImportError:
+            sys.exit('❌ 需要安装 python-docx: pip3 install python-docx')
+
+        orig_doc = Document(input_path)
+        lines = masked_text.split('\n')
+
+        # 逐段替换
+        para_idx = 0
+        for para in orig_doc.paragraphs:
+            if para_idx < len(lines):
+                # 保留原段落的部分格式（对齐方式等）
+                para.clear()
+                run = para.add_run(lines[para_idx])
+                para_idx += 1
+
+        # 处理表格
+        for table in orig_doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if para_idx < len(lines):
+                        for para in cell.paragraphs:
+                            para.clear()
+                            if para_idx < len(lines):
+                                para.add_run(lines[para_idx])
+                                para_idx += 1
+
+        orig_doc.save(output_path)
+        return output_path
+
+    else:
+        # 默认输出纯文本
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(masked_text)
+        return output_path
+
+
+# ============================================================
 # CLI 入口
 # ============================================================
 
@@ -570,9 +619,10 @@ def main():
   # 生成 LLM 脱敏提示词
   cat document.txt | python desensitize.py llm-prompt
 
-  # 读取文件（支持 .txt .docx .pdf）
-  python desensitize.py mask -f contract.docx
-  python desensitize.py mask -f contract.pdf
+  # 读取文件并输出同格式文件
+  python desensitize.py mask -f 合同.docx              # 自动生成 合同_desensitized.docx
+  python desensitize.py mask -f 证据.pdf -o 脱敏后.txt  # 指定输出路径
+  python desensitize.py mask -f 文档.txt               # 自动生成 文档_desensitized.txt
         """
     )
 
@@ -581,8 +631,10 @@ def main():
     # mask 命令
     mask_parser = subparsers.add_parser('mask', help='执行规则层脱敏')
     mask_parser.add_argument('-f', '--file', help='输入文件路径（默认从stdin读取）')
+    mask_parser.add_argument('-o', '--output', help='输出文件路径（默认自动生成，如输入为.docx则输出同名的_desensitized.docx）')
     mask_parser.add_argument('--json', action='store_true', help='以JSON格式输出')
     mask_parser.add_argument('--mapping', action='store_true', help='仅输出脱敏映射表')
+    mask_parser.add_argument('--save-mapping', help='脱敏映射表另存为文件')
 
     # scan 命令
     scan_parser = subparsers.add_parser('scan', help='扫描敏感信息（不替换）')
@@ -605,26 +657,30 @@ def main():
 
     if args.command == 'mask':
         result = d.mask(text)
-        if args.mapping:
-            print(result.to_markdown())
-        elif args.json:
-            print(result.to_json())
+
+        # 保存映射表到文件（如果指定了 --save-mapping）
+        if hasattr(args, 'save_mapping') and args.save_mapping:
+            with open(args.save_mapping, 'w', encoding='utf-8') as f:
+                f.write(result.to_markdown())
+            print(f'📋 映射表已保存: {args.save_mapping}')
+
+        # 输出到文件（如果指定了 -o 或输入是文件）
+        output_path = None
+        if hasattr(args, 'output') and args.output:
+            output_path = args.output
+        elif hasattr(args, 'file') and args.file and not args.json and not args.mapping:
+            base, ext = os.path.splitext(args.file)
+            output_path = f'{base}_desensitized{ext if ext else ".txt"}'
+
+        if output_path:
+            write_desensitized_file(args.file, output_path, result.text)
+            print(f'✅ 脱敏后文件已保存: {output_path}')
         else:
-            # 输出脱敏后文本 + 映射表摘要
-            print("=" * 60)
-            print("【脱敏后文本】")
-            print("=" * 60)
-            print(result.text)
-            print()
-            print("=" * 60)
-            print("【脱敏统计】")
-            for k, v in result.stats.items():
-                print(f"  {k}: {v}")
-            print()
-            print("=" * 60)
-            print("【脱敏映射表】（共 {} 项）".format(len(result.mapping)))
-            print("=" * 60)
-            print(result.to_markdown())
+            # 输出到 stdout
+            if args.mapping:
+                print(result.to_markdown())
+            elif args.json:
+                print(result.to_json())
 
     elif args.command == 'scan':
         findings = d.scan(text)

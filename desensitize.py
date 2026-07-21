@@ -120,6 +120,7 @@ class Desensitizer:
         text = self._mask_person_name(text)    # 人名（角色词上下文）
         text = self._mask_company_name(text)   # 公司名
         text = self._mask_address(text)        # 地址
+        text = self._mask_amount(text)         # 金额（带单位的大额数字）
 
         # 构建映射表
         mapping = []
@@ -251,14 +252,28 @@ class Desensitizer:
         )
 
     def _mask_wechat(self, text: str) -> str:
-        """微信号"""
-        # 微信号: xxx 或 微信: xxx
+        """微信号：匹配有前缀 或 独立出现的微信号模式"""
+        # 微信号: xxx 或 微信: xxx（有前缀，带冒号）
         text = re.sub(
-            r'(微信号|微信)\s*[：:]\s*\S+',
-            lambda m: m.group(1) + '：[微信号]',
+            r'(微信号|微信)\s*[：:]\s*([a-zA-Z][a-zA-Z0-9_]{4,19})',
+            lambda m: self._safe_replace_wechat(m.group(2), m.group(1)),
+            text
+        )
+        # 独立微信号：字母开头 + 字母数字下划线，6-20位
+        # 使用 [a-zA-Z0-9_] 而非 \w 避免匹配中文
+        # 排除邮箱（含@）、URL、纯数字
+        text = re.sub(
+            r'(?<![a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',
+            lambda m: self._safe_replace_wechat(m.group(1)),
             text
         )
         return text
+
+    def _safe_replace_wechat(self, original: str, prefix: str = '') -> str:
+        """记录微信号替换"""
+        self._replaced[original] = ('[微信号]', '微信号')
+        self._stats['微信号'] = self._stats.get('微信号', 0) + 1
+        return f'{prefix}：[微信号]' if prefix else '[微信号]'
 
     def _mask_qq(self, text: str) -> str:
         """QQ号"""
@@ -270,11 +285,12 @@ class Desensitizer:
         return text
 
     def _mask_bank_card(self, text: str) -> str:
-        """银行卡号：16-19位纯数字"""
+        """银行卡号：14-20位纯数字（覆盖各银行不同长度）"""
         # 注意：排除前面已匹配的身份证号(18位)、手机号(11位)的上下文
+        # 常见银行卡长度：招行16位、建行19位、部分旧卡15位、企业账户20位
         return self._safe_replace(
             text,
-            r'(?<!\d)(\d{16,19})(?!\d)',
+            r'(?<!\d)(\d{14,20})(?!\d)',
             '[银行账号]',
             '银行账号'
         )
@@ -406,13 +422,19 @@ class Desensitizer:
         """
         # 住所地/地址/位于 + 内容
         text = re.sub(
-            r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层))',
+            r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(）\)\s]{5,40}(?:号|室|层))',
             lambda m: self._record_addr(m.group(2), m.group(1)),
             text
         )
         # 独立的地理地址（省开头 + 详细到号/室）
         text = re.sub(
             r'([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层))',
+            lambda m: self._record_addr(m.group(1)),
+            text
+        )
+        # 独立城市级地址（市/区开头 + 详细到路/街/号）
+        text = re.sub(
+            r'((?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)）\s]{2,29}(?:号|室|层|栋|幢)(?:\d+)?)',
             lambda m: self._record_addr(m.group(1)),
             text
         )
@@ -424,6 +446,28 @@ class Desensitizer:
         self._stats['地址'] = self._stats.get('地址', 0) + 1
         return f'{prefix}：[地址]' if prefix else '[地址]'
 
+    def _mask_amount(self, text: str) -> str:
+        """
+        金额匹配：大额货币数值（人民币/美元/欧元等）
+        匹配格式：¥2,350,000元  236,000,000.00元  80万  3.6万  500美元  80万
+        排除：普通数字、日期、股票数量（带"股"）、百分比（带%）
+        """
+        # 带"元/美元/欧元"等单位的完整金额
+        text = self._safe_replace(
+            text,
+            r'(?:¥)?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?(?:[万千亿])?(?:元|美元|欧元|英镑|港币)(?![.\d万千亿])',
+            '[金额]',
+            '金额'
+        )
+        # 口语化金额：X万 / X.X万（无"元"后缀，如"借我80万""3.6万利息"）
+        text = self._safe_replace(
+            text,
+            r'(?<!\d)(\d+(?:\.\d+)?)[万千亿](?![.\d万千亿])',
+            '[金额]',
+            '金额'
+        )
+        return text
+
 
     def _get_all_rules(self):
         """返回所有规则（用于scan）"""
@@ -432,7 +476,7 @@ class Desensitizer:
             ('手机号', r'1[3-9]\d{9}', self._mask_phone),
             ('固定电话', r'0\d{2,3}[-\s]?\d{7,8}', self._mask_landline),
             ('邮箱', r'[\w.+-]+@[\w-]+\.[\w.-]+', self._mask_email),
-            ('银行账号', r'\d{16,19}', self._mask_bank_card),
+            ('银行账号', r'\d{14,20}', self._mask_bank_card),
             ('统一社会信用代码', r'[0-9A-Z]{18}', self._mask_credit_code),
             ('案号', r'\(?\d{4}\)?[\u4e00-\u9fa5]{1,10}\(?\d{1,6}\)?\d{0,3}号?', self._mask_case_number),
             ('车牌号', r'[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}', self._mask_license_plate),
@@ -440,6 +484,8 @@ class Desensitizer:
             ('人名', r'(原告|被告|法定代表人|委托诉讼代理人|审判员|书记员)[：:]\s*[\u4e00-\u9fa5]{2,3}', self._mask_person_name),
             ('公司名', r'[\u4e00-\u9fa5]{3,30}(?:有限公司|公司|集团|事务所)', self._mask_company_name),
             ('地址', r'[\u4e00-\u9fa5]{1,3}省[\u4e00-\u9fa5\s]{1,10}市[\u4e00-\u9fa5\s]{1,10}(?:区|县)[\u4e00-\u9fa5\d\s\-]{5,40}(?:号|室|层)', self._mask_address),
+            ('金额', r'(?:¥)?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?(?:[万千亿])?(?:元|美元|欧元|英镑|港币)(?![.\d万千亿])', self._mask_amount),
+            ('微信号', r'[a-zA-Z][a-zA-Z0-9_]{5,19}', self._mask_wechat),
         ]
 
 

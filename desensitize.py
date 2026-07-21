@@ -116,6 +116,9 @@ class Desensitizer:
         text = self._mask_case_number(text)     # 案号
         text = self._mask_license_plate(text)  # 车牌号
         text = self._mask_date(text)           # 日期
+        text = self._mask_person_name(text)    # 人名（角色词上下文）
+        text = self._mask_company_name(text)   # 公司名
+        text = self._mask_address(text)        # 地址
 
         # 构建映射表
         mapping = []
@@ -311,6 +314,116 @@ class Desensitizer:
             '日期'
         )
 
+    # --------------------------------------------------------
+    # 新增：人名 / 公司名 / 地址（规则层初步匹配）
+    # --------------------------------------------------------
+
+    def _mask_person_name(self, text: str) -> str:
+        """
+        在法律文书中，自然人人名常出现在角色词之后。
+        通过上下文匹配：原告/被告/法定代表人/委托诉讼代理人/审判员/书记员 + 分隔符 + 2~3字姓名
+        注意：被告后可能是公司名，此处仅捕获明确为2~3字的个人姓名。
+        """
+        role_patterns = [
+            # 角色词 + 冒号/逗号/空格 + 姓名，或直接跟姓名
+            r'(原告|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人)[：:，,，\s]*([\u4e00-\u9fa5]{2,3})(?=[，,。.\s（(]|\u3001|$|的)',
+            # 审判员/书记员 + 空格(可有可无) + 姓名（后跟任何字符，取最短匹配）
+            r'(审判员|书记员|审判长|代理审判员|代理审判长|人民陪审员)\s*([\u4e00-\u9fa5]{2,3})',
+        ]
+        for pat in role_patterns:
+            def make_replacer(p):
+                def replacer(m):
+                    role = m.group(1)
+                    name = m.group(2)
+                    # 角色占位符映射
+                    role_map = {
+                        '原告': '当事人甲', '被告': '当事人乙', '第三人': '当事人丙',
+                        '法定代表人': '法定代表人', '负责人': '负责人',
+                        '委托诉讼代理人': '委托代理人', '委托代理人': '委托代理人',
+                        '审判员': '法官', '审判长': '法官', '代理审判员': '法官',
+                        '书记员': '书记员', '人民陪审员': '人民陪审员',
+                        '联系人': '联系人',
+                    }
+                    placeholder = f'[{role_map.get(role, role)}]'
+                    # 记录映射
+                    self._replaced[name] = (placeholder, '人名')
+                    self._stats['人名'] = self._stats.get('人名', 0) + 1
+                    # 保留原文的分隔符（如果有），没有则用空格
+                    raw = m.group(0)
+                    after_role = raw[len(role):]
+                    delim = ''
+                    for ch in after_role:
+                        if ch in '：:，,　 ':
+                            delim += ch
+                        else:
+                            break
+                    if delim.strip():
+                        return f'{role}{delim}{placeholder}'
+                    else:
+                        return f'{role} {placeholder}'
+                return replacer
+            text = re.sub(pat, make_replacer(pat), text)
+        return text
+
+    def _mask_company_name(self, text: str) -> str:
+        """
+        公司/机构名称，匹配以下格式：
+        1. 完整公司名：XXX有限公司、XXX股份有限公司、XXX律师事务所等
+        2. 简称：XXX公司（3字以上 + 公司）
+        """
+        # 完整公司名
+        text = re.sub(
+            r'([\u4e00-\u9fa5（）\(\)]{4,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业))',
+            lambda m: self._record_company(m.group(1)),
+            text
+        )
+        # 律师事务所/会计师事务所等
+        text = re.sub(
+            r'([\u4e00-\u9fa5]{4,20}(?:律师事务所|会计师事务所|资产评估事务所))',
+            lambda m: self._record_company(m.group(1)),
+            text
+        )
+        # 简称：不少于3个中文字 + 公司
+        text = re.sub(
+            r'(?<!\w)([\u4e00-\u9fa5]{3,6})公司(?![\u4e00-\u9fa5])',
+            lambda m: self._record_company(m.group(1) + '公司'),
+            text
+        )
+        return text
+
+    def _record_company(self, name: str) -> str:
+        """记录公司名替换"""
+        placeholder = f'[公司]'
+        self._replaced[name] = (placeholder, '公司名')
+        self._stats['公司名'] = self._stats.get('公司名', 0) + 1
+        return placeholder
+
+    def _mask_address(self, text: str) -> str:
+        """
+        地址信息，匹配地理层级结构：
+        住所地/地址 + 内容，或 省/市/区/路/号 层级结构
+        """
+        # 住所地/地址/位于 + 内容
+        text = re.sub(
+            r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层))',
+            lambda m: self._record_addr(m.group(2), m.group(1)),
+            text
+        )
+        # 独立的地理地址（省开头 + 详细到号/室）
+        text = re.sub(
+            r'([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层))',
+            lambda m: self._record_addr(m.group(1)),
+            text
+        )
+        return text
+
+    def _record_addr(self, addr: str, prefix: str = '') -> str:
+        """记录地址替换"""
+        self._replaced[addr.replace(' ', '')] = ('[地址]', '地址')
+        self._stats['地址'] = self._stats.get('地址', 0) + 1
+        return f'{prefix}：[地址]' if prefix else '[地址]'
+
+
     def _get_all_rules(self):
         """返回所有规则（用于scan）"""
         return [
@@ -323,6 +436,9 @@ class Desensitizer:
             ('案号', r'\(?\d{4}\)?[\u4e00-\u9fa5]{1,10}\(?\d{1,6}\)?\d{0,3}号?', self._mask_case_number),
             ('车牌号', r'[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}', self._mask_license_plate),
             ('日期', r'\d{4}年\d{1,2}月\d{1,2}日', self._mask_date),
+            ('人名', r'(原告|被告|法定代表人|委托诉讼代理人|审判员|书记员)[：:]\s*[\u4e00-\u9fa5]{2,3}', self._mask_person_name),
+            ('公司名', r'[\u4e00-\u9fa5]{3,30}(?:有限公司|公司|集团|事务所)', self._mask_company_name),
+            ('地址', r'[\u4e00-\u9fa5]{1,3}省[\u4e00-\u9fa5\s]{1,10}市[\u4e00-\u9fa5\s]{1,10}(?:区|县)[\u4e00-\u9fa5\d\s\-]{5,40}(?:号|室|层)', self._mask_address),
         ]
 
 

@@ -76,6 +76,164 @@ class MaskResult:
 
 
 # ============================================================
+# 实体归一化与角色绑定
+# ============================================================
+
+class EntityResolver:
+    """实体归一化与角色绑定层
+    
+    解决问题：
+    1. 同一实体不同表述 → 统一ID（金进跃 = 原告金进跃 = 金进跃先生）
+    2. 公司名称无区分 → 按角色生成不同占位符（甲方/乙方/第三方）
+    3. 角色绑定基于上下文 → 而非出现顺序
+    4. 简称可链接到全称 → 鼎盛公司 → 杭州鼎盛房地产开发有限公司
+    """
+    
+    ROLE_LABELS = {
+        'plaintiff': '当事人甲（原告）',
+        'defendant': '当事人乙（被告）',
+        'third_party': '当事人丙（第三人）',
+        'judge': '法官',
+        'clerk': '书记员',
+        'lawyer': '委托代理人',
+        'legal_rep': '法定代表人',
+        'guarantor': '担保方',
+        'contract_a': '合同甲方',
+        'contract_b': '合同乙方',
+        'subcontractor': '分包方',
+    }
+    
+    COMPANY_ROLE_LABELS = {
+        'plaintiff': '合同甲方',
+        'defendant': '合同乙方',
+        'contract_a': '合同甲方',
+        'contract_b': '合同乙方',
+        'guarantor': '担保方',
+        'subcontractor': '分包方',
+        'third_party': '第三方公司',
+    }
+    
+    # 角色关键词 → 归一化角色名
+    ROLE_KEYWORDS = {
+        '原告': 'plaintiff', '上诉人': 'plaintiff', '申请执行人': 'plaintiff',
+        '被告': 'defendant', '被上诉人': 'defendant', '被执行人': 'defendant',
+        '第三人': 'third_party',
+        '审判员': 'judge', '审判长': 'judge', '代理审判员': 'judge',
+        '书记员': 'clerk',
+        '委托诉讼代理人': 'lawyer', '委托代理人': 'lawyer',
+        '法定代表人': 'legal_rep', '负责人': 'legal_rep',
+        '甲方': 'contract_a', '发包人': 'contract_a',
+        '乙方': 'contract_b', '承包人': 'contract_b',
+        '担保方': 'guarantor',
+    }
+    
+    def __init__(self):
+        self._canonical_map: Dict[str, str] = {}  # 归一化文本 → 统一ID
+        self._role_bindings: Dict[str, str] = {}  # 统一ID → 角色占位符
+        self._id_original: Dict[str, str] = {}    # 统一ID → 首次出现的原始文本
+        self._person_counter = 0
+        self._company_counter = 0
+    
+    def normalize(self, text: str) -> str:
+        """归一化文本：去空格、统一全半角、去冗余修饰"""
+        text = text.replace(' ', '').replace('\u3000', '').replace('\t', '')
+        # 去除常见称谓后缀
+        for suffix in ['先生', '女士', '同志', '律师', '法官']:
+            if text.endswith(suffix) and len(text) > len(suffix) + 1:
+                text = text[:-len(suffix)]
+        return text
+    
+    def normalize_company(self, name: str) -> str:
+        """公司名归一化：去除常见后缀以匹配简称"""
+        for suffix in ['有限公司', '股份有限公司', '有限责任公司', '集团公司', '合伙企业',
+                       '律师事务所', '会计师事务所', '事务所']:
+            if name.endswith(suffix):
+                return name[:-len(suffix)]
+        return name
+    
+    def resolve_person(self, name: str, role: str = '') -> tuple:
+        """
+        解析人名实体：归一化 → 分配或查找ID → 绑定角色 → 生成占位符
+        
+        返回: (entity_id, placeholder)
+        """
+        canonical = self.normalize(name)
+        role = self.ROLE_KEYWORDS.get(role, role)
+        
+        # 查找或创建
+        if canonical not in self._canonical_map:
+            self._person_counter += 1
+            ent_id = f'person_{self._person_counter}'
+            self._canonical_map[canonical] = ent_id
+            self._id_original[ent_id] = name
+        else:
+            ent_id = self._canonical_map[canonical]
+        
+        # 角色绑定（不覆盖已有角色，除非冲突）
+        if role and ent_id not in self._role_bindings:
+            self._role_bindings[ent_id] = role
+        
+        return ent_id, self._make_placeholder(ent_id)
+    
+    def resolve_company(self, name: str, role: str = '') -> tuple:
+        """
+        解析公司实体：处理全称和简称的归一化链接
+        """
+        # 先尝试精确匹配
+        if name in self._canonical_map:
+            ent_id = self._canonical_map[name]
+            if role and ent_id not in self._role_bindings:
+                self._role_bindings[ent_id] = role
+            return ent_id, self._make_placeholder(ent_id)
+        
+        # 归一化后匹配（简称链接到全称）
+        canonical = self.normalize_company(name)
+        for existing_canonical, existing_id in self._canonical_map.items():
+            if self.normalize_company(existing_canonical) == canonical:
+                self._canonical_map[name] = existing_id
+                if role and existing_id not in self._role_bindings:
+                    self._role_bindings[existing_id] = role
+                return existing_id, self._make_placeholder(existing_id)
+        
+        # 新实体
+        self._company_counter += 1
+        ent_id = f'company_{self._company_counter}'
+        self._canonical_map[name] = ent_id
+        self._id_original[ent_id] = name
+        if role:
+            self._role_bindings[ent_id] = role
+        
+        return ent_id, self._make_placeholder(ent_id)
+    
+    def _make_placeholder(self, entity_id: str) -> str:
+        """生成语义占位符"""
+        parts = entity_id.split('_')
+        entity_type = parts[0]
+        idx = parts[1]
+        
+        role = self._role_bindings.get(entity_id, '')
+        
+        if entity_type == 'company':
+            label = self.COMPANY_ROLE_LABELS.get(role, f'公司_{idx}')
+            return f'[{label}]'
+        else:
+            label = self.ROLE_LABELS.get(role, f'当事人_{idx}')
+            return f'[{label}]'
+    
+    def get_entity_original(self, entity_id: str) -> str:
+        """获取实体首次出现的原始文本"""
+        return self._id_original.get(entity_id, entity_id)
+    
+    def reset(self):
+        """重置解析器状态"""
+        self._canonical_map.clear()
+        self._role_bindings.clear()
+        self._id_original.clear()
+        self._person_counter = 0
+        self._company_counter = 0
+
+
+# ============================================================
 # 脱敏规则引擎
 # ============================================================
 
@@ -83,17 +241,13 @@ class Desensitizer:
     """法律文书脱敏器 — 规则引擎层"""
 
     def __init__(self):
+        # 实体归一化解析器（用于人名/公司名的角色绑定）
+        self._resolver = EntityResolver()
+        
         # 已替换的记录，避免重复替换
         self._replaced = {}   # original -> (replacement, type)
         self._counter = {}    # type -> counter for unique naming
         self._stats = {}      # type -> count
-
-        # 存储规则执行过程中需要跟踪的数据
-        self._person_counter = 0
-        self._company_counter = 0
-        self._address_counter = 0
-        self._court_counter = 0
-        self._party_counter = 0
 
     # --------------------------------------------------------
     # 核心方法
@@ -118,9 +272,8 @@ class Desensitizer:
         text = self._mask_bank_card(text)       # 16-19位数字（排除了已匹配的）
         text = self._mask_case_number(text)     # 案号
         text = self._mask_license_plate(text)  # 车牌号
-        # 人名和日期由LLM层处理（规则层不脱敏，避免误杀和结构破坏）
-        # text = self._mask_date(text)           # 日期（已移至LLM层）
-        # text = self._mask_person_name(text)    # 人名（已移至LLM层）
+        text = self._mask_date(text)           # 日期
+        text = self._mask_person_name(text)    # 人名（角色词上下文）
         text = self._mask_company_name(text)   # 公司名
         text = self._mask_address(text)        # 地址
         text = self._mask_amount(text)         # 金额（带单位的大额数字）
@@ -163,12 +316,10 @@ class Desensitizer:
     # --------------------------------------------------------
 
     def _reset(self):
+        self._resolver.reset()
         self._replaced = {}
         self._counter = {}
         self._stats = {}
-        self._person_counter = 0
-        self._company_counter = 0
-        self._address_counter = 0
         self._court_counter = 0
         self._party_counter = 0
 
@@ -358,35 +509,25 @@ class Desensitizer:
 
     def _mask_person_name(self, text: str) -> str:
         """
-        在法律文书中，自然人人名常出现在角色词之后。
-        通过上下文匹配：原告/被告/法定代表人/委托诉讼代理人/审判员/书记员 + 分隔符 + 2~3字姓名
-        注意：被告后可能是公司名，此处仅捕获明确为2~3字的个人姓名。
+        人名识别 + 实体归一化：
+        - 角色词后 2-4 字姓名（含4字复姓）
+        - 同一人物全文档用统一占位符 [当事人甲（原告）]
         """
         role_patterns = [
-            # 角色词 + 冒号/逗号/空格 + 姓名，或直接跟姓名
-            r'(原告|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人)[：:，,，\s]*([\u4e00-\u9fa5]{2,3})(?=[，,。.\s（(]|\u3001|$|的)',
-            # 审判员/书记员 + 空格(可有可无) + 姓名（后跟任何字符，取最短匹配）
-            r'(审判员|书记员|审判长|代理审判员|代理审判长|人民陪审员)\s*([\u4e00-\u9fa5]{2,3})',
+            r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,，\s]*([\u4e00-\u9fa5]{2,4})(?=[，,。.\s（(的]|\u3001|$)',
         ]
         for pat in role_patterns:
             def make_replacer(p):
                 def replacer(m):
                     role = m.group(1)
                     name = m.group(2)
-                    # 角色占位符映射
-                    role_map = {
-                        '原告': '当事人甲', '被告': '当事人乙', '第三人': '当事人丙',
-                        '法定代表人': '法定代表人', '负责人': '负责人',
-                        '委托诉讼代理人': '委托代理人', '委托代理人': '委托代理人',
-                        '审判员': '法官', '审判长': '法官', '代理审判员': '法官',
-                        '书记员': '书记员', '人民陪审员': '人民陪审员',
-                        '联系人': '联系人',
-                    }
-                    placeholder = f'[{role_map.get(role, role)}]'
+                    # 通过EntityResolver进行归一化和角色绑定
+                    _, placeholder = self._resolver.resolve_person(name, role)
                     # 记录映射
-                    self._replaced[name] = (placeholder, '人名')
+                    canonical = self._resolver.normalize(name)
+                    self._replaced[canonical] = (placeholder, '人名')
                     self._stats['人名'] = self._stats.get('人名', 0) + 1
-                    # 保留原文的分隔符（如果有），没有则用空格
+                    # 保留原文分隔符
                     raw = m.group(0)
                     after_role = raw[len(role):]
                     delim = ''
@@ -405,36 +546,48 @@ class Desensitizer:
 
     def _mask_company_name(self, text: str) -> str:
         """
-        公司/机构名称，匹配以下格式：
-        1. 完整公司名：XXX有限公司、XXX股份有限公司、XXX律师事务所等
-        2. 简称：XXX公司（3字以上 + 公司）
+        公司/机构名称识别 + 实体归一化：
+        - 全称/简称统一链接到同一实体
+        - 不同公司按角色生成不同占位符 [合同甲方] [合同乙方] [第三方公司]
         """
-        # 完整公司名
+        original = text  # 保留原文用于上下文角色检测
+        
+        def co_replacer(m):
+            name = m.group(1)
+            # 检查上下文中的角色词
+            role = ''
+            start = m.start()
+            context_before = original[max(0, start-25):start]
+            # 找最近的角色关键词（不是第一个）
+            role = ''
+            best_pos = -1
+            for kw, r in self._resolver.ROLE_KEYWORDS.items():
+                pos = context_before.rfind(kw)
+                if pos > best_pos:
+                    best_pos = pos
+                    role = r
+            _, placeholder = self._resolver.resolve_company(name, role)
+            self._replaced[name] = (placeholder, '公司名')
+            self._stats['公司名'] = self._stats.get('公司名', 0) + 1
+            return placeholder
+
         text = re.sub(
             r'([\u4e00-\u9fa5（）\(\)]{4,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业))',
-            lambda m: self._record_company(m.group(1)),
+            co_replacer,
             text
         )
-        # 律师事务所/会计师事务所等
         text = re.sub(
             r'([\u4e00-\u9fa5]{4,20}(?:律师事务所|会计师事务所|资产评估事务所))',
-            lambda m: self._record_company(m.group(1)),
+            co_replacer,
             text
         )
-        # 简称：不少于3个中文字 + 公司
         text = re.sub(
             r'(?<!\w)([\u4e00-\u9fa5]{3,6})公司(?![\u4e00-\u9fa5])',
-            lambda m: self._record_company(m.group(1) + '公司'),
+            co_replacer,
             text
         )
         return text
-
-    def _record_company(self, name: str) -> str:
-        """记录公司名替换"""
-        placeholder = f'[公司]'
-        self._replaced[name] = (placeholder, '公司名')
-        self._stats['公司名'] = self._stats.get('公司名', 0) + 1
-        return placeholder
+        return text
 
     def _mask_address(self, text: str) -> str:
         """

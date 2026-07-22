@@ -1,6 +1,8 @@
 # 法律文书脱敏工具 (Legal Document Desensitizer)
 
-规则引擎 + LLM 混合脱敏工具，专为法律文书设计。
+规则引擎 + EntityResolver 实体归一化 + LLM 混合脱敏工具，专为法律文书设计。
+
+> **v2.1 新特性**：EntityResolver 实体归一化 | SecureDesensitizer 内存安全模式 | 零信任 AES-256-GCM 加密映射表 | 文件名自动脱敏
 
 ## 功能
 
@@ -31,13 +33,23 @@ python desensitize.py scan -f 文档.docx
 # 生成 LLM 脱敏提示词
 python desensitize.py llm-prompt -f 文档.docx
 
+# v2.1 内存安全模式
+python desensitize.py mask -f 合同.docx --secure
+
+# v2.1 零信任加密映射表（密码不输出到终端）
+export DESENSITIZER_MAPPING_PASSWORD="your-password"
+python desensitize.py mask -f 合同.docx --save-mapping 映射表.enc --encrypt-mapping
+
+# v2.1 解密映射表
+python desensitize.py decrypt -f 映射表.enc -p "your-password"
+
 # JSON 格式输出
 python desensitize.py mask --json -f 文档.docx
 ```
 
 ## 脱敏覆盖范围
 
-### 规则层（11类）
+### 规则层（18类）+ EntityResolver 实体归一化
 身份证号、手机号、固定电话、邮箱、微信号、QQ号、银行卡号、统一社会信用代码、案号、律师执业证号、车牌号、日期
 
 ### LLM层（5类）
@@ -52,6 +64,13 @@ python desensitize.py mask --json -f 文档.docx
 - 结构化数据在本地就被替换，AI 永远不会看到真实号码
 - 脱敏映射表保存在本地，不上传
 - 即使 LLM 在云端，也接触不到最敏感的信息
+
+### v2.1 安全增强
+
+- **SecureDesensitizer**：`--secure` 启用内存安全模式，脱敏后尽力清空原始字符串引用
+- **零信任加密**：AES-256-GCM + PBKDF2 密码派生，密钥绝不输出到 stdout（修复 v2.0 Fernet 设计缺陷）
+- **文件名自动脱敏**：输出文件时自动替换文件名中的敏感信息（可通过 `--no-sanitize-filename` 禁用）
+- **EntityResolver**：同一人物/公司全文档统一占位符，公司简称自动链接到全称
 
 ### ⚠️ 安全等级说明：请根据你的需求选择脱敏深度
 

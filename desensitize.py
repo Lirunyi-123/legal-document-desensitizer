@@ -234,6 +234,91 @@ class EntityResolver:
 
 
 # ============================================================
+# SecureDesensitizer — 内存安全包装层
+# ============================================================
+
+class SecureDesensitizer(Desensitizer):
+    """安全增强版脱敏器 — 在标准脱敏基础上增加纵深防御措施。
+
+    与标准 Desensitizer 的区别：
+    - 脱敏完成后尽力清空传入文本对象的内存引用
+    - 触发垃圾回收以尽早释放中间字符串
+
+    局限性（Python 字符串不可变）：
+    - 无法真正擦除内存中的原始字符串（字符串不可变，旧对象可能仍被引用）
+    - 这是"尽力而为"的纵深防御，不是绝对的内存擦除
+    - 如需真正的内存安全，请在硬件安全模块 (HSM) 或机密计算环境中运行
+    """
+
+    def __init__(self, security_level: str = 'strict'):
+        super().__init__()
+        self._security_level = security_level
+        self._secure_mode = security_level in ('strict', 'high')
+        self._text_refs = []  # 跟踪传入的文本引用，便于后续清理
+
+    def mask(self, text: str) -> MaskResult:
+        """对文本执行规则层脱敏（安全增强版）"""
+        if self._secure_mode:
+            self._text_refs.append(text)
+
+        result = super().mask(text)
+
+        if self._secure_mode:
+            self._purge_text_refs()
+        return result
+
+    def _safe_replace(self, text: str, pattern: str, replacement: str,
+                      typ: str, original_group: int = 0) -> str:
+        """安全替换（安全增强版）：替换完成后尝试清除原字符串引用"""
+        result = super()._safe_replace(text, pattern, replacement, typ, original_group)
+
+        if self._secure_mode:
+            try:
+                text = ''
+            except Exception:
+                pass
+
+        return result
+
+    def _safe_replace_wechat(self, original: str, prefix: str = '') -> str:
+        """记录微信号替换（安全增强版）"""
+        result = super()._safe_replace_wechat(original, prefix)
+        if self._secure_mode:
+            try:
+                original = ''
+            except Exception:
+                pass
+        return result
+
+    def _record_addr(self, addr: str, prefix: str = '') -> str:
+        """记录地址替换（安全增强版）"""
+        result = super()._record_addr(addr, prefix)
+        if self._secure_mode:
+            try:
+                addr = ''
+            except Exception:
+                pass
+        return result
+
+    def _purge_text_refs(self):
+        """清空所有跟踪的文本引用并触发垃圾回收。"""
+        import gc
+        for i in range(len(self._text_refs)):
+            try:
+                self._text_refs[i] = ''
+            except Exception:
+                pass
+        self._text_refs.clear()
+        gc.collect()
+
+    def flush(self):
+        """手动触发内存清理（如多次调用 mask 后集中清理）。"""
+        self._purge_text_refs()
+        import gc
+        gc.collect()
+
+
+# ============================================================
 # 脱敏规则引擎
 # ============================================================
 
@@ -725,6 +810,176 @@ def make_llm_prompt(rule_masked_text: str) -> str:
 
 
 # ============================================================
+# 零信任映射表加密（AES-256-GCM + PBKDF2）
+# ============================================================
+
+def _get_mapping_password() -> str:
+    """获取映射表加密密码。优先级：环境变量 > 交互式输入。
+
+    环境变量：DESENSITIZER_MAPPING_PASSWORD
+    交互式输入：使用 getpass（不回显）
+    """
+    password = os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '')
+    if password:
+        return password
+
+    # 交互式输入
+    try:
+        import getpass
+        password = getpass.getpass('🔑 请输入映射表加密密码（不显示）：')
+        if not password:
+            sys.exit('❌ 密码不能为空')
+        confirm = getpass.getpass('🔑 请再次输入密码确认：')
+        if password != confirm:
+            sys.exit('❌ 两次输入的密码不一致')
+        return password
+    except Exception as e:
+        sys.exit(f'❌ 无法读取密码（请设置环境变量 DESENSITIZER_MAPPING_PASSWORD）：{e}')
+
+
+def save_mapping_encrypted(mapping_content: str, filepath: str) -> bytes:
+    """使用 AES-256-GCM + PBKDF2 加密映射表。
+
+    加密方案：
+    - PBKDF2HMAC(SHA256, 600,000次迭代) 从密码+随机盐派生 32字节 AES 密钥
+    - AES-256-GCM 认证加密（带 12 字节随机 nonce）
+    - 文件格式：salt(32B) + nonce(12B) + ciphertext
+
+    密码来源：
+    - 环境变量 DESENSITIZER_MAPPING_PASSWORD（推荐用于自动化）
+    - 或交互式 getpass 输入（不 echo）
+    """
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.primitives import hashes
+    except ImportError:
+        sys.exit('❌ 需要安装 cryptography: pip3 install cryptography')
+
+    password = _get_mapping_password()
+
+    # 生成随机盐和随机 nonce
+    salt = os.urandom(32)
+    nonce = os.urandom(12)
+
+    # PBKDF2 密钥派生
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=600_000,
+    )
+    key = kdf.derive(password.encode('utf-8'))
+
+    # AES-256-GCM 加密
+    aesgcm = AESGCM(key)
+    ciphertext = aesgcm.encrypt(nonce, mapping_content.encode('utf-8'), None)
+
+    # 合并：salt + nonce + ciphertext
+    output = salt + nonce + ciphertext
+
+    with open(filepath, 'wb') as f:
+        f.write(output)
+
+    # 清理内存中的密码和密钥
+    password = ''
+    key = b'\x00' * 32
+
+    return salt  # 返回 salt（用于密码验证，不包含密钥）
+
+
+def decrypt_mapping_encrypted(filepath: str, password: str) -> str:
+    """解密 AES-256-GCM 加密的映射表。
+
+    Args:
+        filepath: 加密文件路径
+        password: 解密密码（明文字符串，使用后立即清零）
+
+    Returns:
+        解密后的映射表内容（字符串）
+    """
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.primitives import hashes
+    except ImportError:
+        sys.exit('❌ 需要安装 cryptography: pip3 install cryptography')
+
+    with open(filepath, 'rb') as f:
+        data = f.read()
+
+    # 检查是否是旧版 Fernet 格式（迁移提示）
+    if len(data) < 44:  # salt(32) + nonce(12) 至少 44 字节
+        sys.exit(
+            '⚠️  此文件可能是旧版 Fernet 加密格式（v2.0），不兼容当前 AES-GCM 格式。\n'
+            '   请使用旧版 desensitize.py 解密后重新加密。\n'
+            '   旧版命令：python desensitize.py decrypt -f <文件> -k <Fernet密钥>'
+        )
+
+    salt = data[:32]
+    nonce = data[32:44]
+    ciphertext = data[44:]
+
+    # PBKDF2 密钥派生
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=600_000,
+    )
+    key = kdf.derive(password.encode('utf-8'))
+
+    # AES-GCM 解密
+    try:
+        aesgcm = AESGCM(key)
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    except Exception:
+        sys.exit('❌ 解密失败：密码错误或文件已损坏')
+
+    # 清理内存中的密码和密钥
+    password = ''
+    key = b'\x00' * 32
+
+    return plaintext.decode('utf-8')
+
+
+# ============================================================
+# 文件名自动脱敏
+# ============================================================
+
+def sanitize_filename(filepath: str) -> str:
+    """自动将文件名中的敏感信息替换为脱敏占位符。
+
+    对文件名的 basename 部分（不含目录）执行规则层脱敏，
+    保留扩展名和目录路径不变。
+
+    示例：
+        "金进跃诉张三合同.docx" → "[当事人甲]诉[当事人乙]合同.docx"
+        "北京华信科技有限公司_判决书.pdf" → "[公司]_判决书.pdf"
+
+    注意：
+    - 规则层可能无法识别所有类型的人名/公司名（如英文名、简称）
+    - 这是"尽力而为"的辅助功能，建议手动检查结果
+    """
+    dir_part = os.path.dirname(filepath)
+    basename = os.path.basename(filepath)
+
+    # 分离名称和扩展名
+    name, ext = os.path.splitext(basename)
+
+    # 对名称部分执行规则层脱敏
+    d = Desensitizer()
+    result = d.mask(name)
+
+    sanitized_name = result.text
+    sanitized_basename = sanitized_name + ext
+
+    if dir_part:
+        return os.path.join(dir_part, sanitized_basename)
+    return sanitized_basename
+
+
+# ============================================================
 # 文件读取（支持 .txt / .docx / .pdf）
 # ============================================================
 
@@ -884,11 +1139,19 @@ def main():
   # 生成 LLM 脱敏提示词
   cat document.txt | python desensitize.py llm-prompt
 
-  # 保存加密的映射表
+  # v2.1: 零信任加密映射表（密码不输出到终端）
+  export DESENSITIZER_MAPPING_PASSWORD="your-password"
   python desensitize.py mask -f 合同.docx --save-mapping 映射表.enc --encrypt-mapping
-  python desensitize.py mask -f 合同.docx              # 自动生成 合同_desensitized.docx
-  python desensitize.py mask -f 证据.pdf -o 脱敏后.txt  # 指定输出路径
-  python desensitize.py mask -f 文档.txt               # 自动生成 文档_desensitized.txt
+
+  # v2.1: 内存安全增强模式
+  python desensitize.py mask -f 合同.docx --secure
+
+  # 文件名自动脱敏（默认启用）
+  python desensitize.py mask -f 金进跃诉张三合同.docx
+  # → 输出: [当事人甲]诉[当事人乙]合同_desensitized.docx
+
+  # 解密映射表（v2.1 AES-GCM）
+  python desensitize.py decrypt -f 映射表.enc -p "your-password"
         """
     )
 
@@ -902,6 +1165,10 @@ def main():
     mask_parser.add_argument('--mapping', action='store_true', help='仅输出脱敏映射表')
     mask_parser.add_argument('--save-mapping', help='脱敏映射表另存为文件（⚠️ 包含原始值，建议配合 --encrypt-mapping 使用）')
     mask_parser.add_argument('--encrypt-mapping', action='store_true', help='对映射表进行 AES-256 加密保存（需配合 --save-mapping 使用）')
+    mask_parser.add_argument('--secure', action='store_true', default=False, help='启用内存安全增强模式（尽力清空原始文本引用）')
+    mask_parser.add_argument('--security-level', default='strict', choices=['strict', 'high', 'standard'],
+                             help='安全等级：strict/high（启用纵深防御）、standard（默认，无额外内存清理）')
+    mask_parser.add_argument('--no-sanitize-filename', action='store_true', default=False, help='禁用输出文件名自动脱敏')
 
     # scan 命令
     scan_parser = subparsers.add_parser('scan', help='扫描敏感信息（不替换）')
@@ -915,25 +1182,49 @@ def main():
     # decrypt 命令
     decrypt_parser = subparsers.add_parser('decrypt', help='解密加密的映射表文件')
     decrypt_parser.add_argument('-f', '--file', required=True, help='加密的映射表文件路径')
-    decrypt_parser.add_argument('-k', '--key', required=True, help='解密密钥')
+    decrypt_parser.add_argument('-k', '--key', help='Fernet 解密密钥（v2.0 旧格式兼容，不推荐）')
+    decrypt_parser.add_argument('-p', '--password', help='AES-GCM 解密密码（v2.1+，优先使用。也可通过环境变量 DESENSITIZER_MAPPING_PASSWORD 设置）')
     decrypt_parser.add_argument('-o', '--output', help='输出路径（默认输出到 stdout）')
 
     args = parser.parse_args()
 
     # 读取输入（支持 .txt / .docx / .pdf）
     if hasattr(args, 'file') and args.file:
-        # 检查文件名是否含敏感信息（姓名、公司名等）
+        # 文件名自动脱敏检查
         basename = os.path.basename(args.file)
         name_hint = re.findall(r'[\u4e00-\u9fa5]{2,4}(?:诉|与|vs|VS|\.)', basename)
         if name_hint:
-            print('⚠️  警告：文件名可能包含客户信息（{}）'.format('、'.join(name_hint[:3])))
-            print('⚠️  建议重命名文件后重新处理，或在输出文件中检查文件名是否泄露')
+            no_sanitize = hasattr(args, 'no_sanitize_filename') and args.no_sanitize_filename
+            if no_sanitize:
+                print('⚠️  警告：文件名可能包含客户信息（{}）'.format('、'.join(name_hint[:3])))
+                print('⚠️  已通过 --no-sanitize-filename 禁用自动脱敏，请手动检查')
+            else:
+                sanitized_name = sanitize_filename(basename)
+                print(f'🔄 文件名已自动脱敏：{basename} → {sanitized_name}')
+                # 将脱敏后的文件名信息保存，供后续输出路径使用
+                args._sanitized_basename = sanitized_name
+        else:
+            args._sanitized_basename = None
 
         text = read_text_from_file(args.file)
     else:
         text = sys.stdin.read()
 
     d = Desensitizer()
+
+    # 如果启用了内存安全增强，使用 SecureDesensitizer
+    secure_mode = False
+    if hasattr(args, 'secure') and args.secure:
+        secure_mode = True
+    if hasattr(args, 'security_level') and args.security_level in ('strict', 'high'):
+        secure_mode = True
+
+    if secure_mode:
+        level = args.security_level if hasattr(args, 'security_level') else 'strict'
+        d = SecureDesensitizer(security_level=level)
+        if sys.stderr.isatty():
+            print(f'🔒 内存安全增强模式已启用 (security_level={level})', file=sys.stderr)
+            print(f'   ⚠️  Python 字符串不可变，内存清理为"尽力而为"的纵深防御', file=sys.stderr)
 
     if args.command == 'mask':
         result = d.mask(text)
@@ -944,21 +1235,14 @@ def main():
             mapping_path = args.save_mapping
 
             if hasattr(args, 'encrypt_mapping') and args.encrypt_mapping:
-                # AES-256 加密保存
+                # AES-256-GCM + PBKDF2 加密保存（v2.1 零信任方案）
                 try:
-                    from cryptography.fernet import Fernet
+                    save_mapping_encrypted(mapping_content, mapping_path)
                 except ImportError:
                     sys.exit('❌ 需要安装 cryptography: pip3 install cryptography')
-
-                key = Fernet.generate_key()
-                cipher = Fernet(key)
-                encrypted = cipher.encrypt(mapping_content.encode('utf-8'))
-                with open(mapping_path, 'wb') as f:
-                    f.write(encrypted)
-                print(f'🔐 映射表已加密保存: {mapping_path}')
-                print(f'🔑 解密密钥（请妥善保管，丢失无法恢复）:')
-                print(f'   {key.decode()}')
-                print(f'   ⚠️  此密钥请勿上传到任何AI服务或网络')
+                print(f'🔐 映射表已 AES-256-GCM 加密保存: {mapping_path}')
+                print(f'🔑 解密时需要输入相同的密码')
+                print(f'   💡 设置环境变量 DESENSITIZER_MAPPING_PASSWORD 可跳过交互式输入')
             else:
                 # 明文保存（默认行为，发出警告）
                 with open(mapping_path, 'w', encoding='utf-8') as f:
@@ -973,8 +1257,18 @@ def main():
         if hasattr(args, 'output') and args.output:
             output_path = args.output
         elif hasattr(args, 'file') and args.file and not args.json and not args.mapping:
-            base, ext = os.path.splitext(args.file)
-            output_path = f'{base}_desensitized{ext if ext else ".txt"}'
+            # 优先使用脱敏后的文件名（由 sanitize_filename 生成）
+            sanitized_basename = getattr(args, '_sanitized_basename', None)
+            if sanitized_basename:
+                dir_part = os.path.dirname(args.file)
+                name, ext = os.path.splitext(sanitized_basename)
+                if dir_part:
+                    output_path = os.path.join(dir_part, f'{name}_desensitized{ext}')
+                else:
+                    output_path = f'{name}_desensitized{ext}'
+            else:
+                base, ext = os.path.splitext(args.file)
+                output_path = f'{base}_desensitized{ext if ext else ".txt"}'
 
         if output_path:
             write_desensitized_file(args.file, output_path, result.text)
@@ -1020,17 +1314,45 @@ def main():
         print(make_llm_prompt(result.text))
 
     elif args.command == 'decrypt':
-        from cryptography.fernet import Fernet
-        key = args.key.encode('utf-8') if not args.key.startswith('b') else eval(args.key)
-        cipher = Fernet(key)
+        # 读取完整文件数据用于格式检测
         with open(args.file, 'rb') as f:
-            decrypted = cipher.decrypt(f.read())
+            file_data = f.read()
+
+        # 自动检测加密格式：新 AES-GCM vs 旧 Fernet
+        # Fernet 加密文件：token 的 base64 编码以 gAAAAA 开头
+        # AES-GCM：前 32 字节是随机 salt，无固定模式
+        is_fernet = file_data.startswith(b'gAAAAA') and len(file_data) < 2000
+
+        if is_fernet or (args.key and not args.password):
+            # 旧版 Fernet 解密（向后兼容）
+            if not args.key:
+                sys.exit(
+                    '⚠️  检测到旧版 Fernet 加密格式（v2.0）。\n'
+                    '   请使用 -k 参数提供 Fernet 解密密钥。\n'
+                    '   或重新用 v2.0 工具解密后，用 v2.1 重新加密。'
+                )
+            from cryptography.fernet import Fernet
+            key = args.key.encode('utf-8') if not args.key.startswith('b') else eval(args.key)
+            cipher = Fernet(key)
+            decrypted = cipher.decrypt(file_data)
+            print('⚠️  使用旧版 Fernet 格式解密成功。建议用 v2.1 的 AES-GCM 重新加密。', file=sys.stderr)
+        else:
+            # 新版 AES-GCM 解密
+            password = args.password or os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '')
+            if not password:
+                import getpass
+                password = getpass.getpass('🔑 请输入映射表解密密码（不显示）：')
+                if not password:
+                    sys.exit('❌ 密码不能为空')
+            decrypted = decrypt_mapping_encrypted(args.file, password).encode('utf-8')
+            password = ''
+
         if args.output:
-            with open(args.output, 'w', encoding='utf-8') as f:
-                f.write(decrypted.decode('utf-8'))
+            with open(args.output, 'w', encoding='utf-8') as out_f:
+                out_f.write(decrypted.decode('utf-8') if isinstance(decrypted, bytes) else decrypted)
             print(f'✅ 已解密: {args.output}')
         else:
-            print(decrypted.decode('utf-8'))
+            print(decrypted.decode('utf-8') if isinstance(decrypted, bytes) else decrypted)
 
     else:
         parser.print_help()

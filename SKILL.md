@@ -218,6 +218,54 @@ python3 desensitize.py mask -f 证据.pdf -o 脱敏后.txt
 - ✅ 映射表完整可追溯
 - ⚠️ 语义占位符保留原角色的区分度（不同角色不同占位符）
 
+---
+
+## v2.1 安全纵深防御（新增）
+
+### 内存安全增强模式
+
+通过 `--secure` 或 `--security-level strict` 启用 `SecureDesensitizer`：
+
+```bash
+python3 desensitize.py mask -f 合同.docx --secure
+python3 desensitize.py mask -f 合同.docx --security-level strict
+```
+
+脱敏完成后会尽力清空内存中的原始文本引用并触发垃圾回收。
+⚠️ 注意：Python 字符串不可变，此为"尽力而为"的纵深防御。
+
+### 映射表零信任加密
+
+v2.1 采用 AES-256-GCM + PBKDF2 密码派生加密，**不再将密钥打印到终端**：
+
+```bash
+# 方式 1：环境变量（推荐用于自动化）
+export DESENSITIZER_MAPPING_PASSWORD="your-strong-password"
+python3 desensitize.py mask -f 合同.docx --save-mapping 映射表.enc --encrypt-mapping
+
+# 方式 2：交互式输入（推荐用于手动操作）
+python3 desensitize.py mask -f 合同.docx --save-mapping 映射表.enc --encrypt-mapping
+# → 提示输入密码（不 echo）
+
+# 解密
+python3 desensitize.py decrypt -f 映射表.enc -p "your-strong-password"
+```
+
+旧版 Fernet 加密文件仍可通过 `-k` 解密（自动检测格式）。
+
+### 文件名自动脱敏
+
+输出文件时自动对含有敏感信息的文件名执行规则层脱敏：
+
+```
+输入：金进跃诉张三合同.docx
+输出：[当事人甲]诉[当事人乙]合同_desensitized.docx
+```
+
+禁用：`--no-sanitize-filename`
+
+---
+
 ## 安全注意事项
 
 - 脱敏映射表是敏感文件，应妥善保管

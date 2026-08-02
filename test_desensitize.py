@@ -305,6 +305,13 @@ class TestRealCaseFixes(unittest.TestCase):
         remaining = scan_remaining_risk('[审理法院]已受理，[合同乙方]施工。')
         self.assertEqual(remaining, [])
 
+    def test_case_number_ocr_space(self):
+        # OCR 版案号在"字第"与数字、数字与"号"之间夹空格（审阅清单暴露的缺口）
+        r = self.d.mask('据(2015)杭余民初字第 1819号民事判决书，'
+                        '另见(2015)  杭余民初字第1819 号。')
+        self.assertNotIn('1819', r.text)
+        self.assertEqual(r.text.count('[案号]'), 2)
+
     def test_restore_person_no_delimiter(self):
         # 无分隔符人名不插空格，还原后与原文完全一致
         self._roundtrip('原告陈建国，被告李四。')

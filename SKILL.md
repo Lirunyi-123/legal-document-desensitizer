@@ -50,8 +50,8 @@ allowed-tools: read_file, write_file, grep, ls, glob
 
 ### 5. 验证方法（每次改规则后必跑）
 ```bash
-python3 -m unittest test_desensitize     # 58 个单测（含还原往返/审阅清单）
-python3 evaluate.py                      # 59 个红队用例，含新增实战负样本
+python3 -m unittest test_desensitize     # 59 个单测（含还原往返/审阅清单）
+python3 evaluate.py                      # 60 个红队用例，含新增实战负样本
 python3 desensitize.py mask -f 判决书.docx --save-mapping 映射表.md
 python3 desensitize.py restore -f 判决书_desensitized.docx -m 映射表.md -o 还原.docx
 # 还原后与原文逐段比对，要求 0 差异

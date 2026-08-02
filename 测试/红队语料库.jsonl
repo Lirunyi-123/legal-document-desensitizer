@@ -20,6 +20,7 @@
 {"id": "case_01", "note": "民事案号", "text": "案号：(2024)京0108民初12345号", "expect_masked": [{"type": "案号", "value": "(2024)京0108民初12345号"}], "expect_kept": []}
 {"id": "case_02", "note": "省高院案号", "text": "本院（2025）浙民终123号民事判决书", "expect_masked": [{"type": "案号", "value": "（2025）浙民终123号"}], "expect_kept": []}
 {"id": "case_03", "note": "普通年份文本不是案号", "text": "2024年签订的合同继续有效", "expect_masked": [], "expect_kept": ["2024年签订的合同继续有效"]}
+{"id": "case_04", "note": "OCR 空格案号（字第与数字、数字与号之间夹空格）", "text": "据(2015)杭余民初字第 1819号民事判决书认定，另见(2015)  杭余民初字第1819 号。", "expect_masked": [{"type": "案号", "value": "(2015)杭余民初字第 1819号"}, {"type": "案号", "value": "(2015)  杭余民初字第1819 号"}], "expect_kept": []}
 {"id": "plate_01", "note": "新能源车牌", "text": "车辆浙AD12345停于车库", "expect_masked": [{"type": "车牌号", "value": "浙AD12345"}], "expect_kept": []}
 {"id": "birth_01", "note": "出生日期（上下文在前）", "text": "出生日期：1985年8月15日", "expect_masked": [{"type": "出生日期", "value": "1985年8月15日"}], "expect_kept": []}
 {"id": "birth_02", "note": "出生日期（上下文在后）", "text": "原告1985年8月15日出生", "expect_masked": [{"type": "出生日期", "value": "1985年8月15日"}], "expect_kept": []}

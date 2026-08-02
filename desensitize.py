@@ -1312,10 +1312,13 @@ class Desensitizer:
         )
 
     def _mask_case_number(self, text: str) -> str:
-        """案号：(2024)京0108民初12345号 / （2025）浙民终123号 — 排除年月日误匹配"""
+        """案号：(2024)京0108民初12345号 / （2025）浙民终123号 / OCR 空格版
+        "杭余民初字第 1819号" — 排除年月日误匹配；只容忍行内空格，不跨换行"""
         return self._safe_replace(
             text,
-            r'[（(]?\d{4}[）)]?(?![年月日])[\u4e00-\u9fa5]{1,10}\d{0,6}[\u4e00-\u9fa5]{0,6}\d{1,6}号',
+            r'[（(]?[ \t]*\d{4}[ \t]*[）)]?[ \t]*(?![年月日])'
+            r'[\u4e00-\u9fa5]{1,10}[ \t]*\d{0,6}[ \t]*'
+            r'[\u4e00-\u9fa5]{0,6}[ \t]*\d{1,6}[ \t]*号',
             '[案号]',
             '案号'
         )
@@ -1864,7 +1867,9 @@ class Desensitizer:
              'handler': self._mask_credit_code_bare, 'group': 1, 'validate': credit_confidence,
              'value_group': 1},
             {'type': '案号',
-             'pattern': r'[（(]?\d{4}[）)]?(?![年月日])[\u4e00-\u9fa5]{1,10}\d{0,6}[\u4e00-\u9fa5]{0,6}\d{1,6}号',
+             'pattern': r'[（(]?[ \t]*\d{4}[ \t]*[）)]?[ \t]*(?![年月日])'
+                        r'[\u4e00-\u9fa5]{1,10}[ \t]*\d{0,6}[ \t]*'
+                        r'[\u4e00-\u9fa5]{0,6}[ \t]*\d{1,6}[ \t]*号',
              'handler': self._mask_case_number},
             {'type': '车牌号',
              'pattern': r'(?<![A-Za-z0-9])[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}(?![\dA-Za-z])',

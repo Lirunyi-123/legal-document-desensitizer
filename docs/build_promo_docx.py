@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""生成 宣传介绍.docx（launch_messaging_guide 预设）。"""
+"""生成 简介.docx（launch_messaging_guide 预设）。"""
 
 import os
 
@@ -321,7 +321,7 @@ def main():
     npf.space_after = Pt(6)
     npf.line_spacing = 300 / 240.0
 
-    add_header_footer(doc, '法律文书脱敏工具 · 宣传介绍')
+    add_header_footer(doc, '法律文书脱敏工具 · 简介')
 
     # ---------- 标题块 ----------
     t = para(doc, '法律文书脱敏工具', size=24, bold=True, color=INK_BLUE,
@@ -507,7 +507,7 @@ def main():
 
     # 输出到脚本所在目录（docs/），从仓库根目录执行也能正确落位
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       '宣传介绍.docx')
+                       '简介.docx')
     doc.save(out)
     print('saved', out)
 

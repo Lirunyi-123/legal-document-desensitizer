@@ -109,6 +109,25 @@ python desensitize.py mask -f 聊天记录.txt --all-dates
 > 
 > 完整脱敏 = 规则层 + LLM层（二选一：本地模型或云端AI）
 
+## 推送工具（github.com 直连受限时）
+
+`api-push.py` 通过 GitHub Git API 推送提交，适用于 github.com 无法直连、
+但 api.github.com 可达的网络环境（如国内网络）。
+
+```bash
+# 推送指定文件
+python3 api-push.py -m "fix: 修复xxx" desensitize.py
+
+# 推送全部工作区改动，并同步本地历史（SHA 与远程一致）
+python3 api-push.py -m "feat: xxx" --all --sync-local
+
+# 先看将执行什么，不实际推送
+python3 api-push.py -m "test" --all --dry-run
+```
+
+Token 按 `--token` → `GITHUB_PAT_TOKEN` → gh 配置文件（`~/.config/gh/hosts.yml`）
+的顺序自动读取；网络恢复后仍可直接使用标准 `git push`。
+
 ## 授权
 
 MIT License

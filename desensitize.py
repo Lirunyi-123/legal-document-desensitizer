@@ -410,8 +410,10 @@ _COMPANY_OFFICE_PATTERN = re.compile(
 )
 _COMPANY_SHORT_PATTERN = re.compile(
     # 前不能紧贴中文/字母（避免吞掉更长公司名中的片段）；
+    # 但"建设单位怡丰成公司""与怡丰成公司"等前接连接字时也命中
     # 2~6 字简称 + 公司（"华临公司""方汇公司""元勤公司"等，含 OCR 空格）
-    r'(?<![\u4e00-\u9fa5A-Za-z0-9])((?:[\u4e00-\u9fa5]' + _INLINE_SP
+    r'(?:(?<![\u4e00-\u9fa5A-Za-z0-9])|(?<=[位与为系由向对在的及和或是称等也并就]))'
+    r'((?:[\u4e00-\u9fa5]' + _INLINE_SP
     + r'){2,6}公' + _INLINE_SP + r'司)'
 )
 
@@ -447,6 +449,29 @@ def _trim_company_span(span: str) -> tuple:
         return '', span
     prefix = span[:len(span) - len(name)]
     return name, prefix
+
+
+# ============================================================
+# 项目名称（"怡丰城项目/小区/一标段"→[项目名称]；避开"本项目/工程项目"等泛化词组）
+# ============================================================
+
+_PROJECT_SUFFIX = (
+    r'(?:项目|小区|花园|公寓|家园|新村|大厦|广场|商城|'
+    r'一期|二期|三期|一标段|二标段|三标段|项目部)'
+)
+_PROJECT_PATTERN = re.compile(
+    r'(?:(?<![\u4e00-\u9fa5])|(?<=[涉案]))([\u4e00-\u9fa5]{2,6})'
+    + _PROJECT_SUFFIX
+)
+_PROJECT_GENERIC_SINGLE = set(
+    '本该此各每全大小新旧上下前后一期号年月日及与和的之为在对把被子而是且或从向给等'
+    '以由将并也还又再都曾均已未不无有所区案涉')
+_PROJECT_GENERIC_WORDS = set(
+    ('建设 工程 施工 开发 建筑 招标 投标 监理 设计 勘察 装修 装饰 绿化 市政 道路 '
+     '桥梁 隧道 轨道 交通 商业 住宅 办公 写字楼 保障 安置 廉租 经适 地块 案涉 涉案 '
+     '相关 其他 上述 下列 以下 所在 新建 在建 竣工 验收 总包 分包 承包 拆迁 旧改 '
+     '城市 更新 房地产 楼盘 标段 项目 小区 花园 公寓 家园 新村 大厦 广场 商城 '
+     '公司 集团 有限 股份 标准 质量 安全 文明').split())
 
 
 # ============================================================
@@ -682,6 +707,7 @@ class Desensitizer:
             text = self._mask_birthdate(text)   # 仅带出生上下文的日期
         text = self._mask_person_name(text)    # 人名（角色词上下文）
         text = self._mask_company_name(text)   # 公司名
+        text = self._mask_project_name(text)   # 项目名称（公司名之后，避免吞掉公司简称）
         text = self._mask_bare_person_names(text)  # 裸人名（姓氏启发式 + 角色名传播）
         text = self._mask_address(text)        # 地址
         text = self._mask_amount(text)         # 金额（带单位的大额数字）
@@ -1694,6 +1720,39 @@ class Desensitizer:
             text = re.sub(pat, co_replacer, text)
         return text
 
+    def _mask_project_name(self, text: str) -> str:
+        """项目名称：怡丰城项目/怡丰城小区/怡丰城一标段 → [项目名称]。
+
+        放在公司名之后执行（公司简称如"怡丰城公司"已先被替换）；
+        只匹配"专名+项目/小区/标段"等复合词，避开"本项目/工程项目"等泛化词组。
+        """
+        out = []
+        scan = 0
+        pending = 0
+        shift = [0]
+        while True:
+            m = _PROJECT_PATTERN.search(text, scan)
+            if not m:
+                break
+            name = m.group(1)
+            original = m.group(0)
+            # 泛化词组/占位符内部不替换；无效匹配从下一位重试，
+            # 避免"案涉怡丰城项目"被"案涉怡丰城+项目"整段吞掉
+            if (_inside_placeholder(text, m.start())
+                    or name[0] in _PROJECT_GENERIC_SINGLE
+                    or any(w in name for w in _PROJECT_GENERIC_WORDS)):
+                scan = m.start() + 1
+                continue
+            out.append(text[pending:m.start()])
+            out.append('[项目名称]')
+            self._record(original, '[项目名称]', '项目名称')
+            self._record_event(m.start() + shift[0], original, '[项目名称]')
+            shift[0] += len('[项目名称]') - len(original)
+            scan = m.end()
+            pending = m.end()
+        out.append(text[pending:])
+        return ''.join(out)
+
     def _mask_address(self, text: str) -> str:
         """
         地址信息，匹配地理层级结构：
@@ -1709,7 +1768,7 @@ class Desensitizer:
 
         # 住所地/地址/位于 + 内容
         text = re.sub(
-            r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(）\) ]{5,40}(?:号|室|层))',
+            r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)[\u4e00-\u9fa5\d\-（\(）\) ]{5,40}(?:号|室|层))',
             # 前缀用相对偏移（m.start(2)-m.start(0)），避免地址前半截残留在文本中
             lambda m: addr_replacer(
                 m, m.group(2),
@@ -1718,7 +1777,7 @@ class Desensitizer:
         )
         # 独立的地理地址（省开头 + 详细到号/室）
         text = re.sub(
-            r'([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层))',
+            r'([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层))',
             lambda m: addr_replacer(m, m.group(1), ''),
             text
         )
@@ -1730,13 +1789,13 @@ class Desensitizer:
         )
         # 无省市区层级的地址：小区/花园/公寓/大厦/苑/里/村/镇/区 + 栋/单元/室/楼/号
         text = re.sub(
-            r'([\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\-]{1,12}(?:号|栋|幢|单元|室|楼|座|层))',
+            r'([\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|栋|幢|单元|室|楼|座|层))',
             lambda m: addr_replacer(m, m.group(1), ''),
             text
         )
         # 路/街/大道/巷 + 门牌号（无需"区"前缀，如"莫干山路100号"）
         text = re.sub(
-            r'([\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\-]{1,12}(?:号|弄|栋|幢|单元|室|楼|座))',
+            r'([\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|弄|栋|幢|单元|室|楼|座))',
             lambda m: addr_replacer(m, m.group(1), ''),
             text
         )
@@ -1885,8 +1944,11 @@ class Desensitizer:
                         + _COMPANY_OFFICE_PATTERN.pattern + '|'
                         + _COMPANY_SHORT_PATTERN.pattern,
              'handler': self._mask_company_name, 'value_fn': 'company'},
+            {'type': '项目名称',
+             'pattern': _PROJECT_PATTERN.pattern,
+             'handler': self._mask_project_name},
             {'type': '地址',
-             'pattern': r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?|[\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\-]{1,12}(?:号|栋|幢|单元|室|楼|座|层)|[\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\-]{1,12}(?:号|弄|栋|幢|单元|室|楼|座)',
+             'pattern': r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?|[\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|栋|幢|单元|室|楼|座|层)|[\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|弄|栋|幢|单元|室|楼|座)',
              'handler': self._mask_address, 'value_fn': 'address'},
             {'type': '金额（中文大写）',
              'pattern': r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?'
@@ -2497,8 +2559,10 @@ _REMAINING_PATTERNS = (
         r'(?:公司|事务所|集团|商行|经营部|服务部|商店)')),
     ('地址残留', re.compile(
         r'[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,12}(?:市)'
-        r'[\u4e00-\u9fa5 ]{1,12}(?:区|县|市)[\u4e00-\u9fa5\d\- ]{3,30}(?:号|室|层)'
+        r'[\u4e00-\u9fa5 ]{1,12}(?:区|县|市|镇)[\u4e00-\u9fa5\d\- ]{3,30}(?:号|室|层)'
         r'|[\u4e00-\u9fa5]{2,10}(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-]{1,10}(?:号|栋|弄)')),
+    ('项目名称残留', re.compile(
+        r'([\u4e00-\u9fa5]{2,6})(?:项目|小区|大厦|花园|公寓|家园|新村|广场|商城)')),
     ('金额残留', re.compile(
         r'\d[\d,，.]{3,}[ \t]*[万千亿]?[ \t]*(?:元|美元|欧元)'
         r'|(?<!\d)\d{7,}(?:\.\d{1,3})?(?!\d)')),
@@ -2520,6 +2584,11 @@ def scan_remaining_risk(masked_text: str) -> list:
         for m in pat.finditer(masked_text):
             if _inside_placeholder(masked_text, m.start()):
                 continue
+            if typ == '项目名称残留':
+                name = m.group(1)
+                if (name[0] in _PROJECT_GENERIC_SINGLE
+                        or any(w in name for w in _PROJECT_GENERIC_WORDS)):
+                    continue
             value = m.group(0)
             start = max(0, m.start() - 12)
             ctx = masked_text[start:m.end() + 12].replace('\n', ' ')

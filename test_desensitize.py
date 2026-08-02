@@ -312,6 +312,22 @@ class TestRealCaseFixes(unittest.TestCase):
         self.assertNotIn('1819', r.text)
         self.assertEqual(r.text.count('[案号]'), 2)
 
+    def test_address_ocr_spaces_town(self):
+        # 原告户籍地址：OCR 空格 + 镇级地址（东阳市歇山镇圳干村）
+        r = self.d.mask('原告住浙江省 东 阳 市 歇 山 镇 圳 干 村  1-414     号，汉族。')
+        self.assertIn('[地址]', r.text)
+        self.assertNotIn('1-414', r.text)
+        self.assertNotIn('歇山', r.text)
+
+    def test_project_name_masked(self):
+        # 项目名称（怡丰城项目/小区/一标段）→ [项目名称]；泛化词组保留
+        r = self.d.mask('案涉怡丰城项目复工，怡丰城小区物业沟通，怡丰城一标段开工，'
+                        '本项目继续施工，工程进度正常。')
+        self.assertEqual(r.text.count('[项目名称]'), 3)
+        self.assertNotIn('怡丰城', r.text)
+        self.assertIn('本项目', r.text)
+        self.assertIn('工程进度', r.text)
+
     def test_restore_person_no_delimiter(self):
         # 无分隔符人名不插空格，还原后与原文完全一致
         self._roundtrip('原告陈建国，被告李四。')

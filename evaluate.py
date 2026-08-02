@@ -138,6 +138,8 @@ def main():
     parser.add_argument('--llm-model', default='qwen2.5', help='LLM 模型名')
     parser.add_argument('--llm-endpoint', default='http://localhost:11434',
                         help='LLM 服务地址')
+    parser.add_argument('--llm-api-key', default='',
+                        help='云端 API Key（也可用环境变量 LLM_API_KEY）')
     parser.add_argument('--llm-timeout', type=int, default=180,
                         help='LLM 调用超时（秒）')
     args = parser.parse_args()
@@ -147,7 +149,8 @@ def main():
         from llm_layer import LLMConfig
         d = FullPipeline(
             LLMConfig(api=args.llm_api, model=args.llm_model,
-                      endpoint=args.llm_endpoint, timeout=args.llm_timeout),
+                      endpoint=args.llm_endpoint, timeout=args.llm_timeout,
+                      api_key=args.llm_api_key),
             mask_all_dates=args.all_dates)
         llm_mode = True
     else:

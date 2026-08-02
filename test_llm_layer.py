@@ -121,5 +121,60 @@ class TestReorderMergedMapping(unittest.TestCase):
         self.assertEqual([m.order for m in out], [1, 2])
 
 
+class TestCloudAPI(unittest.TestCase):
+    """云端 OpenAI 兼容 API 通道（不发真实请求，全部 mock）。"""
+
+    def test_chat_url_variants(self):
+        from llm_layer import _chat_url
+        cases = {
+            'https://dashscope.aliyuncs.com/compatible-mode':
+                'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+            'https://api.deepseek.com':
+                'https://api.deepseek.com/v1/chat/completions',
+            'https://open.bigmodel.cn/api/paas/v4':
+                'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+            'http://localhost:1234':
+                'http://localhost:1234/v1/chat/completions',
+        }
+        for endpoint, expected in cases.items():
+            self.assertEqual(_chat_url(endpoint), expected)
+
+    def test_openai_call_sends_key_and_parses(self):
+        from llm_layer import call_llm, LLMConfig
+        captured = {}
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({
+                    'choices': [{'message': {
+                        'content': '### 脱敏后文本\nX\n\n### 补充映射表\n[]'}}]
+                }).encode('utf-8')
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=180):
+            captured['url'] = req.full_url
+            captured['headers'] = dict(req.headers)
+            captured['body'] = json.loads(req.data.decode('utf-8'))
+            return FakeResp()
+
+        with mock.patch('llm_layer.urllib.request.urlopen',
+                        side_effect=fake_urlopen):
+            out = call_llm('prompt', LLMConfig(
+                api='openai', model='qwen-plus',
+                endpoint='https://dashscope.aliyuncs.com/compatible-mode',
+                api_key='sk-test-123'))
+
+        self.assertIn('/v1/chat/completions', captured['url'])
+        self.assertEqual(captured['headers']['Authorization'], 'Bearer sk-test-123')
+        self.assertEqual(captured['body']['model'], 'qwen-plus')
+        self.assertEqual(captured['body']['temperature'], 0.0)
+        self.assertIn('### 脱敏后文本', out)
+
+
 if __name__ == '__main__':
     unittest.main()

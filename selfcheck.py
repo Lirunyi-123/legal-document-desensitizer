@@ -11,6 +11,8 @@
 环境变量：
     SELFCHECK_LLM_ENDPOINT  指定 LLM 地址（如 http://localhost:11434）
     SELFCHECK_LLM_MODEL     指定模型名（默认 qwen2.5）
+    SELFCHECK_LLM_API       ollama（默认）或 openai（云端 OpenAI 兼容 API）
+    LLM_API_KEY             云端 API Key（openai 模式需要）
 
 输出：每项 PASS / FAIL / SKIP / WARN，全部必检项通过时退出码 0。
 """
@@ -103,6 +105,7 @@ print("EXACT" if back == text else "DIFF")
 def llm_layer(args):
     endpoint = os.environ.get('SELFCHECK_LLM_ENDPOINT', 'http://localhost:11434')
     model = os.environ.get('SELFCHECK_LLM_MODEL', 'qwen2.5')
+    api = os.environ.get('SELFCHECK_LLM_API', 'ollama')
     if not args.llm and not _endpoint_alive(endpoint):
         return (None, f'未检测到 LLM 服务（{endpoint}），已跳过；'
                       f'如需检查请先启动 ollama serve 或设 SELFCHECK_LLM_ENDPOINT')
@@ -110,7 +113,7 @@ def llm_layer(args):
 import sys
 sys.path.insert(0, {REPO_DIR!r})
 from llm_layer import LLMConfig, full_desensitize
-cfg = LLMConfig(api='ollama', model={model!r}, endpoint={endpoint!r}, timeout=60)
+cfg = LLMConfig(api={api!r}, model={model!r}, endpoint={endpoint!r}, timeout=60)
 try:
     r, _ = full_desensitize('张三欠李四钱不还。\\n原告：陈建国。', cfg)
     ok = '[当事人' in r.text and '张三' not in r.text
@@ -129,9 +132,12 @@ except Exception as e:
 
 def _endpoint_alive(endpoint, timeout=3):
     import urllib.request
+    import urllib.error
     try:
         urllib.request.urlopen(endpoint, timeout=timeout)
         return True
+    except urllib.error.HTTPError:
+        return True  # 服务有响应（401/404 也算可达）
     except Exception:
         return False
 

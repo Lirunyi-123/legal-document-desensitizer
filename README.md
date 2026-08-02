@@ -102,6 +102,45 @@ python desensitize.py full -f 判决书.docx --llm-api openai \
 
 **数据安全**：默认仅连接本机 Ollama（localhost），规则层之后才发送文本。务必确认 endpoint 是本地或可信服务。
 
+## 不部署本地模型：云端 API 方案（二选一即可）
+
+**不想装 Ollama、不想下载模型？用云端 API 一样能跑 full。** 机器上什么都不用装，
+只要有一个 API Key：
+
+```bash
+# 通义千问（阿里云百炼，新用户有免费额度）
+export LLM_API_KEY="你的通义APIKey"
+python3 desensitize.py full -f 判决书.docx --llm-api openai \
+  --llm-model qwen-plus --llm-endpoint https://dashscope.aliyuncs.com/compatible-mode
+
+# DeepSeek
+export LLM_API_KEY="你的DeepSeekAPIKey"
+python3 desensitize.py full -f 判决书.docx --llm-api openai \
+  --llm-model deepseek-chat --llm-endpoint https://api.deepseek.com
+
+# 智谱 GLM
+export LLM_API_KEY="你的智谱APIKey"
+python3 desensitize.py full -f 判决书.docx --llm-api openai \
+  --llm-model glm-4-plus --llm-endpoint https://open.bigmodel.cn/api/paas/v4
+```
+
+也可用 `--llm-api-key "xxx"` 直接传 Key（会留在 shell 历史里，建议用环境变量）。
+
+### 云端方案的安全边界（必须知道）
+
+- 规则层先把身份证号、手机号、银行卡号等**结构化数据替换成占位符**，
+  所以发送给云端的文本里没有这些号码
+- 但**人名、地址、案情细节会发送给 API 服务商**——这取决于你对"数据出境/交给第三方"的接受度
+- 涉密程度高的材料，请优先本地 Ollama 方案；可接受第三方处理时，云端方案零部署、开箱即用
+- 评测照常可用：`python3 evaluate.py --llm-api openai --llm-model qwen-plus --llm-endpoint https://dashscope.aliyuncs.com/compatible-mode`
+
+### 两个方案怎么选
+
+| 方案 | 部署成本 | 数据去向 | 适用 |
+|------|---------|---------|------|
+| 本地 Ollama | 下载 4~5GB 模型，需 8GB+ 内存 | 不出本机 | 涉密材料、高隐私要求 |
+| 云端 API | 零部署，注册拿 Key | 发送给服务商（已先脱敏结构化数据） | 无本地硬件、接受第三方处理 |
+
 ### evaluate --llm 评测模式
 
 ```bash

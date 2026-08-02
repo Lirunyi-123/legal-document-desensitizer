@@ -249,6 +249,28 @@ python3 desensitize.py full -f 判决书.docx --llm-api openai \
 **失败安全**：LLM 输出若增删行、改动已有占位符、声称替换的值仍残留，全部拒绝采用并中止，
 不产出未经验证的"完整脱敏"文档。映射合并后 `restore` 一键无损还原。
 
+### 不部署本地模型：云端 API 同样可用
+
+`full` 支持任何 OpenAI 兼容 API，机器上无需安装任何模型：
+
+```bash
+# 通义千问（阿里云百炼）
+export LLM_API_KEY="你的Key"
+python3 desensitize.py full -f 判决书.docx --llm-api openai \
+  --llm-model qwen-plus --llm-endpoint https://dashscope.aliyuncs.com/compatible-mode
+
+# DeepSeek
+python3 desensitize.py full -f 判决书.docx --llm-api openai \
+  --llm-model deepseek-chat --llm-endpoint https://api.deepseek.com
+
+# 智谱 GLM
+python3 desensitize.py full -f 判决书.docx --llm-api openai \
+  --llm-model glm-4-plus --llm-endpoint https://open.bigmodel.cn/api/paas/v4
+```
+
+注意：云端方案会把规则层处理后的文本（人名/地址/案情细节仍在）发送给 API 服务商，
+结构化号码已在规则层被替换。涉密材料请用本地 Ollama 方案。
+
 ### LLM 评测模式
 
 ```bash

@@ -31,16 +31,41 @@ from desensitize import Mapping, MaskResult, Desensitizer, SecureDesensitizer
 
 
 class LLMConfig:
-    """LLM 层配置"""
+    """LLM 层配置
+
+    api: 'ollama'（本地，默认）或 'openai'（OpenAI 兼容云端 API，
+         通义千问 / DeepSeek / 智谱 / LM Studio 等）
+    endpoint:
+        - ollama: 本地服务地址，默认 http://localhost:11434
+        - openai: API 基础地址（不含 /v1 与 /chat/completions），如
+          https://dashscope.aliyuncs.com/compatible-mode
+          https://api.deepseek.com
+          https://open.bigmodel.cn/api/paas/v4
+    api_key: 云端 API Key；为空时读取环境变量 LLM_API_KEY
+    """
 
     def __init__(self, api: str = 'ollama',
                  model: str = 'qwen2.5',
                  endpoint: str = 'http://localhost:11434',
-                 timeout: int = 180):
+                 timeout: int = 180,
+                 api_key: str = ''):
         self.api = api
         self.model = model
         self.endpoint = endpoint.rstrip('/')
         self.timeout = timeout
+        self.api_key = api_key
+
+
+def _chat_url(endpoint: str) -> str:
+    """由 API 基础地址推导 /chat/completions 完整地址。
+
+    - 基础地址已含 /v1、/v4 等版本段（DeepSeek/智谱）→ 直接拼 /chat/completions
+    - 其余（通义 compatible-mode、LM Studio）→ 拼 /v1/chat/completions
+    """
+    endpoint = endpoint.rstrip('/')
+    if endpoint.endswith(('/v1', '/v4', '/v2', '/v3')):
+        return f'{endpoint}/chat/completions'
+    return f'{endpoint}/v1/chat/completions'
 
 
 FULL_PROMPT_TEMPLATE = """你是一个严谨的法律文书脱敏专家。下面是一份**已经完成规则层脱敏**的法律文书（身份证号、手机号、银行卡号等结构化数据已被替换为 [占位符]）。
@@ -86,14 +111,14 @@ class LLMLayerError(Exception):
 def call_llm(prompt: str, config: LLMConfig) -> str:
     """调用 LLM 并返回响应文本。"""
     if config.api == 'openai':
-        url = f"{config.endpoint}/v1/chat/completions"
+        url = _chat_url(config.endpoint)
         payload = {
             'model': config.model,
             'messages': [{'role': 'user', 'content': prompt}],
             'temperature': 0.0,
         }
         headers = {'Content-Type': 'application/json'}
-        api_key = os.environ.get('LLM_API_KEY', '')
+        api_key = config.api_key or os.environ.get('LLM_API_KEY', '')
         if api_key:
             headers['Authorization'] = f'Bearer {api_key}'
     else:

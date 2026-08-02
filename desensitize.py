@@ -1787,6 +1787,8 @@ def main():
     full_parser.add_argument('--llm-model', default='qwen2.5', help='LLM 模型名')
     full_parser.add_argument('--llm-endpoint', default='http://localhost:11434',
                              help='LLM 服务地址（Ollama 默认 http://localhost:11434）')
+    full_parser.add_argument('--llm-api-key', default='',
+                             help='云端 API Key（OpenAI 兼容 API；也可用环境变量 LLM_API_KEY）')
     full_parser.add_argument('--llm-timeout', type=int, default=180,
                              help='LLM 调用超时（秒）')
 
@@ -2012,7 +2014,8 @@ def main():
         from llm_layer import LLMConfig, full_desensitize, LLMLayerError
 
         config = LLMConfig(api=args.llm_api, model=args.llm_model,
-                           endpoint=args.llm_endpoint, timeout=args.llm_timeout)
+                           endpoint=args.llm_endpoint, timeout=args.llm_timeout,
+                           api_key=args.llm_api_key)
         if sys.stderr.isatty():
             print('⚠️  完整脱敏会将规则层处理后的文本发送到 LLM 服务：'
                   f'{config.endpoint}（模型 {config.model}）', file=sys.stderr)

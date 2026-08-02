@@ -327,7 +327,7 @@ def main():
     para(doc, 'Legal Document Desensitizer', size=12, color=GRAY, after=10)
     para(doc, '面向中国律师与法律实务的本地优先文书脱敏工具', size=13, bold=True,
          color=H1_BLUE, after=4)
-    meta = '规则引擎 + 语义占位符 + 可选 LLM 层 ｜ 加密映射表 ｜ 一键无损还原 ｜ 红队评测量化'
+    meta = '规则引擎 + 语义占位符 ｜ 两阶段工作流（审阅清单） ｜ 加密映射表 ｜ 一键无损还原 ｜ 红队评测量化'
     para(doc, meta, size=10, color=GRAY, after=12)
 
     # 核心承诺 callout
@@ -389,10 +389,12 @@ def main():
         ('失败安全，不盲目信任模型',
          'LLM 层输出若增删行数、改动已有占位符、声称替换的值仍残留原文，整套输出被拒绝并中止。'),
         ('可复现、可自检',
-         'selfcheck.py 一键验证文件、56 项单元测试、红队评测、还原往返，任何拷贝跑一遍即可比对一致性。'),
-        ('灵活的 LLM 层（可选）',
-         '本地 Ollama（数据不出本机）或云端 OpenAI 兼容 API（通义/DeepSeek/智谱，零部署），'
-         '覆盖最后两类盲区：案情敏感细节与裸公司简称。'),
+         'selfcheck.py 一键验证文件、58 项单元测试、红队评测、还原往返，任何拷贝跑一遍即可比对一致性。'),
+        ('两阶段工作流，无需接入任何外部 API',
+         '阶段一（规则层）：关键信息本地必清，mask --review 一次生成脱敏文书 + 审阅清单，'
+         '自动校验关键信息清零并列出剩余低优先级项；阶段二（语义层）：律师审阅后说'
+         '"继续语义层脱敏"，配置了本技能的 AI 直接执行，无需 Ollama、无需 API Key；'
+         '本地/云端模型仍为可选替代，不再是默认依赖。'),
         ('实战打磨，专治 OCR 扫描版文书',
          '以 42 页 OCR 扫描判决书做端到端验证：387/387 段无损还原（映射表逐字节一致，'
          '含数字与单位间带空格/尾随空格的写法）；角色词后名词不再误伤（提供担保/处签名/印章/私章）；'
@@ -413,9 +415,10 @@ def main():
     code_block(doc, [
         'python3 desensitize.py scan -f 判决书.docx                  # 扫描敏感信息',
         'python3 desensitize.py mask -f 判决书.docx                  # 规则层脱敏（零模型）',
+        'python3 desensitize.py mask -f 判决书.docx --review         # 阶段一：脱敏+审阅清单',
         'python3 desensitize.py mask -f 合同.docx --save-mapping 映射表.enc --encrypt-mapping',
         'python3 desensitize.py restore -f 合同_desensitized.docx -m 映射表.enc -o 还原.docx',
-        'python3 desensitize.py full -f 判决书.docx --llm-model qwen2.5   # 规则层+本地LLM',
+        'python3 desensitize.py full -f 判决书.docx --llm-model qwen2.5   # 可选：规则层+本地LLM',
         'python3 evaluate.py                                          # 红队评测',
         'python3 selfcheck.py                                         # 一键自检',
     ])
@@ -428,25 +431,28 @@ def main():
     make_table(doc,
                ['操作', '替换了什么', '还剩什么', '能否上传云端 AI'],
                [
-                   ['规则层 mask', '20+ 类结构化数据 + 角色/裸人名 + 地址 + 金额',
-                    '案情敏感细节、裸公司简称', '⚠️ 不建议直接上传'],
+                   ['规则层 mask（阶段一）', '关键信息（身份证/手机/银行卡/案号等）+ 人名/公司名/地址/金额',
+                    '法院名称、案情细节、公司简称、OCR 变体', '⚠️ 须先经审阅清单确认'],
+                   ['规则层 + Agent 语义层（默认，无需外部 API）', '上述全部 + 语义层低优先级信息',
+                    '无', '✅ 可以'],
                    ['规则层 + 本地 LLM（full）', '上述全部 + 案情细节/公司名', '无', '✅ 可以（模型在本地）'],
                    ['规则层 + 云端 API（full）', '上述全部', '无', '✅ 但 LLM 那一步数据会到服务商'],
                ],
-               [1.35, 2.25, 1.45, 1.45])
+               [1.65, 2.25, 1.35, 1.25])
     para(doc, '', size=4, after=2)
     add_heading(doc, '必须知道的三件事', 2)
     warn_id = add_numbering(doc, bullet=False)
-    for s in ['只跑规则层就把文件上传 AI，姓名和案情细节仍在泄露。',
+    for s in ['规则层结果必须先过审阅清单：mask --review 的关键信息校验要 ✅，剩余低优先级项逐条确认后再使用。',
               '映射表是敏感文件：含全部原始值，务必加密保存（--encrypt-mapping），切勿上传网络。',
               '云端 LLM 方案数据出境：人名、地址、案情会发送给 API 服务商；涉密材料请用本地 '
-              'Ollama 或纯规则层 + 人工复核。']:
+              'Ollama 或默认的 Agent 语义层（无需外部 API）。']:
         list_item(doc, warn_id, s)
 
     # ---------- 已知不足 ----------
     add_heading(doc, '已知不足与边界（不回避）', 1)
     limit_id = add_numbering(doc, bullet=True)
-    for s in ['LLM 层仍需外部模型：案情敏感细节、裸公司简称两类只能靠 LLM（本地或云端），规则层不承诺覆盖。',
+    for s in ['语义层需要"配置了本技能的 AI"来执行：无 AI 环境批量处理时才需本地 Ollama 或云端 API 作为替代；'
+              '规则层不承诺覆盖法院名称、案情敏感细节、裸公司简称、OCR 变体写法。',
               '裸人名是启发式：罕见姓氏、单次出现的数字三字名、网络昵称存在漏判或过度脱敏。',
               'jieba 是必装依赖：缺失时裸人名发现自动关闭。',
               '格式保真有限：docx 保留段落结构；PDF 输出为纯文本。',
@@ -481,7 +487,9 @@ def main():
                    ['v2.3.1', '云端 API 适配（通义/DeepSeek/智谱），无需本地部署模型'],
                    ['v2.4', '裸人名 + 无层级地址进规则层（jieba 分词过滤 + 全文实体一致）'],
                    ['v2.5', '实战修复：还原精确配对 / 角色词后名词门控 / OCR 空格兼容 / 金额增强；'
-                            '56 项回归测试 + 59 个红队用例'],
+                            '58 项回归测试 + 59 个红队用例'],
+                   ['v2.6', '两阶段工作流：规则层关键信息必清 → --review 审阅清单 → '
+                            'Agent 语义层直接执行（无需外部 API）'],
                ],
                [1.15, 5.35])
 

@@ -57,6 +57,16 @@ def load_corpus(path):
     return cases
 
 
+def _partial_leak(value, masked_text, n=6):
+    """检测敏感值是否部分残留在脱敏文本中（如地址只脱敏了尾部）。
+
+    取连续 n 个字符的片段检查：完全脱敏时任何片段都不应再出现。
+    """
+    if len(value) <= n:
+        return value in masked_text
+    return any(value[i:i + n] in masked_text for i in range(len(value) - n + 1))
+
+
 def run_case(case, desensitizer):
     """对单个用例执行脱敏并给出结构化结果。"""
     text = case['text']
@@ -69,9 +79,13 @@ def run_case(case, desensitizer):
         value = item['value']
         typ = item['type']
         # 命中：进入映射表，或原文中已消失（被占位符替换）
-        hit = value in mapping_originals or value not in masked_text
+        in_mapping = value in mapping_originals
+        gone = value not in masked_text
+        leak = _partial_leak(value, masked_text)
+        hit = (in_mapping or gone) and not leak
         checks.append({'kind': 'masked', 'type': typ, 'value': value,
-                       'ok': hit, 'detail': value in mapping_originals})
+                       'ok': hit,
+                       'detail': f'mapping={in_mapping} gone={gone} leak={leak}'})
     for item in case['expect_kept']:
         if isinstance(item, str):
             item = {'value': item, 'type': '保留项'}
@@ -169,7 +183,7 @@ def main():
             print(f'  [{r["id"]}] {r["note"]}')
             for c in r['failures']:
                 if c['kind'] == 'masked':
-                    print(f'    ✗ 未脱敏: {c["type"]} = {c["value"]}')
+                    print(f'    ✗ 未完全脱敏: {c["type"]} = {c["value"]}（{c["detail"]}）')
                 elif c['kind'] == 'kept':
                     print(f'    ✗ 误脱敏: 应保留的 {c["value"]} 被替换')
                 elif c['kind'] == 'absent':
@@ -213,7 +227,7 @@ def main():
                 lines.append(f'### {r["id"]} — {r["note"]}')
                 for c in r['failures']:
                     if c['kind'] == 'masked':
-                        lines.append(f'- ✗ 未脱敏：{c["type"]} = `{c["value"]}`')
+                        lines.append(f'- ✗ 未完全脱敏：{c["type"]} = `{c["value"]}`（{c["detail"]}）')
                     elif c['kind'] == 'kept':
                         lines.append(f'- ✗ 误脱敏：应保留的 `{c["value"]}` 被替换')
                     elif c['kind'] == 'absent':

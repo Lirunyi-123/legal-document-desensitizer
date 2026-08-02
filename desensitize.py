@@ -541,6 +541,14 @@ class Desensitizer:
                     'end': match.end(),
                     'confidence': confidence,
                 })
+        # 重叠去重：同一区间/交叉区间保留置信度最高者（如身份证 vs 银行卡）
+        findings.sort(key=lambda f: (f['start'], -f['confidence'], -f['end']))
+        dedup = []
+        for f in findings:
+            if dedup and f['start'] < dedup[-1]['end']:
+                continue
+            dedup.append(f)
+        findings = dedup
         return findings
 
     # --------------------------------------------------------
@@ -725,9 +733,9 @@ class Desensitizer:
 
     def _mask_wechat(self, text: str) -> str:
         """微信号：匹配有前缀 或 独立出现的微信号模式"""
-        # 微信号: xxx 或 微信: xxx（有前缀，带冒号）
+        # 微信号: xxx / 微信号xxx / 微信账号xxx（前缀，冒号可省略）
         text = re.sub(
-            r'(微信号|微信)\s*[：:]\s*([a-zA-Z][a-zA-Z0-9_]{4,19})',
+            r'((?:微信号|微信账号|微信)\s*[：:]?\s*)([a-zA-Z][a-zA-Z0-9_]{4,19})',
             lambda m: self._safe_replace_wechat(m.group(2), m.group(1)),
             text
         )
@@ -744,7 +752,8 @@ class Desensitizer:
     def _safe_replace_wechat(self, original: str, prefix: str = '') -> str:
         """记录微信号替换"""
         self._record(original, '[微信号]', '微信号')
-        return f'{prefix}：[微信号]' if prefix else '[微信号]'
+        # 前缀已含原文分隔符（"微信号："或"微信号"），原样保留，还原时无损
+        return f'{prefix}[微信号]' if prefix else '[微信号]'
 
     def _mask_qq(self, text: str) -> str:
         """QQ号：保留前缀并记录映射"""
@@ -943,19 +952,20 @@ class Desensitizer:
         """
         # 住所地/地址/位于 + 内容
         text = re.sub(
-            r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(）\)\s]{5,40}(?:号|室|层))',
-            lambda m: self._record_addr(m.group(2), m.group(0)[:m.start(2)]),
+            r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(）\) ]{5,40}(?:号|室|层))',
+            # 前缀用相对偏移（m.start(2)-m.start(0)），避免地址前半截残留在文本中
+            lambda m: self._record_addr(m.group(2), m.group(0)[:m.start(2) - m.start(0)]),
             text
         )
         # 独立的地理地址（省开头 + 详细到号/室）
         text = re.sub(
-            r'([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层))',
+            r'([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层))',
             lambda m: self._record_addr(m.group(1)),
             text
         )
         # 独立城市级地址（市/区开头 + 详细到路/街/号）
         text = re.sub(
-            r'((?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)）\s]{2,29}(?:号|室|层|栋|幢)(?:\d+)?)',
+            r'((?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?)',
             lambda m: self._record_addr(m.group(1)),
             text
         )
@@ -1042,6 +1052,9 @@ class Desensitizer:
              'pattern': r'(?<!\d)([48]00[-\s]?\d{3}[-\s]?\d{4})(?!\d)',
              'handler': self._mask_landline, 'group': 1},
             {'type': '微信号',
+             'pattern': r'((?:微信号|微信账号|微信)\s*[：:]?\s*)([a-zA-Z][a-zA-Z0-9_]{4,19})',
+             'handler': self._mask_wechat, 'group': 2},
+            {'type': '微信号',
              'pattern': r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',
              'handler': self._mask_wechat, 'group': 1},
             {'type': 'QQ号',
@@ -1078,7 +1091,7 @@ class Desensitizer:
              'pattern': r'[\u4e00-\u9fa5（）\(\)]{4,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业)|[\u4e00-\u9fa5]{4,20}(?:律师事务所|会计师事务所|资产评估事务所)|(?<![\u4e00-\u9fa5A-Za-z0-9])[\u4e00-\u9fa5]{3,6}公司',
              'handler': self._mask_company_name},
             {'type': '地址',
-             'pattern': r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)）\s]{2,29}(?:号|室|层|栋|幢)(?:\d+)?',
+             'pattern': r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?',
              'handler': self._mask_address},
             {'type': '金额（中文大写）',
              'pattern': r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?[零壹贰叁肆伍陆柒捌玖拾][零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整亿]*(?:元|圆)?(?:整)?',

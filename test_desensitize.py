@@ -158,6 +158,23 @@ class TestV22NewRules(unittest.TestCase):
         self.assertIn('confidence', findings[0])
         self.assertGreater(findings[0]['confidence'], 0.9)
 
+    def test_wechat_without_colon(self):
+        result = self.d.mask('双方确认微信号lawyer_wang888为联络方式')
+        self.assertIn('微信号[微信号]', result.text)
+
+    def test_address_prefix_no_leak(self):
+        result = self.d.mask('住所地浙江省杭州市拱墅区莫干山路100号')
+        self.assertIn('住所地[地址]', result.text)
+        self.assertNotIn('浙江省', result.text)
+        self.assertNotIn('拱墅区', result.text)
+
+    def test_scan_dedup_overlap(self):
+        # 身份证号不应同时被记为银行账号
+        findings = self.d.scan('身份证号110101198001011232')
+        types = [f['type'] for f in findings]
+        self.assertEqual(types.count('身份证号'), 1)
+        self.assertNotIn('银行账号', types)
+
 
 class TestRestore(unittest.TestCase):
     """mask → 映射表 → restore 无损往返"""
@@ -187,6 +204,10 @@ class TestRestore(unittest.TestCase):
     def test_restore_person_no_delimiter(self):
         # 无分隔符人名不插空格，还原后与原文完全一致
         self._roundtrip('原告陈建国，被告李四。')
+
+    def test_restore_address_with_prefix(self):
+        # 带"住所地"前缀的地址：脱敏整体替换、还原完全一致
+        self._roundtrip('住所地：浙江省杭州市西湖区文一西路1号。')
 
 
 class TestNerIntegration(unittest.TestCase):

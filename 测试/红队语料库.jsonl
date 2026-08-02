@@ -9,6 +9,7 @@
 {"id": "email_01", "note": "邮箱优先于手机号，不得拆成手机号+邮箱", "text": "联系邮箱13800138000@qq.com", "expect_masked": [{"type": "邮箱", "value": "13800138000@qq.com"}], "expect_absent": ["13800138000"]}
 {"id": "wx_01", "note": "带上下文微信号", "text": "微信号：lawyer_wang888", "expect_masked": [{"type": "微信号", "value": "lawyer_wang888"}], "expect_kept": []}
 {"id": "wx_02", "note": "裸微信号（字母开头6-20位）", "text": "加我 lawyer_wang888 详谈", "expect_masked": [{"type": "微信号", "value": "lawyer_wang888"}], "expect_kept": []}
+{"id": "wx_04", "note": "微信号无冒号（法律文书常见写法）", "text": "双方确认微信号lawyer_wang888为联络方式", "expect_masked": [{"type": "微信号", "value": "lawyer_wang888"}], "expect_kept": []}
 {"id": "wx_03", "note": "车牌不是微信号", "text": "我开保时捷粤B88888去法院", "expect_masked": [{"type": "车牌号", "value": "粤B88888"}], "expect_kept": []}
 {"id": "qq_01", "note": "QQ号", "text": "QQ：12345678", "expect_masked": [{"type": "QQ号", "value": "12345678"}], "expect_kept": []}
 {"id": "bank_01", "note": "带账号上下文", "text": "收款账号：6222020200012345678", "expect_masked": [{"type": "银行账号", "value": "6222020200012345678"}], "expect_kept": []}
@@ -30,6 +31,7 @@
 {"id": "company_01", "note": "有限责任公司全称", "text": "甲方：北京华信科技有限公司", "expect_masked": [{"type": "公司名", "value": "北京华信科技有限公司"}], "expect_kept": []}
 {"id": "company_02", "note": "公司简称", "text": "华信置业公司应于三日内付款", "expect_masked": [{"type": "公司名", "value": "华信置业公司"}], "expect_kept": []}
 {"id": "addr_01", "note": "住所地地址", "text": "住所地浙江省杭州市西湖区文一西路1号", "expect_masked": [{"type": "地址", "value": "浙江省杭州市西湖区文一西路1号"}], "expect_kept": []}
+{"id": "addr_03", "note": "住所地+冒号，地址必须整体脱敏不得残留省市区", "text": "住所地：浙江省杭州市西湖区文一西路1号", "expect_masked": [{"type": "地址", "value": "浙江省杭州市西湖区文一西路1号"}], "expect_absent": ["浙江省杭州市西湖区"]}
 {"id": "addr_02", "note": "独立省市区地址", "text": "现住浙江省杭州市拱墅区莫干山路100号", "expect_masked": [{"type": "地址", "value": "浙江省杭州市拱墅区莫干山路100号"}], "expect_kept": []}
 {"id": "amount_01", "note": "带单位金额", "text": "尾款80万元应于验收后支付", "expect_masked": [{"type": "金额", "value": "80万元"}], "expect_kept": []}
 {"id": "amount_02", "note": "中文大写金额", "text": "违约金人民币伍佰万元整", "expect_masked": [{"type": "金额", "value": "人民币伍佰万元整"}], "expect_kept": []}

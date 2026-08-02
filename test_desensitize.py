@@ -232,5 +232,64 @@ class TestNerIntegration(unittest.TestCase):
         self.assertIn('COMPANY', types)
 
 
+class TestBareNamesAndUnstructuredAddress(unittest.TestCase):
+    """v2.4 规则层增强：裸人名 + 无层级地址 + 全文一致"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_bare_names_consistency_with_role_seed(self):
+        # 角色词识别的名字向裸出现处传播，全文同一占位符
+        result = self.d.mask('原告：陈建国。陈建国再次到庭陈述。原告陈建国称双方系朋友。')
+        self.assertEqual(result.text.count('[当事人甲（原告）]'), 3)
+        self.assertNotIn('陈建国', result.text)
+
+    def test_bare_names_without_role(self):
+        result = self.d.mask('张三欠李四钱不还')
+        self.assertNotIn('张三', result.text)
+        self.assertNotIn('李四', result.text)
+        for m in result.mapping:
+            if m.type == '人名':
+                self.assertIn(m.original, ('张三', '李四'))
+
+    def test_three_char_and_compound_names(self):
+        result = self.d.mask('欧阳雪梅与王小明签订合同，欧阳雪梅称王小明已付款。')
+        self.assertNotIn('欧阳雪梅', result.text)
+        self.assertNotIn('王小明', result.text)
+        # 同一人同一个占位符
+        ph = [m.replacement for m in result.mapping if m.original == '欧阳雪梅']
+        self.assertEqual(len(set(ph)), 1)
+
+    def test_role_rule_not_cross_line(self):
+        # 跨行"原告及其\n委托…""被告不应\n承担…"不得吞词
+        result = self.d.mask('原告及其\n委托诉讼代理人赵敏。\n被告不应\n承担逾期交房违约责任。')
+        self.assertNotIn('及其', {m.original for m in result.mapping if m.type == '人名'})
+        self.assertNotIn('承担', {m.original for m in result.mapping if m.type == '人名'})
+        self.assertIn('[委托代理人]', result.text)
+
+    def test_common_words_not_names(self):
+        result = self.d.mask('陈述事实经过后，双方对借款金额无异议，诉讼费由被告承担，原告抚养权问题另行处理。')
+        names = {m.original for m in result.mapping if m.type == '人名'}
+        for w in ('陈述', '金额', '承担', '抚养'):
+            self.assertNotIn(w, names)
+
+    def test_unstructured_address(self):
+        result = self.d.mask('双方约定在望京西园四区410楼当面核账，莫干山路100号是注册地。')
+        self.assertEqual(result.text.count('[地址]'), 2)
+        self.assertNotIn('望京西园', result.text)
+
+    def test_disable_bare_names(self):
+        d = Desensitizer(bare_names=False)
+        result = d.mask('原告：陈建国。张三欠李四钱不还。')
+        self.assertIn('[当事人甲（原告）]', result.text)  # 角色名仍脱敏
+        self.assertIn('张三', result.text)  # 裸人名关闭
+
+    def test_bare_names_restore_roundtrip(self):
+        text = '原告：陈建国。张三欠李四钱不还，双方约定在望京西园四区410楼核账。'
+        r = self.d.mask(text)
+        restored = restore_text(r.text, parse_mapping_text(r.to_json()))
+        self.assertEqual(restored, text)
+
+
 if __name__ == '__main__':
     unittest.main()

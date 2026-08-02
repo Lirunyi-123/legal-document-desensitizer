@@ -53,14 +53,18 @@ class TestLLMPipeline(unittest.TestCase):
     def test_full_pipeline_covers_llm_only_items(self):
         text = ('原告：陈建国，男，身份证号110101198001011232。\n'
                 '张三欠李四钱不还，双方约定在望京西园四区410楼当面核账。\n'
-                '华信置业与鼎盛集团签订合作框架协议。')
+                '华信置业与鼎盛集团签订合作框架协议。\n'
+                '原告称其因婚外情导致家庭破裂，并曾接受心理治疗。')
         result, warnings = full_desensitize(text, self.config)
         self.assertEqual(warnings, [])
-        self.assertIn('[当事人丙]', result.text)
-        self.assertIn('[地址]', result.text)
-        self.assertIn('[合同丙方]', result.text)
+        # 裸人名/无结构地址现在由规则层覆盖（不依赖 LLM 层）
         self.assertNotIn('张三', result.text)
         self.assertNotIn('李四', result.text)
+        self.assertNotIn('望京西园', result.text)
+        self.assertIn('[地址]', result.text)
+        # 案情敏感细节必须由 LLM 层处理
+        self.assertIn('[案情细节]', result.text)
+        self.assertNotIn('婚外情', result.text)
         # 规则层占位符不受影响
         self.assertIn('[身份证号]', result.text)
         # 合并映射可无损还原

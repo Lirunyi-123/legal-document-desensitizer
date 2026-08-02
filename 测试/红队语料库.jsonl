@@ -27,8 +27,11 @@
 {"id": "person_01", "note": "原告人名（角色词+姓名）", "text": "原告：陈建国，男，汉族", "expect_masked": [{"type": "人名", "value": "陈建国"}], "expect_kept": []}
 {"id": "person_02", "note": "被告/法定代表人", "text": "被告：杭州鼎盛房地产开发有限公司，法定代表人：李四", "expect_masked": [{"type": "人名", "value": "李四"}, {"type": "公司名", "value": "杭州鼎盛房地产开发有限公司"}], "expect_kept": []}
 {"id": "person_03", "note": "委托诉讼代理人", "text": "委托诉讼代理人：赵敏，浙江泽大律师事务所律师", "expect_masked": [{"type": "人名", "value": "赵敏"}, {"type": "公司名", "value": "浙江泽大律师事务所"}], "expect_kept": []}
-{"id": "person_04", "note": "LLM层覆盖项（裸人名，规则层不承诺）", "text": "张三欠李四钱不还", "expect_masked": [], "expect_kept": [], "llm_only": [{"type": "人名", "value": "张三"}, {"type": "人名", "value": "李四"}]}
-{"id": "llm_02", "note": "LLM层覆盖项（无省市区层级的地址）", "text": "双方约定在望京西园四区410楼当面核账", "expect_masked": [], "expect_kept": [], "llm_only": [{"type": "地址", "value": "望京西园四区410楼"}]}
+{"id": "person_04", "note": "裸人名（规则层姓氏启发式覆盖）", "text": "张三欠李四钱不还", "expect_masked": [{"type": "人名", "value": "张三"}, {"type": "人名", "value": "李四"}], "expect_kept": []}
+{"id": "person_05", "note": "裸人名全文一致性：角色词识别的名字传播到裸出现处", "text": "原告：陈建国。陈建国再次到庭陈述。原告陈建国称双方系朋友。", "expect_masked": [{"type": "人名", "value": "陈建国"}], "expect_kept": []}
+{"id": "person_06", "note": "3字复姓/普通名（出现多次）", "text": "欧阳雪梅与王小明签订合同，欧阳雪梅称王小明已付款。", "expect_masked": [{"type": "人名", "value": "欧阳雪梅"}, {"type": "人名", "value": "王小明"}], "expect_kept": []}
+{"id": "neg_03", "note": "公司/职务名不是人名（负样本）", "text": "张律师向法院提交材料，华信置业与鼎盛集团签订协议，尾款80万元应于三日内支付。", "expect_masked": [{"type": "金额", "value": "80万元"}], "expect_kept": ["张律师", "华信置业", "鼎盛集团"]}
+{"id": "llm_02", "note": "无省市区层级的地址（规则层小区/路牌模式覆盖）", "text": "双方约定在望京西园四区410楼当面核账，莫干山路100号是注册地", "expect_masked": [{"type": "地址", "value": "望京西园四区410楼"}, {"type": "地址", "value": "莫干山路100号"}], "expect_kept": []}
 {"id": "llm_03", "note": "LLM层覆盖项（案情敏感细节）", "text": "原告称其因婚外情导致家庭破裂，并曾接受心理治疗", "expect_masked": [], "expect_kept": [], "llm_only": [{"type": "案情细节", "value": "婚外情"}]}
 {"id": "llm_04", "note": "LLM层覆盖项（裸公司简称）", "text": "华信置业与鼎盛集团签订合作框架协议", "expect_masked": [], "expect_kept": [], "llm_only": [{"type": "公司名", "value": "华信置业"}, {"type": "公司名", "value": "鼎盛集团"}]}
 {"id": "company_01", "note": "有限责任公司全称", "text": "甲方：北京华信科技有限公司", "expect_masked": [{"type": "公司名", "value": "北京华信科技有限公司"}], "expect_kept": []}

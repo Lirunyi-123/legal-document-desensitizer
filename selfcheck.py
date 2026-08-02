@@ -144,16 +144,17 @@ def _endpoint_alive(endpoint, timeout=3):
 
 def optional_deps():
     missing = []
-    for mod in ('cryptography', 'docx', 'fitz'):
+    for mod in ('jieba', 'cryptography', 'docx', 'fitz'):
         try:
             __import__(mod)
         except ImportError:
             missing.append(mod)
-    names = {'cryptography': '映射表加密', 'docx': 'docx 支持', 'fitz': 'pdf 支持'}
+    names = {'jieba': '裸人名启发式', 'cryptography': '映射表加密',
+             'docx': 'docx 支持', 'fitz': 'pdf 支持'}
     if not missing:
         return (True, '全部可选依赖已安装')
     return (None, f'可选依赖未装：{[names.get(m, m) for m in missing]}'
-                  '（不影响纯规则层，缺少时相关功能不可用）')
+                  '（缺少时对应功能降级/不可用）')
 
 
 def version_info():
@@ -174,8 +175,8 @@ def main():
     for name, fn in [
         ('必要文件齐全', required_files),
         ('模块导入', imports_ok),
-        ('单元测试(44项)', unit_tests),
-        ('红队评测(48用例)', redteam_eval),
+        ('单元测试(54项)', unit_tests),
+        ('红队评测(51用例)', redteam_eval),
         ('mask→restore 往返', restore_roundtrip),
         ('本地LLM二轮脱敏', lambda: llm_layer(args)),
         ('可选依赖', optional_deps),

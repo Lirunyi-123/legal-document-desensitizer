@@ -198,6 +198,144 @@ _ORG_CODE_PATTERN = re.compile(r'(?<![0-9A-Z-])([0-9A-Z]{8}-[0-9A-Z])(?![0-9A-Z-
 
 
 # ============================================================
+# 裸人名启发式（姓氏 + 频率 + 上下文）
+# ============================================================
+
+# 常见单姓（覆盖绝大多数中国人姓名）
+_SURNAMES = set(
+    '王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董袁潘'
+    '于蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江'
+    '尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤欧成温乔包华柳苟庄齐'
+    '鲁葛穆纪游屈古舒阮柯蓝盛司'
+)
+
+# 常见复姓
+_COMPOUND_SURNAMES = set(
+    ['欧阳', '太史', '端木', '上官', '司马', '东方', '独孤', '南宫', '万俟', '闻人',
+     '夏侯', '诸葛', '尉迟', '公羊', '赫连', '澹台', '皇甫', '宗政', '濮阳', '公冶',
+     '太叔', '申屠', '公孙', '慕容', '仲孙', '钟离', '长孙', '宇文', '司徒', '鲜于',
+     '司空', '闾丘', '子车', '亓官', '司寇', '巫马', '公西', '颛孙', '壤驷', '公良',
+     '漆雕', '乐正', '宰父', '谷梁', '拓跋', '夹谷', '轩辕', '令狐', '段干', '百里',
+     '呼延', '东郭', '南门', '羊舌', '微生', '公户', '公玉', '公仪', '梁丘', '公仲',
+     '公上', '公门', '公山', '公坚', '左丘', '公伯', '西门', '公祖', '第五', '公乘',
+     '贯丘', '公皙', '南荣', '东里', '东宫', '仲长', '子书', '子桑', '即墨', '达奚',
+     '褚师', '吴铭']
+)
+
+# 以姓氏开头但不是人名的常见词（避免把"陈述""范围""金额"等误当人名）
+_BARE_NAME_BLACKLIST = set(
+    (
+    '陈述 陈设 陈列 陈旧 陈规 陈词 陈年 陈腐 陈情 陈诉 陈案 '
+    '王国 王子 王后 王位 王权 王法 王八 王室 王朝 王宫 王储 '
+    '李代 李唐 李树 '
+    '张罗 张望 张贴 张狂 张扬 张挂 张榜 张目 张嘴 张口 张冠 '
+    '刘海 刘览 '
+    '周围 周到 周密 周全 周日 周末 周年 周期 周折 周转 周游 周旋 周边 周济 '
+    '孙子 孙女 孙山 '
+    '马虎 马上 马路 马匹 马甲 马术 马戏 马达 马桶 '
+    '朱红 朱砂 '
+    '胡说 胡闹 胡乱 胡话 胡须 胡子 胡同 胡来 '
+    '何况 何其 何处 何时 何地 何必 何苦 何不 '
+    '高兴 高速 高级 高度 高档 高楼 高山 高原 高见 高明 '
+    '树林 森林 林立 '
+    '罗列 罗网 罗盘 '
+    '桥梁 '
+    '谢谢 谢绝 '
+    '唐朝 唐代 唐诗 '
+    '许多 许可 许愿 许久 '
+    '曾经 '
+    '田地 田野 田埂 田园 '
+    '董事 懂事 董事长 '
+    '于是 '
+    '余下 余地 余款 余额 余数 余年 '
+    '杜绝 杜鹃 '
+    '叶子 '
+    '程序 程度 '
+    '苏醒 '
+    '任何 任凭 任务 任职 任性 任命 '
+    '生姜 '
+    '钟表 钟情 钟爱 '
+    '陆地 陆续 '
+    '范围 范例 范畴 范文 '
+    '金色 金额 金融 金属 金牌 金库 '
+    '石头 石油 '
+    '夏天 夏季 '
+    '付出 付款 '
+    '方法 方向 方式 方面 方便 方圆 方针 方言 方位 '
+    '白色 白天 白菜 '
+    '秦国 秦朝 '
+    '江湖 江南 江山 '
+    '段落 阶段 手段 '
+    '雷同 '
+    '历史 史实 '
+    '陶瓷 '
+    '黎明 '
+    '顾问 顾客 顾虑 '
+    '毛病 毛巾 '
+    '万一 万能 万分 '
+    '万元 亿元 元整 万般 万象 万物 万古 万世 万分之 万分之五 钱款 '
+    '严重 严肃 严密 严格 '
+    '武器 武术 '
+    '莫非 '
+    '孔子 '
+    '向导 '
+    '集团 公司 有限 股份 银行 医院 学校 法院 酒店 饭店 宾馆 商场 超市 工厂 置业 '
+    '律师 经理 主任 顾问 老师 教授 医生 护士 会计 董事长 总经理 总裁 总监 主管 '
+    '书记 部长 处长 科长 所长 院长 校长 队长 组长 会长 主席 委员 代表 记者 '
+    '江苏省 浙江省 广东省 山东省 河南省 河北省 四川省 湖北省 湖南省 江西省 '
+    '陕西省 云南省 贵州省 安徽省 福建省 甘肃省 青海省 辽宁省 吉林省 黑龙江省 '
+    '山西省 海南省 台湾省 内蒙古 广西壮族 西藏 宁夏回族 新疆维吾尔 '
+    '曾多次 曾几何 '
+    '徐徐 徐缓').split())
+
+# 强上下文：前接/后接这些字时，候选为名字的可能性显著提高
+_NAME_CONTEXT_BEFORE = set('向与和给对为被由把将叫欠借还付转签交送收出让起诉告称表示委托指定要求主张')
+_NAME_CONTEXT_AFTER = set('欠借贷付还签称诉辩陈述出庭委托支付偿还提交主张认为要求表示答应拒绝承认起诉告到庭')
+_NUMERAL_CHARS = set('一二三四五六七八九十百千万零')
+_NAME_FUNCTION_WORDS = set(
+    ('不 的 是 了 在 有 和 与 及 或 但 且 而 就 都 也 还 又 再 才 只 很 更 最 过 着 呢 吗 吧 啊 '
+     '被 把 向 从 以 于 之 为 对 若 虽 因 如 即 则 者 所 其 此 哪 怎 么 哦 呀 哎 哟 中 上 下').split())
+
+# 候选名字后紧跟这些词时，说明是公司/机构/职务名的一部分（如"华信置业""盛集团"）
+_NAME_COMPANY_SUFFIXES = (
+    '置业 集团 公司 有限 股份 银行 医院 学校 法院 酒店 饭店 宾馆 商场 超市 工厂 '
+    '大厦 小区 花园 公寓 律师 经理 主任 顾问 老师 教授 医生 护士 会计 董事长 '
+    '总经理 总裁 总监 主管 书记 部长 处长 科长 所长 院长 校长 队长 组长 会长 '
+    '主席 委员 代表 记者 事务所 工作室 '
+    '新区 开发区 高新区 科创 科技 置业'
+).split()
+
+# 角色词后捕获到的"名字"若含这些虚词/连接词，大概率是词组而非姓名
+# （如"原告起诉之日""原告与被告"），保留原文
+_ROLE_NAME_REJECT = set('之其及与和或对被把在于而但且所此那这等各每该向从以非是')
+
+# 角色词后紧跟的常见动词/法律名词（"被告承担""原告抚养""被告辩称"），不是姓名
+_ROLE_NAME_VERBS = set(
+    ('承担 抚养 主张 认为 请求 起诉 上诉 申诉 反诉 答辩 举证 质证 陈述 辩称 '
+     '委托 指定 要求 支付 偿还 交付 提交 出庭 到庭 签字 履行 违约 侵权 '
+     '故意 过失 严重 依法 应当 可以 有权 义务 责任 权利 利益 损失 赔偿 补偿 '
+     '违约金 逾期 延迟 保证 担保 借贷 还款 付款 收款').split())
+
+# 中文分词器（jieba，可选依赖）：用于过滤"江省杭""付逾期"这类
+# 嵌在长词里的人名假候选；缺失时裸人名发现降级为种子传播
+_SEGMENTER = None
+_SEGMENTER_TRIED = False
+
+
+def _get_segmenter():
+    global _SEGMENTER, _SEGMENTER_TRIED
+    if not _SEGMENTER_TRIED:
+        _SEGMENTER_TRIED = True
+        try:
+            import jieba
+            jieba.setLogLevel(60)
+            _SEGMENTER = jieba.lcut
+        except ImportError:
+            _SEGMENTER = None
+    return _SEGMENTER
+
+
+# ============================================================
 # 实体归一化与角色绑定
 # ============================================================
 
@@ -360,11 +498,13 @@ class EntityResolver:
 class Desensitizer:
     """法律文书脱敏器 — 规则引擎层"""
 
-    def __init__(self, mask_all_dates: bool = False):
+    def __init__(self, mask_all_dates: bool = False, bare_names: bool = True):
         # 实体归一化解析器（用于人名/公司名的角色绑定）
         self._resolver = EntityResolver()
         # True 时把所有"年月日"日期替换为 [日期]；默认仅处理带出生上下文的日期
         self._mask_all_dates = mask_all_dates
+        # True 时启用裸人名启发式（姓氏+频率+上下文，全文一致占位符）
+        self._bare_names = bare_names
 
         # 已替换的记录，避免重复替换
         self._replaced = {}   # original -> (replacement, type)
@@ -427,6 +567,7 @@ class Desensitizer:
             text = self._mask_birthdate(text)   # 仅带出生上下文的日期
         text = self._mask_person_name(text)    # 人名（角色词上下文）
         text = self._mask_company_name(text)   # 公司名
+        text = self._mask_bare_person_names(text)  # 裸人名（姓氏启发式 + 角色名传播）
         text = self._mask_address(text)        # 地址
         text = self._mask_amount(text)         # 金额（带单位的大额数字）
         return text
@@ -869,13 +1010,20 @@ class Desensitizer:
         - 同一人物全文档用统一占位符 [当事人甲（原告）]
         """
         role_patterns = [
-            r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,，\s]*([\u4e00-\u9fa5]{2,4})(?=[，,。.\s（(的]|\u3001|$)',
+            # 分隔符与前瞻只认空格，不认换行，避免"原告及其\n委托…"跨行吞词
+            r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,， ]*([\u4e00-\u9fa5]{2,4})(?=[，,。. （(的]|\u3001|$)',
         ]
         for pat in role_patterns:
             def make_replacer(p):
                 def replacer(m):
                     role = m.group(1)
                     name = m.group(2)
+                    # 含虚词/连接词的"名字"（如"起诉之日""与被告"）不是姓名
+                    if any(ch in _ROLE_NAME_REJECT for ch in name):
+                        return m.group(0)
+                    # 常见动词/法律名词（如"被告承担""原告抚养"）不是姓名
+                    if name in _ROLE_NAME_VERBS:
+                        return m.group(0)
                     # 通过EntityResolver进行归一化和角色绑定
                     _, placeholder = self._resolver.resolve_person(name, role)
                     # 记录映射
@@ -897,6 +1045,187 @@ class Desensitizer:
                         return f'{role}{placeholder}'
                 return replacer
             text = re.sub(pat, make_replacer(pat), text)
+        return text
+
+    def _find_name_candidates(self, text: str) -> set:
+        """用姓氏 + 频率 + 上下文启发式发现"无角色词"的人名候选。
+
+        规则（保守优先，宁漏勿错）：
+        - 姓氏（含复姓）开头，总长 2~4 字，全部为汉字
+        - 不在黑名单（如"陈述""范围""金额"等常见词）
+        - 出现 >= 2 次，或紧邻强上下文（"向/与/欠/借/诉…"）
+        - 每个姓氏位置只保留"最长的合法候选"：尾部吞了动词
+          （如"陈建国称"）或第 2 位是数字（如"李四钱"）的 3 字候选直接判非法
+        - 前面不是另一个姓氏（避免截断"王李四"这类更长名字）
+        - **jieba 分词校验**（推荐安装）：候选必须是分词独立词
+          （"江省杭""付逾期"这类嵌在长词里的假候选被过滤），
+          或"名字+动词"前缀（"张三欠"→"张三"），或"复姓+名"相邻分词
+        """
+        segmenter = _get_segmenter()
+        if segmenter is None:
+            return set()  # 无分词器时放弃发现（种子传播不受影响）
+
+        tokens = segmenter(text)
+        token_at = {}
+        pos = 0
+        for w in tokens:
+            idx = text.find(w, pos)
+            if idx == -1:
+                idx = pos
+            token_at[idx] = w
+            pos = idx + len(w)
+
+        candidates = set()
+        n = len(text)
+        i = 0
+        while i < n:
+            if not ('\u4e00' <= text[i] <= '\u9fa5'):
+                i += 1
+                continue
+            # 复姓优先
+            surnames = []
+            if i + 1 < n and text[i:i + 2] in _COMPOUND_SURNAMES:
+                surnames.append(text[i:i + 2])
+            if text[i] in _SURNAMES:
+                surnames.append(text[i])
+            if not surnames:
+                i += 1
+                continue
+            # 前一字符是姓氏 → 说明当前可能只是更长名字的中间部分，跳过
+            if i > 0 and ('\u4e00' <= text[i - 1] <= '\u9fa5'
+                          and text[i - 1] in _SURNAMES):
+                i += 1
+                continue
+            for surname in sorted(surnames, key=len, reverse=True):
+                # 单姓 2~3 字（姓+1~2字名）；复姓 3~4 字，避免把
+                # "陈建国称"这种 姓+名+动词 误当成 4 字名
+                for extra in (2, 1):  # 最长的先试，取第一个合法候选
+                    cand = text[i:i + len(surname) + extra]
+                    if len(cand) != len(surname) + extra:
+                        break
+                    if not all('\u4e00' <= c <= '\u9fa5' for c in cand):
+                        break
+                    if cand in _BARE_NAME_BLACKLIST:
+                        continue
+                    before = text[i - 1] if i > 0 else ''
+                    after = text[i + len(cand)] if i + len(cand) < n else ''
+                    next1 = text[i + len(cand)] if i + len(cand) < n else ''
+                    next2 = text[i + len(cand):i + len(cand) + 2]
+                    count = text.count(cand)
+                    if not (count >= 2
+                            or before in _NAME_CONTEXT_BEFORE
+                            or after in _NAME_CONTEXT_AFTER):
+                        continue
+                    given = cand[len(surname):]
+                    # 公司/职务名片段（如"张律师""华信置业""盛集团"）不是人名
+                    if cand.endswith(tuple(_NAME_COMPANY_SUFFIXES)):
+                        continue
+                    if next2 in _NAME_COMPANY_SUFFIXES:
+                        continue
+                    if next1 and (cand + next1).endswith(
+                            tuple(_NAME_COMPANY_SUFFIXES)):
+                        continue
+                    # jieba 分词校验
+                    if not self._cand_valid_in_tokens(
+                            cand, i, surname, token_at):
+                        continue
+                    # 2 字候选的"名"是虚词（如"钱不"的"不"）→ 不是人名
+                    if len(given) == 1 and given in _NAME_FUNCTION_WORDS:
+                        continue
+                    # 尾部是强动词（如"陈建国称"的"称"）→ 吞了动词，非法
+                    if len(given) >= 2 and cand[-1] in _NAME_CONTEXT_AFTER:
+                        continue
+                    # 第 2 位是数字（如"李四钱"的"四"）→ 大概率不是名字；
+                    # 但整体出现 >= 2 次的（如"张三丰"）放行完整 3 字名
+                    if (len(given) >= 2 and given[0] in _NUMERAL_CHARS
+                            and count < 2):
+                        continue
+                    # 频率/时间词尾（"曾多次"的"次"）→ 不是人名
+                    if cand[-1] in '次':
+                        continue
+                    candidates.add(cand)
+                    break  # 该姓氏位置只取最长合法候选
+            i += 1
+        return candidates
+
+    @staticmethod
+    def _cand_valid_in_tokens(cand: str, start: int, surname: str,
+                              token_at: dict) -> bool:
+        """校验候选在分词结果中的合法性（三种形态）。"""
+        # 1) 独立词："张三丰""陈建国""周强"
+        if token_at.get(start) == cand:
+            return True
+        # 2) 名字+动词前缀："张三欠" → 剩余"欠"是强动词
+        head = token_at.get(start)
+        if head and head.startswith(cand) and len(head) > len(cand):
+            rest = head[len(cand):]
+            if all(c in _NAME_CONTEXT_AFTER for c in rest):
+                return True
+            if rest in ('先生', '女士', '同志', '律师', '法官'):
+                return True
+        # 3) 复姓+名相邻分词："欧阳"+"雪梅"
+        if len(surname) == 2:
+            given = cand[len(surname):]
+            if (token_at.get(start) == surname
+                    and token_at.get(start + len(surname)) == given):
+                return True
+        return False
+
+    def _mask_bare_person_names(self, text: str) -> str:
+        """裸人名统一替换：
+
+        1. 种子：角色词已识别的人名（如"原告：陈建国"→[当事人甲（原告）]）
+           向全文裸出现处传播同一占位符 → 全文对应一致
+        2. 发现：姓氏启发式识别从未带角色词的人名 → [当事人_N]
+        3. 同名字段冲突时取更长者，逆序替换保证位置正确
+        """
+        if not self._bare_names:
+            return text
+
+        names = set()
+        # 种子：已有人名映射（含角色绑定）
+        for original, (_, typ) in self._replaced.items():
+            if typ == '人名':
+                names.add(original)
+        # 发现：姓氏启发式
+        names.update(self._find_name_candidates(self._original_text))
+        if not names:
+            return text
+
+        # 收集当前文本中所有出现位置
+        spans = []
+        for name in names:
+            start = 0
+            while True:
+                pos = text.find(name, start)
+                if pos == -1:
+                    break
+                spans.append((pos, pos + len(name), name))
+                start = pos + len(name)
+        if not spans:
+            return text
+
+        # 重叠冲突：长名优先（"王小明"覆盖"王小"）
+        spans.sort(key=lambda s: (-(s[1] - s[0]), s[0]))
+        kept = []
+        for s in spans:
+            if any(s[0] < k[1] and k[0] < s[1] for k in kept):
+                continue
+            kept.append(s)
+        kept.sort(key=lambda s: s[0])
+
+        # 正序记录（保证映射 order 按原文顺序）
+        for pos, end, name in kept:
+            if text[pos:end] != name:
+                continue
+            _, placeholder = self._resolver.resolve_person(name, '')
+            self._record(name, placeholder, '人名')
+        # 逆序替换
+        for pos, end, name in reversed(kept):
+            if text[pos:end] != name:
+                continue
+            _, placeholder = self._resolver.resolve_person(name, '')
+            text = text[:pos] + placeholder + text[end:]
         return text
 
     def _mask_company_name(self, text: str) -> str:
@@ -966,6 +1295,18 @@ class Desensitizer:
         # 独立城市级地址（市/区开头 + 详细到路/街/号）
         text = re.sub(
             r'((?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?)',
+            lambda m: self._record_addr(m.group(1)),
+            text
+        )
+        # 无省市区层级的地址：小区/花园/公寓/大厦/苑/里/村/镇/区 + 栋/单元/室/楼/号
+        text = re.sub(
+            r'([\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\-]{1,12}(?:号|栋|幢|单元|室|楼|座|层))',
+            lambda m: self._record_addr(m.group(1)),
+            text
+        )
+        # 路/街/大道/巷 + 门牌号（无需"区"前缀，如"莫干山路100号"）
+        text = re.sub(
+            r'([\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\-]{1,12}(?:号|弄|栋|幢|单元|室|楼|座))',
             lambda m: self._record_addr(m.group(1)),
             text
         )
@@ -1085,13 +1426,13 @@ class Desensitizer:
              'pattern': r'((?:出生日期|出生年月|生日|出生于|生于)\s*[：:]?\s*)(\d{4}年\d{1,2}月\d{1,2}日)|(\d{4}年\d{1,2}月\d{1,2}日)\s*(?:出生|生)',
              'handler': self._mask_birthdate},
             {'type': '人名',
-             'pattern': r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,，\s]*[\u4e00-\u9fa5]{2,4}(?=[，,。.\s（(的]|\u3001|$)',
+             'pattern': r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,， ]*[\u4e00-\u9fa5]{2,4}(?=[，,。. （(的]|\u3001|$)',
              'handler': self._mask_person_name},
             {'type': '公司名',
              'pattern': r'[\u4e00-\u9fa5（）\(\)]{4,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业)|[\u4e00-\u9fa5]{4,20}(?:律师事务所|会计师事务所|资产评估事务所)|(?<![\u4e00-\u9fa5A-Za-z0-9])[\u4e00-\u9fa5]{3,6}公司',
              'handler': self._mask_company_name},
             {'type': '地址',
-             'pattern': r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?',
+             'pattern': r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?|[\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\-]{1,12}(?:号|栋|幢|单元|室|楼|座|层)|[\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\-]{1,12}(?:号|弄|栋|幢|单元|室|楼|座)',
              'handler': self._mask_address},
             {'type': '金额（中文大写）',
              'pattern': r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?[零壹贰叁肆伍陆柒捌玖拾][零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整亿]*(?:元|圆)?(?:整)?',
@@ -1130,8 +1471,9 @@ class SecureDesensitizer(Desensitizer):
     - 如需真正的内存安全，请在硬件安全模块 (HSM) 或机密计算环境中运行
     """
 
-    def __init__(self, security_level: str = 'strict', mask_all_dates: bool = False):
-        super().__init__(mask_all_dates=mask_all_dates)
+    def __init__(self, security_level: str = 'strict', mask_all_dates: bool = False,
+                 bare_names: bool = True):
+        super().__init__(mask_all_dates=mask_all_dates, bare_names=bare_names)
         self._security_level = security_level
         self._secure_mode = security_level in ('strict', 'high')
         self._text_refs = []  # 跟踪传入的文本引用，便于后续清理
@@ -1736,6 +2078,8 @@ def main():
     mask_parser.add_argument('--no-sanitize-filename', action='store_true', default=False, help='禁用输出文件名自动脱敏')
     mask_parser.add_argument('--all-dates', action='store_true', default=False,
                              help='把文中所有"年月日"日期也替换为 [日期]（默认只处理出生日期）')
+    mask_parser.add_argument('--no-bare-names', action='store_true', default=False,
+                             help='关闭裸人名启发式（姓氏+频率+上下文），只保留角色词人名与传播')
     mask_parser.add_argument('--ner-backend', default=None,
                              choices=['regex', 'spacy', 'huggingface', 'llm'],
                              help='规则层后追加本地 NER 层：spacy（需中文模型）/ huggingface（需 transformers）/ llm（本地 Ollama）')
@@ -1782,6 +2126,8 @@ def main():
                              help='启用内存安全增强模式')
     full_parser.add_argument('--all-dates', action='store_true', default=False,
                              help='把文中所有"年月日"日期也替换为 [日期]')
+    full_parser.add_argument('--no-bare-names', action='store_true', default=False,
+                             help='关闭裸人名启发式（姓氏+频率+上下文）')
     full_parser.add_argument('--llm-api', default='ollama', choices=['ollama', 'openai'],
                              help='LLM API 类型：ollama（默认）/ openai 兼容')
     full_parser.add_argument('--llm-model', default='qwen2.5', help='LLM 模型名')
@@ -1816,7 +2162,8 @@ def main():
     else:
         text = sys.stdin.read()
 
-    d = Desensitizer(mask_all_dates=getattr(args, 'all_dates', False))
+    d = Desensitizer(mask_all_dates=getattr(args, 'all_dates', False),
+                     bare_names=not getattr(args, 'no_bare_names', False))
 
     # 如果启用了内存安全增强，使用 SecureDesensitizer
     secure_mode = False
@@ -1828,7 +2175,8 @@ def main():
     if secure_mode:
         level = args.security_level if hasattr(args, 'security_level') else 'strict'
         d = SecureDesensitizer(security_level=level,
-                               mask_all_dates=getattr(args, 'all_dates', False))
+                               mask_all_dates=getattr(args, 'all_dates', False),
+                               bare_names=not getattr(args, 'no_bare_names', False))
         if sys.stderr.isatty():
             print(f'🔒 内存安全增强模式已启用 (security_level={level})', file=sys.stderr)
             print(f'   ⚠️  Python 字符串不可变，内存清理为"尽力而为"的纵深防御', file=sys.stderr)
@@ -2025,7 +2373,8 @@ def main():
             result, warnings = full_desensitize(
                 text, config,
                 mask_all_dates=getattr(args, 'all_dates', False),
-                secure=getattr(args, 'secure', False))
+                secure=getattr(args, 'secure', False),
+                bare_names=not getattr(args, 'no_bare_names', False))
         except LLMLayerError as e:
             sys.exit(f'❌ LLM 层失败：{e}\n'
                      '   已中止，未生成"完整脱敏"输出（避免产出未经验证的脱敏文档）。\n'

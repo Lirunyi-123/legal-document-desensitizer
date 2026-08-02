@@ -249,13 +249,16 @@ def reorder_merged_mapping(mappings: List[Mapping],
 
 def full_desensitize(text: str, config: LLMConfig,
                      mask_all_dates: bool = False,
-                     secure: bool = False) -> Tuple[MaskResult, List[str]]:
+                     secure: bool = False,
+                     bare_names: bool = True) -> Tuple[MaskResult, List[str]]:
     """完整脱敏流水线：规则层 → LLM 层 → 合并映射。
 
     LLM 不可用/输出不合格时抛 LLMLayerError，由调用方决定是否回退。
     """
-    d = (SecureDesensitizer(security_level='strict', mask_all_dates=mask_all_dates)
-         if secure else Desensitizer(mask_all_dates=mask_all_dates))
+    d = (SecureDesensitizer(security_level='strict', mask_all_dates=mask_all_dates,
+                            bare_names=bare_names)
+         if secure else Desensitizer(mask_all_dates=mask_all_dates,
+                                     bare_names=bare_names))
     rule_result = d.mask(text)
 
     prompt = build_full_prompt(rule_result.text)

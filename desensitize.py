@@ -23,6 +23,7 @@ import json
 import os
 import secrets
 import calendar
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
@@ -432,10 +433,8 @@ _COMPANY_OFFICE_PATTERN = re.compile(
     + r'))'
 )
 _COMPANY_SHORT_PATTERN = re.compile(
-    # 前不能紧贴中文/字母（避免吞掉更长公司名中的片段）；
-    # 但"建设单位怡丰成公司""与怡丰成公司"等前接连接字时也命中
-    # 2~6 字简称 + 公司（"华临公司""方汇公司""元勤公司"等，含 OCR 空格）
-    r'(?:(?<![\u4e00-\u9fa5A-Za-z0-9])|(?<=[位与为系由向对在的及和或是称等也并就]))'
+    # 2~6 字简称 + 公司（"华临公司""方汇公司""元勤公司"等，含 OCR 空格）。
+    # 不设前边界：全称规则先执行已屏蔽更长公司名；占位符内部由 co_replacer 防护。
     r'((?:[\u4e00-\u9fa5]' + _INLINE_SP
     + r'){2,6}公' + _INLINE_SP + r'司)'
 )
@@ -723,6 +722,7 @@ class Desensitizer:
         text = self._mask_bank_card(text)       # 14-20位纯数字银行账号
         text = self._mask_credit_code_bare(text)  # 统一社会信用代码（无标签，9开头18位）
         text = self._mask_case_number(text)     # 案号
+        text = self._mask_land_plot_number(text)  # 地块编号（余政储出(2012)81号地块）
         text = self._mask_license_plate(text)  # 车牌号
         if self._mask_all_dates:
             text = self._mask_date(text)        # 全部"年月日"日期
@@ -1372,6 +1372,16 @@ class Desensitizer:
             '案号'
         )
 
+    def _mask_land_plot_number(self, text: str) -> str:
+        """地块编号：余政储出(2012)81号地块 / 余政储出(2012)81地块 → [地块编号]"""
+        return self._safe_replace(
+            text,
+            r'[\u4e00-\u9fa5]{1,4}储出[ \t]*[（(][ \t]*\d{4}[ \t]*[）)]'
+            r'[ \t]*\d+[ \t]*号?[ \t]*地块?',
+            '[地块编号]',
+            '地块编号'
+        )
+
     def _mask_license_plate(self, text: str) -> str:
         """车牌号：粤B88888 / 京A12345 等格式 — 1个汉字省份简称+1个字母城市代码+5-6位字母数字"""
         return self._safe_replace(
@@ -1784,6 +1794,13 @@ class Desensitizer:
             if (_inside_placeholder(text, m.start())
                     or name[0] in _PROJECT_GENERIC_SINGLE
                     or any(w in name for w in _PROJECT_GENERIC_WORDS)):
+                scan = m.start() + 1
+                continue
+            # 后面紧跟商户尾缀（"力灯饰商城丽信装饰材料商行"）→ 是商户名，不是项目
+            after12 = text[m.end():m.end() + 12]
+            if any(s in after12 for s in (
+                    '商行', '商店', '经营部', '服务部', '租赁站', '建材',
+                    '五金', '装饰材料', '家电商店')):
                 scan = m.start() + 1
                 continue
             out.append(text[pending:m.start()])
@@ -2596,7 +2613,7 @@ _REMAINING_PATTERNS = (
     ('角色词人名残留', re.compile(
         r'(原告|被告|上诉人|被上诉人|案外人|证人|法定代表人|负责人|审判员|书记员|'
         r'委托诉讼代理人|委托代理人|项目经理|财务人员|发包人|承包人|分包人)'
-        r'[：:，,， ]*[\u4e00-\u9fa5]{2,4}')),
+        r'[：:，,， ]*([\u4e00-\u9fa5]{2,4})')),
     ('公司/机构简称残留', re.compile(
         r'(?<![\u4e00-\u9fa5A-Za-z0-9\]])[\u4e00-\u9fa5]{2,8}'
         r'(?:公司|事务所|集团|商行|经营部|服务部|商店)')),
@@ -2632,6 +2649,11 @@ def scan_remaining_risk(masked_text: str) -> list:
                 if (name[0] in _PROJECT_GENERIC_SINGLE
                         or any(w in name for w in _PROJECT_GENERIC_WORDS)):
                     continue
+            if typ == '角色词人名残留':
+                # 只提示"像人名"的候选，过滤"原告及其原委"这类词组误报
+                name = m.group(1)
+                if not _looks_like_person_name(name):
+                    continue
             value = m.group(0)
             start = max(0, m.start() - 12)
             ctx = masked_text[start:m.end() + 12].replace('\n', ' ')
@@ -2639,8 +2661,21 @@ def scan_remaining_risk(masked_text: str) -> list:
     return findings
 
 
+def _looks_like_person_name(name: str) -> bool:
+    """审阅清单用的宽松人名判定：姓氏开头或 jieba 整词分词，且非常见词。"""
+    if (name[0] in _SURNAMES
+            or (len(name) >= 2 and name[:2] in _COMPOUND_SURNAMES)):
+        return True
+    seg = _get_segmenter()
+    if seg is not None and len(seg(name)) == 1:
+        return True
+    return False
+
+
 def build_review_text(masked_text: str, stats: dict,
-                      remaining: list = None) -> str:
+                      remaining: list = None,
+                      mapping: list = None,
+                      original_text: str = None) -> str:
     """生成"规则层脱敏结果 + 审阅清单"文本（阶段一交付物）。"""
     if remaining is None:
         remaining = scan_remaining_risk(masked_text)
@@ -2661,6 +2696,12 @@ def build_review_text(masked_text: str, stats: dict,
     else:
         lines.append(f'  ❌ 仍有关键信息残留：{"、".join(sorted(critical_hits))}'
                      '（请勿继续分享，需人工处理或反馈修复规则）')
+    if mapping is not None and original_text is not None:
+        restored = restore_text(masked_text, mapping)
+        if restored == original_text:
+            lines.append('  ✅ 还原往返校验：restore 后与原文逐字节一致')
+        else:
+            lines.append('  ❌ 还原往返校验失败（映射表与脱敏文本不一致，请勿归档/还原）')
     lines.append('')
     lines.append('【三、剩余低优先级信息（供审阅；如确认需要，再做语义层脱敏）】')
     if remaining:
@@ -2680,6 +2721,109 @@ def build_review_text(masked_text: str, stats: dict,
     lines.append('-' * 62)
     lines.append(masked_text)
     return '\n'.join(lines)
+
+
+# ============================================================
+# 阶段二：语义层（semantic 命令）— 对阶段一输出做通用语义脱敏并合并映射
+# ============================================================
+
+SEMANTIC_RULES = (
+    ('地块编号', re.compile(
+        r'[\u4e00-\u9fa5]{1,4}储出[ \t]*[（(][ \t]*\d{4}[ \t]*[）)]'
+        r'[ \t]*\d+[ \t]*号?[ \t]*地块?'), '[地块编号]', '地块编号'),
+    ('审理法院', re.compile(
+        r'浙江省杭州市临平区人民法院|临平法院'), '[审理法院]', '法院'),
+    ('关联法院', re.compile(
+        r'杭州市余杭区\s*人民\s*法\s*院|余杭区\s*人民\s*法\s*院|'
+        r'浙江省东阳市人民法院'), '[关联法院]', '法院'),
+    ('二审法院', re.compile(
+        r'浙江省杭\s*州市中级人民法院|杭\s*州市中级人民法院'), '[二审法院]', '法院'),
+    ('案外商户', re.compile(
+        r'(?:杭\s*州|嘉\s*兴市|浙江省)[\u4e00-\u9fa5 ]{2,22}'
+        r'(?:服务部|商行|经营部|商店|租赁站)'), '[案外商户]', '公司名'),
+)
+
+_SEMANTIC_PROJECT = re.compile(
+    r'([\u4e00-\u9fa5]{2,6})(?:项目|小区|大厦|花园|公寓|家园|新村|广场|商城|'
+    r'一期|二期|三期|一标段|二标段|三标段|项目部)')
+
+
+def _semantic_apply_line(line: str) -> tuple:
+    """对一行应用通用语义规则；返回 (新行, [(最终偏移, 原文, 占位符)])。"""
+    out = []
+    pending = 0
+    scan = 0
+    reps = []
+
+    def flush(start):
+        out.append(line[pending:start])
+
+    while True:
+        best = None
+        for name, pat, ph, typ in SEMANTIC_RULES:
+            m = pat.search(line, scan)
+            if m and (best is None or m.start() < best[0]):
+                best = (m.start(), m, name, ph, typ)
+        # 项目名称残留（宽松版，带泛化词组黑名单；无效匹配从下一位重试）
+        pm = _SEMANTIC_PROJECT.search(line, scan)
+        if pm and (best is None or pm.start() < best[0]):
+            best = (pm.start(), pm, '项目名称残留', '[项目名称]', '项目名称')
+        if best is None:
+            break
+        start, m, name, ph, typ = best
+        if name == '项目名称残留':
+            cand = m.group(1)
+            if (cand[0] in _PROJECT_GENERIC_SINGLE
+                    or any(w in cand for w in _PROJECT_GENERIC_WORDS)
+                    or _inside_placeholder(line, m.start())):
+                scan = m.start() + 1
+                continue
+        flush(start)
+        out.append(ph)
+        reps.append((len(''.join(out)) - len(ph), m.group(0), ph))
+        scan = m.end()
+        pending = m.end()
+    flush(len(line))
+    return ''.join(out), reps
+
+
+def run_semantic_pass(masked_text: str, stage1_rows: list) -> tuple:
+    """阶段二核心：应用通用语义规则，合并映射表。
+
+    返回 (最终文本, 合并映射行[(占位符, 原文)], 错误信息或 None)。
+    """
+    final_lines = []
+    sem_by_ph = defaultdict(list)
+    for pi, line in enumerate(masked_text.split('\n')):
+        new_line, reps = _semantic_apply_line(line)
+        final_lines.append(new_line)
+        for off, orig, ph in reps:
+            sem_by_ph[ph].append((pi, off, orig))
+    final_text = '\n'.join(final_lines)
+
+    st_by_ph = defaultdict(list)
+    for m in stage1_rows:
+        st_by_ph[m.replacement].append(m)
+    merged = []
+    err = None
+    for ph in sorted(set(st_by_ph) | set(sem_by_ph), key=lambda x: (len(x), x)):
+        st_q = st_by_ph.get(ph, [])[::-1]
+        sem_q = sem_by_ph.get(ph, [])[::-1]
+        for pi, t in enumerate(final_lines):
+            pos = 0
+            while True:
+                f = t.find(ph, pos)
+                if f == -1:
+                    break
+                if sem_q and sem_q[-1][0] == pi and sem_q[-1][1] == f:
+                    merged.append((ph, sem_q.pop()[2]))
+                else:
+                    merged.append((ph, st_q.pop().original))
+                pos = f + len(ph)
+        if st_q or sem_q:
+            err = f'映射配对失败：{ph} 剩余阶段一 {len(st_q)} 语义 {len(sem_q)}'
+            break
+    return final_text, merged, err
 
 
 # ============================================================
@@ -2812,6 +2956,22 @@ def main():
     full_parser.add_argument('--llm-timeout', type=int, default=180,
                              help='LLM 调用超时（秒）')
 
+    # semantic 命令（阶段二：语义层，AI 可直接执行，无需外部 API）
+    semantic_parser = subparsers.add_parser(
+        'semantic',
+        help='阶段二：对阶段一输出做语义层脱敏（法院/地块/商户/项目名残留），合并映射表')
+    semantic_parser.add_argument('-f', '--file', required=True,
+                                 help='阶段一脱敏文件（.txt/.docx/.pdf）')
+    semantic_parser.add_argument('-m', '--mapping', required=True,
+                                 help='阶段一映射表（.md 表格 / .json / 加密 .enc）')
+    semantic_parser.add_argument('-p', '--password',
+                                 help='加密映射表密码（也可用环境变量 DESENSITIZER_MAPPING_PASSWORD）')
+    semantic_parser.add_argument('-o', '--output', help='输出文件路径（默认 原文件_语义层.ext）')
+    semantic_parser.add_argument('--save-mapping', help='合并映射表另存为文件')
+    semantic_parser.add_argument('--original', help='原始未脱敏文件路径，用于完整还原校验')
+    semantic_parser.add_argument('--no-restore-check', action='store_true',
+                                 help='跳过还原校验')
+
     args = parser.parse_args()
 
     # 读取输入（支持 .txt / .docx / .pdf）
@@ -2929,7 +3089,10 @@ def main():
 
         # 两阶段工作流阶段一：生成"规则层结果 + 审阅清单"（供律师审阅）
         if getattr(args, 'review', False):
-            review_text = build_review_text(result.text, result.stats)
+            review_text = build_review_text(
+                result.text, result.stats,
+                mapping=result.mapping,
+                original_text=getattr(d, '_original_text', None))
             if output_path:
                 base, ext = os.path.splitext(output_path)
                 review_path = f'{base}_审阅.txt'
@@ -3096,6 +3259,62 @@ def main():
             print(f'✅ 完整脱敏（规则层+LLM层）完成: {output_path}')
         else:
             print(result.text)
+
+    elif args.command == 'semantic':
+        # 阶段二（语义层）：对阶段一输出做通用语义脱敏 + 合并映射 + 还原校验
+        masked_text = read_text_from_file(args.file)
+        ext = os.path.splitext(args.mapping)[1].lower()
+        if ext == '.enc':
+            password = args.password or os.environ.get(
+                'DESENSITIZER_MAPPING_PASSWORD', '')
+            if not password:
+                import getpass
+                password = getpass.getpass('🔑 请输入映射表解密密码（不显示）：')
+                if not password:
+                    sys.exit('❌ 密码不能为空')
+            content = decrypt_mapping_encrypted(args.mapping, password)
+            password = ''
+        else:
+            with open(args.mapping, 'r', encoding='utf-8') as f:
+                content = f.read()
+        stage1 = parse_mapping_text(content)
+        if not stage1:
+            sys.exit('❌ 未能从映射表解析出任何条目（支持 .md 表格 / .json / 加密 .enc）')
+        final_text, merged, err = run_semantic_pass(masked_text, stage1)
+        if err:
+            sys.exit(f'❌ 语义层失败：{err}\n'
+                     '   已中止，未生成输出（避免映射错位导致无法还原）。\n'
+                     '   可先用 restore 验证阶段一映射，或反馈维护语义规则。')
+
+        output_path = args.output
+        if not output_path:
+            base, e = os.path.splitext(args.file)
+            output_path = f'{base}_语义层{e if e else ".txt"}'
+        write_desensitized_file(args.file, output_path, final_text)
+        print(f'✅ 语义层脱敏完成: {output_path}')
+
+        if args.save_mapping:
+            lines = ['# 脱敏映射表（规则层 + 语义层合并，每处一行）',
+                     '| 序号 | 原始值 | 替换值 | 类型 | 出现次数 |',
+                     '|------|--------|--------|------|---------|']
+            for i, (ph, orig) in enumerate(merged, 1):
+                lines.append(f'|{i}|{orig}|{ph}| |1|')
+            with open(args.save_mapping, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines) + '\n')
+            print(f'📋 合并映射表已保存: {args.save_mapping}')
+
+        if not args.no_restore_check:
+            maps = [Mapping(original=orig, replacement=ph, type='',
+                            count=1, order=i)
+                    for i, (ph, orig) in enumerate(merged, 1)]
+            if args.original:
+                orig_text = read_text_from_file(args.original)
+                ok = restore_text(final_text, maps) == orig_text
+                print('还原校验（对照原文）:',
+                      '✅ 逐字节一致' if ok else '❌ 不一致，请勿归档')
+            else:
+                print('✅ 映射配对校验通过（每处占位符均有对应原始值）；'
+                      '传 --original 可做完整还原校验')
 
     else:
         parser.print_help()

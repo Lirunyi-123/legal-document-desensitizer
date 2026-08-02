@@ -337,6 +337,34 @@ class TestRealCaseFixes(unittest.TestCase):
         self.assertNotIn('余杭区[当事人', r.text)
         self.assertNotIn('承[当事人', r.text)
 
+    def test_land_plot_number(self):
+        r = self.d.mask('余政储出(2012)81号地块怡丰城项目，'
+                        '另见余政储出(2012)81地块开发项目。')
+        self.assertEqual(r.text.count('[地块编号]'), 2)
+        self.assertNotIn('余政储出', r.text)
+
+    def test_project_not_merchant(self):
+        # 项目名规则不得吞商户名（"力灯饰商城丽信装饰材料商行"）
+        r = self.d.mask('杭州华力灯饰商城丽信装饰材料商行供货，怡丰城项目复工。')
+        self.assertNotIn('力灯饰[项目名称]', r.text)
+        self.assertEqual(r.text.count('[项目名称]'), 1)
+
+    def test_semantic_pass_merge_restore(self):
+        # 阶段二：语义层合并映射后 restore 仍无损还原
+        from desensitize import run_semantic_pass
+        text = '案涉怡丰城项目，杭州市余杭区人民法院受理，余政储出(2012)81号地块。'
+        r = self.d.mask(text)
+        final_text, merged, err = run_semantic_pass(r.text, r.mapping)
+        self.assertIsNone(err)
+        self.assertIn('[关联法院]', final_text)   # 余杭区法院 → [关联法院]
+        self.assertIn('[项目名称]', final_text)
+        self.assertIn('[地块编号]', final_text)
+        maps = [__import__('desensitize').Mapping(
+            original=orig, replacement=ph, type='', count=1, order=i)
+            for i, (ph, orig) in enumerate(merged, 1)]
+        from desensitize import restore_text
+        self.assertEqual(restore_text(final_text, maps), text)
+
     def test_restore_person_no_delimiter(self):
         # 无分隔符人名不插空格，还原后与原文完全一致
         self._roundtrip('原告陈建国，被告李四。')

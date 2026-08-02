@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """生成 宣传介绍.docx（launch_messaging_guide 预设）。"""
 
+import os
+
 import docx
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor, Twips
@@ -503,7 +505,9 @@ def main():
                    '关键文书建议脱敏后人工抽检。')
     set_run_font(r, size=10, italic=True, color=GRAY)
 
-    out = '宣传介绍.docx'
+    # 输出到脚本所在目录（docs/），从仓库根目录执行也能正确落位
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       '宣传介绍.docx')
     doc.save(out)
     print('saved', out)
 

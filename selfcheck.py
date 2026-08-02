@@ -190,7 +190,7 @@ def main():
     fails = sum(1 for r in results if not r)
     if fails:
         print(f'结果：{len(results) - fails} 通过，{fails} 项失败 ❌')
-        print('请把上方 FAIL 项的输出发给维护者，或对照《自检清单.md》排查。')
+        print('请把上方 FAIL 项的输出发给维护者，或对照《docs/自检清单.md》排查。')
         return 1
     print(f'结果：{len(results)} 项必检全部通过 ✅')
     print('规则层可复现性已验证：文件一致 + 测试一致 + 评测一致 + 还原一致。')

@@ -1713,6 +1713,10 @@ def main():
   # v2.2: 用映射表还原脱敏文本（律师庭审/归档等需要原文时）
   python desensitize.py restore -f 脱敏后.txt -m 映射表.md
   python desensitize.py restore -f 脱敏后.docx -m 映射表.enc -o 还原.docx
+
+  # v2.3: 完整脱敏流水线（规则层 + 本地 LLM 二轮脱敏 + 合并映射）
+  python desensitize.py full -f 判决书.docx --save-mapping 映射表.enc --encrypt-mapping
+  python desensitize.py full -f 聊天记录.txt --llm-api ollama --llm-model qwen2.5
         """
     )
 
@@ -1764,6 +1768,27 @@ def main():
     restore_parser.add_argument('-m', '--mapping', required=True, help='映射表文件（.md 表格 / .json / 加密 .enc）')
     restore_parser.add_argument('-p', '--password', help='加密映射表密码（也可用环境变量 DESENSITIZER_MAPPING_PASSWORD）')
     restore_parser.add_argument('-o', '--output', help='还原后的输出路径（默认输出到 stdout）')
+
+    # full 命令（规则层 + LLM 层）
+    full_parser = subparsers.add_parser(
+        'full',
+        help='完整脱敏：规则层 + 本地 LLM 二轮脱敏（覆盖裸人名/无结构地址/案情细节），合并映射表')
+    full_parser.add_argument('-f', '--file', help='输入文件路径（默认从stdin读取）')
+    full_parser.add_argument('-o', '--output', help='输出文件路径')
+    full_parser.add_argument('--save-mapping', help='合并映射表另存为文件（含 LLM 层条目）')
+    full_parser.add_argument('--encrypt-mapping', action='store_true',
+                             help='对映射表进行 AES-256 加密保存（需配合 --save-mapping）')
+    full_parser.add_argument('--secure', action='store_true', default=False,
+                             help='启用内存安全增强模式')
+    full_parser.add_argument('--all-dates', action='store_true', default=False,
+                             help='把文中所有"年月日"日期也替换为 [日期]')
+    full_parser.add_argument('--llm-api', default='ollama', choices=['ollama', 'openai'],
+                             help='LLM API 类型：ollama（默认）/ openai 兼容')
+    full_parser.add_argument('--llm-model', default='qwen2.5', help='LLM 模型名')
+    full_parser.add_argument('--llm-endpoint', default='http://localhost:11434',
+                             help='LLM 服务地址（Ollama 默认 http://localhost:11434）')
+    full_parser.add_argument('--llm-timeout', type=int, default=180,
+                             help='LLM 调用超时（秒）')
 
     args = parser.parse_args()
 
@@ -1981,6 +2006,55 @@ def main():
             print(f'✅ 已还原 {len(mappings)} 个映射条目，保存至: {args.output}')
         else:
             print(restored)
+
+    elif args.command == 'full':
+        # 完整脱敏流水线：规则层 + 本地 LLM 二轮脱敏
+        from llm_layer import LLMConfig, full_desensitize, LLMLayerError
+
+        config = LLMConfig(api=args.llm_api, model=args.llm_model,
+                           endpoint=args.llm_endpoint, timeout=args.llm_timeout)
+        if sys.stderr.isatty():
+            print('⚠️  完整脱敏会将规则层处理后的文本发送到 LLM 服务：'
+                  f'{config.endpoint}（模型 {config.model}）', file=sys.stderr)
+            print('   请确认该服务为本地或可信服务，规则层已先替换身份证号、'
+                  '手机号等结构化数据', file=sys.stderr)
+        try:
+            result, warnings = full_desensitize(
+                text, config,
+                mask_all_dates=getattr(args, 'all_dates', False),
+                secure=getattr(args, 'secure', False))
+        except LLMLayerError as e:
+            sys.exit(f'❌ LLM 层失败：{e}\n'
+                     '   已中止，未生成"完整脱敏"输出（避免产出未经验证的脱敏文档）。\n'
+                     '   如需仅规则层结果，请改用: python desensitize.py mask')
+        for w in warnings:
+            print(f'⚠️  {w}', file=sys.stderr)
+
+        # 保存合并映射表
+        if args.save_mapping:
+            mapping_content = result.to_markdown()
+            if args.encrypt_mapping:
+                try:
+                    save_mapping_encrypted(mapping_content, args.save_mapping)
+                except ImportError:
+                    sys.exit('❌ 需要安装 cryptography: pip3 install cryptography')
+                print(f'🔐 合并映射表已 AES-256-GCM 加密保存: {args.save_mapping}')
+            else:
+                with open(args.save_mapping, 'w', encoding='utf-8') as f:
+                    f.write(mapping_content)
+                print(f'⚠️  合并映射表已保存（明文）: {args.save_mapping}')
+                print('⚠️  该文件含原始敏感信息，切勿上传网络，建议 --encrypt-mapping')
+
+        # 输出
+        output_path = args.output
+        if not output_path and args.file:
+            base, ext = os.path.splitext(args.file)
+            output_path = f'{base}_desensitized{ext if ext else ".txt"}'
+        if output_path:
+            write_desensitized_file(args.file, output_path, result.text)
+            print(f'✅ 完整脱敏（规则层+LLM层）完成: {output_path}')
+        else:
+            print(result.text)
 
     else:
         parser.print_help()

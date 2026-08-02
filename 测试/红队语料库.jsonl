@@ -27,7 +27,10 @@
 {"id": "person_01", "note": "原告人名（角色词+姓名）", "text": "原告：陈建国，男，汉族", "expect_masked": [{"type": "人名", "value": "陈建国"}], "expect_kept": []}
 {"id": "person_02", "note": "被告/法定代表人", "text": "被告：杭州鼎盛房地产开发有限公司，法定代表人：李四", "expect_masked": [{"type": "人名", "value": "李四"}, {"type": "公司名", "value": "杭州鼎盛房地产开发有限公司"}], "expect_kept": []}
 {"id": "person_03", "note": "委托诉讼代理人", "text": "委托诉讼代理人：赵敏，浙江泽大律师事务所律师", "expect_masked": [{"type": "人名", "value": "赵敏"}, {"type": "公司名", "value": "浙江泽大律师事务所"}], "expect_kept": []}
-{"id": "person_04", "note": "LLM层覆盖项（裸人名，规则层不承诺）", "text": "张三欠李四钱不还", "expect_masked": [], "expect_kept": ["张三欠李四钱不还"], "llm_only": ["人名", "人名"]}
+{"id": "person_04", "note": "LLM层覆盖项（裸人名，规则层不承诺）", "text": "张三欠李四钱不还", "expect_masked": [], "expect_kept": [], "llm_only": [{"type": "人名", "value": "张三"}, {"type": "人名", "value": "李四"}]}
+{"id": "llm_02", "note": "LLM层覆盖项（无省市区层级的地址）", "text": "双方约定在望京西园四区410楼当面核账", "expect_masked": [], "expect_kept": [], "llm_only": [{"type": "地址", "value": "望京西园四区410楼"}]}
+{"id": "llm_03", "note": "LLM层覆盖项（案情敏感细节）", "text": "原告称其因婚外情导致家庭破裂，并曾接受心理治疗", "expect_masked": [], "expect_kept": [], "llm_only": [{"type": "案情细节", "value": "婚外情"}]}
+{"id": "llm_04", "note": "LLM层覆盖项（裸公司简称）", "text": "华信置业与鼎盛集团签订合作框架协议", "expect_masked": [], "expect_kept": [], "llm_only": [{"type": "公司名", "value": "华信置业"}, {"type": "公司名", "value": "鼎盛集团"}]}
 {"id": "company_01", "note": "有限责任公司全称", "text": "甲方：北京华信科技有限公司", "expect_masked": [{"type": "公司名", "value": "北京华信科技有限公司"}], "expect_kept": []}
 {"id": "company_02", "note": "公司简称", "text": "华信置业公司应于三日内付款", "expect_masked": [{"type": "公司名", "value": "华信置业公司"}], "expect_kept": []}
 {"id": "addr_01", "note": "住所地地址", "text": "住所地浙江省杭州市西湖区文一西路1号", "expect_masked": [{"type": "地址", "value": "浙江省杭州市西湖区文一西路1号"}], "expect_kept": []}

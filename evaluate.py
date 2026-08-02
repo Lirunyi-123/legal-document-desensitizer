@@ -67,7 +67,7 @@ def _partial_leak(value, masked_text, n=6):
     return any(value[i:i + n] in masked_text for i in range(len(value) - n + 1))
 
 
-def run_case(case, desensitizer):
+def run_case(case, desensitizer, include_llm=False):
     """对单个用例执行脱敏并给出结构化结果。"""
     text = case['text']
     result = desensitizer.mask(text)
@@ -97,7 +97,32 @@ def run_case(case, desensitizer):
         ok = value not in masked_text
         checks.append({'kind': 'absent', 'type': '泄露检查', 'value': value,
                        'ok': ok, 'detail': value not in masked_text})
+    # LLM 层覆盖项：仅在 LLM 评测模式下作为硬性期望
+    for item in case.get('llm_only', []):
+        if isinstance(item, str):
+            continue  # 无值的旧格式条目：仅计数，不验证
+        value = item.get('value', '')
+        if not value or not include_llm:
+            continue
+        ok = value not in masked_text
+        checks.append({'kind': 'llm', 'type': item.get('type', 'LLM层'),
+                       'value': value, 'ok': ok,
+                       'detail': value not in masked_text})
     return result, checks
+
+
+class FullPipeline:
+    """规则层 + LLM 层完整流水线（评测用）"""
+
+    def __init__(self, llm_config, mask_all_dates=False):
+        self._config = llm_config
+        self._mask_all_dates = mask_all_dates
+
+    def mask(self, text):
+        from llm_layer import full_desensitize
+        result, _ = full_desensitize(text, self._config,
+                                     mask_all_dates=self._mask_all_dates)
+        return result
 
 
 def main():
@@ -108,10 +133,26 @@ def main():
                         help='使用 --all-dates 全量日期模式评测')
     parser.add_argument('--report', help='输出 Markdown 报告路径')
     parser.add_argument('--json', dest='json_out', help='输出 JSON 结果路径')
+    parser.add_argument('--llm-api', default=None, choices=['ollama', 'openai'],
+                        help='启用 LLM 评测模式并指定 API（ollama/openai 兼容）')
+    parser.add_argument('--llm-model', default='qwen2.5', help='LLM 模型名')
+    parser.add_argument('--llm-endpoint', default='http://localhost:11434',
+                        help='LLM 服务地址')
+    parser.add_argument('--llm-timeout', type=int, default=180,
+                        help='LLM 调用超时（秒）')
     args = parser.parse_args()
 
     from desensitize import Desensitizer
-    d = Desensitizer(mask_all_dates=args.all_dates)
+    if args.llm_api:
+        from llm_layer import LLMConfig
+        d = FullPipeline(
+            LLMConfig(api=args.llm_api, model=args.llm_model,
+                      endpoint=args.llm_endpoint, timeout=args.llm_timeout),
+            mask_all_dates=args.all_dates)
+        llm_mode = True
+    else:
+        d = Desensitizer(mask_all_dates=args.all_dates)
+        llm_mode = False
     cases = load_corpus(args.corpus)
     if not cases:
         sys.exit('❌ 未读取到任何用例，请检查语料库路径')
@@ -119,7 +160,20 @@ def main():
     # 运行全部用例
     results = []
     for case in cases:
-        result, checks = run_case(case, d)
+        try:
+            result, checks = run_case(case, d, include_llm=llm_mode)
+        except Exception as e:
+            results.append({
+                'id': case.get('id', f'line{case["_lineno"]}'),
+                'note': case.get('note', ''),
+                'masked': '',
+                'checks': [],
+                'failures': [{'kind': 'llm', 'type': 'LLM层',
+                              'value': '', 'ok': False,
+                              'detail': f'流水线异常：{e}'}],
+                'llm_only': case.get('llm_only', []),
+            })
+            continue
         failures = [c for c in checks if not c['ok']]
         results.append({
             'id': case.get('id', f'line{case["_lineno"]}'),
@@ -135,20 +189,26 @@ def main():
     kept_total = kept_fail = 0
     absent_total = absent_fail = 0
     llm_only_total = 0
+    llm_hit_total = 0
     failed_cases = []
     for r in results:
         for c in r['checks']:
-            if c['kind'] == 'masked':
+            if c['kind'] in ('masked', 'llm'):
                 type_stats[c['type']]['expected'] += 1
                 if c['ok']:
                     type_stats[c['type']]['hit'] += 1
+                if c['kind'] == 'llm':
+                    llm_only_total += 1
+                    if c['ok']:
+                        llm_hit_total += 1
             elif c['kind'] == 'kept':
                 kept_total += 1
                 kept_fail += 0 if c['ok'] else 1
             elif c['kind'] == 'absent':
                 absent_total += 1
                 absent_fail += 0 if c['ok'] else 1
-        llm_only_total += len(r['llm_only'])
+        if not llm_mode:
+            llm_only_total += len([i for i in r['llm_only'] if not isinstance(i, str)])
         if r['failures']:
             failed_cases.append(r)
 
@@ -161,12 +221,16 @@ def main():
     print('法律文书脱敏规则层 — 红队评测报告')
     print('=' * 62)
     print(f'用例总数: {len(results)}   通过: {len(results) - len(failed_cases)}   失败: {len(failed_cases)}')
+    print(f'评测模式: {"规则层+LLM层" if llm_mode else "仅规则层"}')
     print(f'结构化期望: {expected_total} 项，命中 {hit_total} 项，召回率 {recall:.1%}')
     print(f'保留项检查: {kept_total} 项，误报 {kept_fail} 项')
     if absent_total:
         print(f'泄露检查: {absent_total} 项，发现泄露 {absent_fail} 项')
     if llm_only_total:
-        print(f'LLM 层待覆盖项（不计入召回率）: {llm_only_total} 项')
+        if llm_mode:
+            print(f'LLM 层覆盖项（已计入召回率）: {llm_hit_total}/{llm_only_total}')
+        else:
+            print(f'LLM 层待覆盖项（不计入召回率）: {llm_only_total} 项')
     print()
     print('按类型召回率：')
     print(f'  {"类型":<16}{"期望":>5}{"命中":>5}{"召回率":>9}')
@@ -188,6 +252,8 @@ def main():
                     print(f'    ✗ 误脱敏: 应保留的 {c["value"]} 被替换')
                 elif c['kind'] == 'absent':
                     print(f'    ✗ 泄露: 原文仍包含 {c["value"]}')
+                elif c['kind'] == 'llm':
+                    print(f'    ✗ LLM层未脱敏: {c["type"]} = {c["value"]}（{c["detail"]}）')
 
     # 输出 Markdown 报告
     if args.report:
@@ -196,7 +262,8 @@ def main():
             '',
             f'- 评测时间：{__import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")}',
             f'- 语料库：{args.corpus}',
-            f'- 模式：{"全量日期（--all-dates）" if args.all_dates else "默认（仅出生日期）"}',
+            f'- 模式：{"规则层+LLM层（--llm-api）" if llm_mode else "仅规则层"}'
+            f'，日期：{"全量（--all-dates）" if args.all_dates else "默认（仅出生日期）"}',
             '',
             '## 总览',
             '',
@@ -232,6 +299,8 @@ def main():
                         lines.append(f'- ✗ 误脱敏：应保留的 `{c["value"]}` 被替换')
                     elif c['kind'] == 'absent':
                         lines.append(f'- ✗ 泄露：原文仍包含 `{c["value"]}`')
+                    elif c['kind'] == 'llm':
+                        lines.append(f'- ✗ LLM层未脱敏：{c["type"]} = `{c["value"]}`')
                 lines.append(f'  - 原文：{r["masked"]}')
         with open(args.report, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
@@ -248,9 +317,10 @@ def main():
                 'kept_total': kept_total,
                 'kept_fail': kept_fail,
                 'absent_total': absent_total,
-                'absent_fail': absent_fail,
-                'llm_only_total': llm_only_total,
-            },
+            'absent_fail': absent_fail,
+            'llm_only_total': llm_only_total,
+            'llm_hit_total': llm_hit_total,
+        },
             'by_type': {t: dict(s) for t, s in type_stats.items()},
             'failed_cases': [{'id': r['id'], 'note': r['note'],
                               'failures': r['failures']} for r in failed_cases],

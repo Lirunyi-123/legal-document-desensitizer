@@ -228,6 +228,36 @@ python3 desensitize.py mask -f 合同.docx --ner-backend llm --ner-model qwen2.5
 
 后端缺失时给出安装指引并优雅退出，不影响纯规则层。
 
+## v2.3 完整脱敏流水线 full（LLM 层自动化）
+
+规则层之后自动调用本地 LLM 做二轮语义脱敏，补齐三类短板：
+裸人名（无角色词）、无省市区层级的地址、案情敏感细节。
+
+```bash
+# Ollama（默认，数据不出本机）
+python3 desensitize.py full -f 判决书.docx --llm-model qwen2.5 \
+  --save-mapping 映射表.enc --encrypt-mapping
+
+# OpenAI 兼容本地服务（LM Studio / vLLM）
+python3 desensitize.py full -f 判决书.docx --llm-api openai \
+  --llm-endpoint http://localhost:1234 --llm-model local-model
+```
+
+流程：规则层先替换结构化数据 → LLM 只看到占位符文本 → LLM 返回
+"脱敏后全文 + 补充映射表" → 失败安全校验 → 与规则层映射合并（按原文位置排序）→ 输出。
+
+**失败安全**：LLM 输出若增删行、改动已有占位符、声称替换的值仍残留，全部拒绝采用并中止，
+不产出未经验证的"完整脱敏"文档。映射合并后 `restore` 一键无损还原。
+
+### LLM 评测模式
+
+```bash
+python3 evaluate.py --llm-api ollama --llm-model qwen2.5
+```
+
+语料库 `llm_only` 条目在 LLM 模式下成为硬性期望并计入召回率；
+不传 `--llm-*` 时保持仅规则层评测。
+
 ## 执行流程
 
 ### 步骤1：读取文档内容

@@ -3,6 +3,7 @@
 规则引擎 + EntityResolver 实体归一化 + 本地 NER + LLM 混合脱敏工具，专为中国法律文书设计。
 
 > **v2.2 新特性**：GB 11643/GB 32100 校验码 | 一键还原 restore | 红队评测 evaluate | 本地 NER 接入
+> **v2.3 新特性**：full 完整脱敏流水线（规则层+本地LLM）| LLM 补充映射合并还原 | evaluate --llm 评测
 > **v2.1 新特性**：EntityResolver 实体归一化 | SecureDesensitizer 内存安全模式 | 零信任 AES-256-GCM 加密映射表 | 文件名自动脱敏
 
 ## 功能
@@ -54,6 +55,13 @@ python3 evaluate.py --report 评测报告.md
 python desensitize.py mask -f 合同.docx --ner-backend spacy --ner-model zh_core_web_trf
 python desensitize.py mask -f 合同.docx --ner-backend llm --ner-model qwen2.5
 
+# v2.3 完整脱敏流水线（规则层 + 本地 LLM 二轮脱敏，覆盖裸人名/无结构地址/案情细节）
+python desensitize.py full -f 判决书.docx --llm-api ollama --llm-model qwen2.5 \
+  --save-mapping 映射表.enc --encrypt-mapping
+
+# v2.3 LLM 评测模式（把 LLM 层覆盖项计入召回率）
+python3 evaluate.py --llm-api ollama --llm-model qwen2.5 --report 评测报告.md
+
 # JSON 格式输出
 python desensitize.py mask --json -f 文档.docx
 
@@ -71,6 +79,37 @@ spaCy（zh_core_web_trf）| HuggingFace（bert 系中文 NER）| 本地 Ollama�
 
 ### LLM层（5类）
 自然人姓名、公司/机构名称、地址信息、金额、敏感案情细节（通过 `llm-prompt` 生成提示词）
+
+## v2.3 完整脱敏流水线 full
+
+一条命令跑完"规则层 + LLM 层"，把短板（裸人名、无结构地址、案情敏感细节）补上：
+
+```bash
+# Ollama（默认）
+python desensitize.py full -f 判决书.docx --llm-model qwen2.5 \
+  --save-mapping 映射表.enc --encrypt-mapping
+
+# OpenAI 兼容本地服务（LM Studio / vLLM）
+python desensitize.py full -f 判决书.docx --llm-api openai \
+  --llm-endpoint http://localhost:1234 --llm-model local-model
+```
+
+执行流程：
+1. **规则层**先把身份证/手机号等结构化数据替换为占位符
+2. **LLM 层**只看到脱敏后的文本，识别并替换剩余敏感信息（裸人名、无省市区层级的地址、案情隐私细节、遗漏金额），输出"脱敏后全文 + 补充映射表"
+3. **失败安全**：LLM 输出若增删行、改动已有占位符、声称替换的值仍残留原文，一律拒绝采用并中止，不产出未经验证的"完整脱敏"文档
+4. **合并映射**：规则层与 LLM 层映射按原文位置统一排序，`restore` 一条命令无损还原
+
+**数据安全**：默认仅连接本机 Ollama（localhost），规则层之后才发送文本。务必确认 endpoint 是本地或可信服务。
+
+### evaluate --llm 评测模式
+
+```bash
+python3 evaluate.py --llm-api ollama --llm-model qwen2.5
+```
+
+语料库中的 `llm_only` 条目（裸人名/无结构地址/案情细节）在 LLM 模式下成为硬性期望并计入召回率；
+不传 `--llm-*` 时保持仅规则层评测，如实标注"LLM 层待覆盖项"。
 
 ## v2.2 新增能力
 

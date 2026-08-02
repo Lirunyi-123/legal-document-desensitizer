@@ -38,10 +38,11 @@ class Mapping:
     replacement: str
     type: str           # 类型：身份证号、手机号、人名、公司名、地址、案号...
     count: int = 1      # 出现次数
+    order: int = 0      # 首次出现顺序（用于还原时按原文顺序配对）
 
     def to_dict(self):
         return {'original': self.original, 'replacement': self.replacement,
-                'type': self.type, 'count': self.count}
+                'type': self.type, 'count': self.count, 'order': self.order}
 
 
 @dataclass
@@ -66,7 +67,7 @@ class MaskResult:
             "| 序号 | 原始值 | 替换值 | 类型 | 出现次数 |",
             "|------|--------|--------|------|---------|",
         ]
-        for i, m in enumerate(self.mapping, 1):
+        for i, m in enumerate(sorted(self.mapping, key=lambda m: m.order), 1):
             lines.append(f"| {i} | {m.original} | {m.replacement} | {m.type} | {m.count} |")
 
         lines.extend(["", "", "## 统计", ""])
@@ -95,6 +96,65 @@ def _is_valid_id_birthdate(value: str) -> bool:
     return 1 <= day <= calendar.monthrange(year, month)[1]
 
 
+# GB 11643-1999 居民身份证校验
+# 前17位加权因子与第18位校验码映射表
+_ID_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+_ID_CHECK_CODES = '10X98765432'
+
+
+def _is_valid_id_checksum(value: str) -> bool:
+    """GB 11643 身份证第18位校验码验证。
+
+    只有通过校验码验证的号码才是真正合法的身份证号，可有效区分
+    "长得像身份证的银行卡/订单号"与真实身份证号。
+    """
+    if len(value) != 18 or not value[:17].isdigit():
+        return False
+    total = sum(int(value[i]) * _ID_WEIGHTS[i] for i in range(17))
+    return value[17].upper() == _ID_CHECK_CODES[total % 11]
+
+
+def _is_plausible_id(value: str) -> bool:
+    """无标签身份证判定：GB 11643 校验码合法，或内嵌有效出生日期（兼容录入错误）。"""
+    return _is_valid_id_checksum(value) or _is_valid_id_birthdate(value)
+
+
+# GB 32100-2015 统一社会信用代码校验
+# 18位字符集（排除 I O S V Z），加权因子
+_CREDIT_ALPHABET = '0123456789ABCDEFGHJKLMNPQRTUWXY'
+_CREDIT_WEIGHTS = [1, 3, 9, 27, 19, 26, 16, 17, 20, 29, 25, 13, 8, 24, 10, 30, 28]
+
+
+def _is_valid_credit_code(value: str) -> bool:
+    """GB 32100 统一社会信用代码第18位校验码验证（含 9 字头主体标识码规则）。"""
+    if len(value) != 18:
+        return False
+    value = value.upper()
+    total = 0
+    for i, ch in enumerate(value[:17]):
+        if ch not in _CREDIT_ALPHABET:
+            return False
+        total += _CREDIT_ALPHABET.index(ch) * _CREDIT_WEIGHTS[i]
+    check = _CREDIT_ALPHABET[(31 - total % 31) % 31]
+    return check == value[17]
+
+
+def _luhn_check(value: str) -> bool:
+    """Luhn 算法校验银行卡号。"""
+    if not value.isdigit() or len(value) < 12:
+        return False
+    total = 0
+    reverse = value[::-1]
+    for i, ch in enumerate(reverse):
+        n = int(ch)
+        if i % 2 == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+
 # 带上下文的规则：前缀组保留原文，目标值进入映射表
 _BAR_PATTERN = re.compile(
     r'((?:执业证号|执业许可证号|律师执业证号|律师执业证|执业证)\s*[：:]?\s*)'
@@ -115,6 +175,26 @@ _BIRTHDATE_CONTEXT = re.compile(
 _QQ_PATTERN = re.compile(
     r'((?:QQ|Qq|qq)\s*[：:]?\s*)(\d{5,12})(?!\d)'
 )
+
+# 其他证件（带上下文，律师办案常见）
+_OTHER_CERT_PATTERNS = [
+    (r'((?:护照|护照号)\s*[：:]?\s*)([A-Za-z0-9]{6,12})', '护照号'),
+    (r'((?:港澳通行证|往来港澳通行证|港澳居民来往内地通行证)\s*[：:]?\s*)([A-Za-z0-9]{5,12})', '港澳通行证'),
+    (r'((?:台湾居民来往大陆通行证|台胞证)\s*[：:]?\s*)([A-Za-z0-9]{5,12})', '台胞证'),
+    (r'((?:驾驶证|驾驶证号|驾驶证号码)\s*[：:]?\s*)([0-9A-Za-z]{6,20})', '驾驶证号'),
+    (r'((?:军官证|士兵证|警官证|工作证)\s*[：:]?\s*)([0-9A-Za-z]{4,20})', '军官证'),
+    (r'((?:营业执照|营业执照号|营业执照号码)\s*[：:]?\s*)([0-9A-Za-z]{8,20})', '营业执照号'),
+    (r'((?:税务登记证号|税务登记号)\s*[：:]?\s*)([0-9A-Za-z]{8,20})', '税务登记号'),
+]
+
+# 银行账号（带上下文，标签具有权威性，无条件替换）
+_ACCOUNT_CONTEXT = re.compile(
+    r'((?:银行账号|开户账号|账户号码|银行卡号|收款账号|付款账号|卡号)\s*[：:]?\s*)'
+    r'([0-9]{12,24})'
+)
+
+# 组织机构代码（老式 8-1 位格式，如 69920000-2）
+_ORG_CODE_PATTERN = re.compile(r'(?<![0-9A-Z-])([0-9A-Z]{8}-[0-9A-Z])(?![0-9A-Z-])')
 
 
 # ============================================================
@@ -289,6 +369,7 @@ class Desensitizer:
         # 已替换的记录，避免重复替换
         self._replaced = {}   # original -> (replacement, type)
         self._counts = {}     # original -> 出现次数（按原始值统计）
+        self._order = {}      # original -> 首次出现顺序（用于还原）
         self._counter = {}    # type -> counter for unique naming
         self._stats = {}      # type -> count
 
@@ -302,15 +383,39 @@ class Desensitizer:
 
         # 预处理：清洗零宽字符、全角字母转半角
         text = self._preprocess(text)
+        self._original_text = text  # 保留原文用于跨规则的出现顺序修正
 
+        text = self._run_rules(text)
+        return self._finalize(text)
+
+    def mask_with_ner(self, text: str, ner_backend=None) -> MaskResult:
+        """规则层 + 本地 NER 层脱敏。
+
+        ner_backend: ner_interface.LegalNER 实例（spaCy / HuggingFace / 本地 LLM），
+        在规则层完成后，再识别规则覆盖不到的人名、公司名、地址、法院等
+        非结构化实体并替换，同一实体仍由 EntityResolver 归一化。
+        """
+        self._reset()
+        text = self._preprocess(text)
+        self._original_text = text
+
+        text = self._run_rules(text)
+        if ner_backend is not None:
+            text = self._apply_ner_entities(text, ner_backend)
+        return self._finalize(text)
+
+    def _run_rules(self, text: str) -> str:
+        """按顺序执行全部规则层正则（先精确匹配再宽泛匹配）。"""
         # 按顺序执行各规则（先精确匹配再宽泛匹配）
         text = self._mask_bar_number(text)    # 律师执业证号（带上下文，优先）
+        text = self._mask_other_cert(text)    # 护照/港澳通行证/驾驶证等证件号（优先于身份证/微信，避免误判）
         text = self._mask_id_card(text)        # 身份证号（上下文优先，无标签需内嵌有效出生日期）
         text = self._mask_email(text)           # 邮箱（优先于手机号，避免"138...@qq.com"被拆开）
         text = self._mask_phone(text)           # 手机号
         text = self._mask_landline(text)        # 固定电话
         text = self._mask_wechat(text)          # 微信号
         text = self._mask_qq(text)              # QQ号
+        text = self._mask_org_code(text)        # 组织机构代码（8-1位格式）
         text = self._mask_credit_code(text)     # 统一社会信用代码（带"信用代码"上下文）
         text = self._mask_bank_card(text)       # 14-20位纯数字银行账号
         text = self._mask_credit_code_bare(text)  # 统一社会信用代码（无标签，9开头18位）
@@ -324,6 +429,12 @@ class Desensitizer:
         text = self._mask_company_name(text)   # 公司名
         text = self._mask_address(text)        # 地址
         text = self._mask_amount(text)         # 金额（带单位的大额数字）
+        return text
+
+    def _finalize(self, text: str) -> MaskResult:
+        """构建映射表与统计（mask / mask_with_ner 共用）。"""
+        # 修正映射顺序：按原文出现顺序重新编号（还原时按原文顺序配对）
+        self._assign_text_order(self._original_text)
 
         # 构建映射表
         mapping = []
@@ -332,11 +443,12 @@ class Desensitizer:
                 original=original,
                 replacement=replacement,
                 type=typ,
-                count=self._counts.get(original, 0)
+                count=self._counts.get(original, 0),
+                order=self._order.get(original, 0)
             ))
 
-        # 排序：按出现次数降序
-        mapping.sort(key=lambda m: m.count, reverse=True)
+        # 排序：按首次出现顺序（还原时按原文顺序配对）
+        mapping.sort(key=lambda m: m.order)
 
         # 统计
         stats = dict(self._stats)
@@ -345,16 +457,89 @@ class Desensitizer:
 
         return MaskResult(text=text, mapping=mapping, stats=stats)
 
+    def _apply_ner_entities(self, text: str, ner_backend) -> str:
+        """用本地 NER 识别规则层未覆盖的实体并替换为语义占位符。"""
+        try:
+            from ner_interface import EntityType
+        except ImportError:
+            return text
+
+        ner_result = ner_backend.extract(text)
+        entities = [e for e in ner_result.entities
+                    if e.confidence >= 0.5 and '[' not in e.text and ']' not in e.text]
+        entities.sort(key=lambda e: (e.start, -e.end))
+
+        # 第一遍：正序解析并记录映射（保证 order 与原文一致）
+        for e in entities:
+            self._resolve_ner_entity(e, EntityType, record=True)
+
+        # 第二遍：逆序替换，避免位置偏移
+        for e in reversed(entities):
+            placeholder, typ = self._resolve_ner_entity(e, EntityType, record=False)
+            if not placeholder:
+                continue
+            text = text[:e.start] + placeholder + text[e.end:]
+        return text
+
+    def _resolve_ner_entity(self, entity, EntityType, record: bool) -> tuple:
+        """解析单个 NER 实体 → (占位符, 类型)；record=True 时记入映射表。"""
+        etype = entity.type
+        value = entity.text
+
+        if etype == EntityType.LAWYER:
+            _, placeholder = self._resolver.resolve_person(value, 'lawyer')
+            typ = '人名'
+        elif etype == EntityType.PERSON:
+            role = self._detect_role_before(value, self._original_text)
+            _, placeholder = self._resolver.resolve_person(value, role)
+            typ = '人名'
+        elif etype == EntityType.COMPANY:
+            _, placeholder = self._resolver.resolve_company(value)
+            typ = '公司名'
+        elif etype == EntityType.COURT:
+            placeholder = '[审理法院]' if '法院' in value else '[法院]'
+            typ = '法院'
+        elif etype == EntityType.ADDRESS:
+            placeholder = '[地址]'
+            typ = '地址'
+        else:
+            return ('', '')
+
+        if record:
+            self._record(value, placeholder, typ)
+        return (placeholder, typ)
+
+    def _detect_role_before(self, value: str, text: str) -> str:
+        """在原文中查找实体前最近的诉讼角色关键词（用于占位符语义）。"""
+        pos = text.find(value)
+        if pos == -1:
+            return ''
+        context_before = text[max(0, pos - 20):pos]
+        best_role, best_pos = '', -1
+        for kw, role in self._resolver.ROLE_KEYWORDS.items():
+            p = context_before.rfind(kw)
+            if p > best_pos:
+                best_pos, best_role = p, role
+        return best_role
+
     def scan(self, text: str) -> List[dict]:
         """仅扫描，不替换，返回所有敏感信息位置"""
         findings = []
-        for rule_name, pattern, _ in self._get_all_rules():
+        for rule in self._get_all_rules():
+            rule_name = rule['type']
+            pattern = rule['pattern']
             for match in re.finditer(pattern, text):
+                value = match.group(rule.get('group', 0))
+                confidence = 1.0
+                validate = rule.get('validate')
+                if validate is not None:
+                    confidence = validate(value)
                 findings.append({
                     'type': rule_name,
-                    'value': match.group(),
+                    'value': value,
                     'start': match.start(),
                     'end': match.end(),
+                    'confidence': confidence,
                 })
         return findings
 
@@ -366,6 +551,7 @@ class Desensitizer:
         self._resolver.reset()
         self._replaced = {}
         self._counts = {}
+        self._order = {}
         self._counter = {}
         self._stats = {}
         self._court_counter = 0
@@ -407,7 +593,60 @@ class Desensitizer:
         """记录一次替换：去重、按原始值计数、按类型统计。"""
         self._replaced[original] = (replacement, typ)
         self._counts[original] = self._counts.get(original, 0) + 1
+        if original not in self._order:
+            self._order[original] = len(self._order) + 1
         self._stats[typ] = self._stats.get(typ, 0) + 1
+
+    def _assign_text_order(self, original_text: str) -> None:
+        """按原文出现顺序给映射条目重新编号。
+
+        规则引擎按"规则顺序"执行（如金额的多种写法分多个 pass），
+        与原文出现顺序可能不一致；还原（restore）需要按原文顺序
+        把占位符逐一配对回原始值，因此用全部规则在原文上做一次
+        最左匹配优先扫描，把每个原始值映射到它在原文中的首次出现序号。
+        """
+        rules = self._get_all_rules()
+        compiled = []
+        for rule in rules:
+            try:
+                pat = re.compile(rule['pattern'])
+            except re.error:
+                continue
+            compiled.append((pat, rule.get('group', 0), rule.get('validate')))
+        if not compiled:
+            return
+
+        order_map = {}
+        order_seq = 0
+        pos = 0
+        n = len(original_text)
+        while pos < n:
+            best_start, best_end, best_value = n + 1, -1, None
+            for pat, group, validate in compiled:
+                m = pat.search(original_text, pos)
+                if not m:
+                    continue
+                value = m.group(group) if group else m.group()
+                if validate is not None:
+                    try:
+                        if not validate(value):
+                            continue
+                    except Exception:
+                        continue
+                if (m.start() < best_start or
+                        (m.start() == best_start and m.end() > best_end)):
+                    best_start, best_end, best_value = m.start(), m.end(), value
+            if best_start > n:
+                break
+            if best_value is not None and best_value not in order_map:
+                order_seq += 1
+                order_map[best_value] = order_seq
+            pos = best_end if best_end > best_start else best_start + 1
+
+        # 覆盖为原文顺序（仅对确实出现在原文中的值）
+        for value, order in order_map.items():
+            if value in self._order:
+                self._order[value] = order
 
     def _safe_replace(self, text: str, pattern: str, replacement: str,
                        typ: str, original_group: int = 0,
@@ -433,8 +672,9 @@ class Desensitizer:
     def _mask_id_card(self, text: str) -> str:
         """身份证号：18位，末位可能为X。
 
-        带"身份证/证件"上下文时无条件替换；无标签的 18 位数字要求内嵌有效
-        出生日期，其余由银行卡规则处理，避免 18 位银行账号被误判为身份证号。
+        带"身份证/证件"上下文时无条件替换；无标签的 18 位数字要求
+        GB 11643 校验码合法或内嵌有效出生日期，其余由银行卡规则处理，
+        避免 18 位银行账号/订单号被误判为身份证号。
         """
         def context_replacer(m):
             self._record(m.group(2), '[身份证号]', '身份证号')
@@ -445,7 +685,7 @@ class Desensitizer:
             r'(?<!\d)(\d{17}[\dXx])(?!\d)',
             '[身份证号]',
             '身份证号',
-            validate=_is_valid_id_birthdate
+            validate=_is_plausible_id
         )
 
     def _mask_phone(self, text: str) -> str:
@@ -517,11 +757,37 @@ class Desensitizer:
         """银行卡号：14-20位纯数字（覆盖各银行不同长度）"""
         # 注意：排除前面已匹配的身份证号(18位)、手机号(11位)的上下文
         # 常见银行卡长度：招行16位、建行19位、部分旧卡15位、企业账户20位
-        return self._safe_replace(
+        text = self._safe_replace(
             text,
             r'(?<!\d)(\d{14,20})(?!\d)',
             '[银行账号]',
             '银行账号'
+        )
+        # 带"账号/卡号"上下文的 12-24 位数字：标签权威，无条件替换
+        return _ACCOUNT_CONTEXT.sub(self._account_replacer, text)
+
+    def _account_replacer(self, m):
+        self._record(m.group(2), '[银行账号]', '银行账号')
+        return m.group(1) + '[银行账号]'
+
+    def _mask_other_cert(self, text: str) -> str:
+        """其他证件号码（护照、港澳通行证、驾驶证等）：带上下文标签识别。"""
+        for pattern, label in _OTHER_CERT_PATTERNS:
+            def make_replacer(lbl):
+                def replacer(m):
+                    self._record(m.group(2), f'[{lbl}]', lbl)
+                    return m.group(1) + f'[{lbl}]'
+                return replacer
+            text = re.sub(pattern, make_replacer(label), text)
+        return text
+
+    def _mask_org_code(self, text: str) -> str:
+        """组织机构代码：老式 8-1 位格式（如 69920000-2），常见于旧合同与备案材料。"""
+        return self._safe_replace(
+            text,
+            r'(?<![0-9A-Z-])([0-9A-Z]{8}-[0-9A-Z])(?![0-9A-Z-])',
+            '[组织机构代码]',
+            '组织机构代码'
         )
 
     def _mask_credit_code(self, text: str) -> str:
@@ -535,6 +801,7 @@ class Desensitizer:
         """统一社会信用代码（无标签）：仅匹配以 9 开头的 18 位字母数字。
 
         放在银行卡规则之后执行：纯数字账号优先归银行/身份证规则，避免误判。
+        校验码（GB 32100）不作为脱敏硬门槛——宁替勿漏，校验码用于 scan 置信度。
         """
         return self._safe_replace(
             text,
@@ -544,10 +811,10 @@ class Desensitizer:
         )
 
     def _mask_case_number(self, text: str) -> str:
-        """案号：(2024)京0108民初12345号 / (2024)最高法民申1234号 — 排除年月日误匹配"""
+        """案号：(2024)京0108民初12345号 / （2025）浙民终123号 — 排除年月日误匹配"""
         return self._safe_replace(
             text,
-            r'\(?\d{4}\)?(?![年月日])[\u4e00-\u9fa5]{1,10}\d{0,6}[\u4e00-\u9fa5]{0,6}\d{1,6}号',
+            r'[（(]?\d{4}[）)]?(?![年月日])[\u4e00-\u9fa5]{1,10}\d{0,6}[\u4e00-\u9fa5]{0,6}\d{1,6}号',
             '[案号]',
             '案号'
         )
@@ -578,7 +845,8 @@ class Desensitizer:
                 return m.group(1) + '[出生日期]'
             # "1985年8月15日出生" 这种日期在前、上下文在后的写法
             self._record(m.group(3), '[出生日期]', '出生日期')
-            return '[出生日期]'
+            # 保留"出生/生"等上下文词，还原时无损
+            return '[出生日期]' + m.group(0)[len(m.group(3)):]
         return _BIRTHDATE_CONTEXT.sub(context_replacer, text)
 
     # --------------------------------------------------------
@@ -616,7 +884,8 @@ class Desensitizer:
                     if delim.strip():
                         return f'{role}{delim}{placeholder}'
                     else:
-                        return f'{role} {placeholder}'
+                        # 原文无分隔符时不插入空格，保证还原保真
+                        return f'{role}{placeholder}'
                 return replacer
             text = re.sub(pat, make_replacer(pat), text)
         return text
@@ -658,7 +927,9 @@ class Desensitizer:
             text
         )
         text = re.sub(
-            r'(?<!\w)([\u4e00-\u9fa5]{3,6})公司(?![\u4e00-\u9fa5])',
+            # 前不能紧贴中文/字母（避免吞掉更长公司名中的片段）；
+            # 后不设约束（"华信置业公司应于..."这类句法必须命中，宁替勿漏）
+            r'(?<![\u4e00-\u9fa5A-Za-z0-9])([\u4e00-\u9fa5]{3,6})公司',
             co_replacer,
             text
         )
@@ -673,7 +944,7 @@ class Desensitizer:
         # 住所地/地址/位于 + 内容
         text = re.sub(
             r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(）\)\s]{5,40}(?:号|室|层))',
-            lambda m: self._record_addr(m.group(2), m.group(1)),
+            lambda m: self._record_addr(m.group(2), m.group(0)[:m.start(2)]),
             text
         )
         # 独立的地理地址（省开头 + 详细到号/室）
@@ -693,7 +964,7 @@ class Desensitizer:
     def _record_addr(self, addr: str, prefix: str = '') -> str:
         """记录地址替换"""
         self._record(addr.replace(' ', ''), '[地址]', '地址')
-        return f'{prefix}：[地址]' if prefix else '[地址]'
+        return f'{prefix}[地址]' if prefix else '[地址]'
 
     def _mask_amount(self, text: str) -> str:
         """
@@ -703,23 +974,25 @@ class Desensitizer:
         排除：普通数字、日期、股票数量（带"股"）、百分比（带%）
         """
         # 中文大写金额：零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整
+        # 必须含至少一个"大写数字/拾"，避免把普通数字后的"万元"单独吃掉
         text = self._safe_replace(
             text,
-            r'(?:人民币|美金|港币)?[零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整亿]+(?:元|圆)?(?:整)?',
+            r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?[零壹贰叁肆伍陆柒捌玖拾][零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整亿]*(?:元|圆)?(?:整)?',
             '[金额]',
             '金额'
         )
         # 带"元/美元/欧元"等单位的完整金额
         text = self._safe_replace(
             text,
-            r'(?:¥)?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?(?:[万千亿])?(?:元|美元|欧元|英镑|港币)(?![.\d万千亿])',
+            r'[$¥]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?(?:[万千亿])?(?:元|美元|欧元|英镑|港币)(?![.\d万千亿])',
             '[金额]',
             '金额'
         )
         # 口语化金额：X万 / X.X万（无"元"后缀，如"借我80万""3.6万利息"）
+        # 排除常见非金额搭配：像素、股、人、户、平方米、瓦、公里、粉丝等
         text = self._safe_replace(
             text,
-            r'(?<!\d)(\d+(?:\.\d+)?)[万千亿](?![.\d万千亿])',
+            r'(?<!\d)(\d+(?:\.\d+)?)[万千亿](?![.\d万千亿])(?!像素|股|人|户|平方米|平米|瓦|公里|粉丝|预算|年薪|月薪|彩礼)',
             '[金额]',
             '金额'
         )
@@ -727,30 +1000,103 @@ class Desensitizer:
 
 
     def _get_all_rules(self):
-        """返回所有规则（用于scan）— 与 mask 执行顺序和正则保持一致"""
+        """返回所有规则（用于scan）— 与 mask 执行顺序和正则保持一致。
+
+        每条规则：type/pattern/handler 与 mask 一致；validate 返回置信度
+        (0.0~1.0)，用于标注"标签匹配/校验码验证通过"与"仅格式相似"的差异。
+        """
+        def id_confidence(value):
+            # 标签匹配（value 来自 group(2)）或校验码通过 → 高置信
+            if len(value) >= 18 and value[-1] in '0123456789Xx':
+                if _is_valid_id_checksum(value):
+                    return 1.0
+                return 0.6 if _is_valid_id_birthdate(value) else 0.0
+            return 0.5
+
+        def credit_confidence(value):
+            return 1.0 if _is_valid_credit_code(value) else 0.5
+
+        def bank_confidence(value):
+            return 1.0 if _luhn_check(value) else 0.6
+
         rules = [
-            ('律师执业证号', r'((?:执业证号|执业许可证号|律师执业证号|律师执业证|执业证)\s*[：:]?\s*)([0-9A-Z]{17,18})', self._mask_bar_number),
-            ('身份证号', r'((?:身份证号|身份证号码|身份证|证件号码|证件号)\s*[：:]?\s*)(\d{17}[\dXx])', self._mask_id_card),
-            ('身份证号', r'(?<!\d)(\d{17}[\dXx])(?!\d)', self._mask_id_card),
-            ('邮箱', r'[A-Za-z0-9.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+', self._mask_email),
-            ('手机号', r'(?<!\d)(1[3-9]\d{9})(?!\d)', self._mask_phone),
-            ('固定电话', r'(?<!\d)(0\d{2,3}[-\s]?\d{7,8})(?!\d)', self._mask_landline),
-            ('服务电话', r'(?<!\d)([48]00[-\s]?\d{3}[-\s]?\d{4})(?!\d)', self._mask_landline),
-            ('微信号', r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)', self._mask_wechat),
-            ('QQ号', r'((?:QQ|Qq|qq)\s*[：:]?\s*)(\d{5,12})(?!\d)', self._mask_qq),
-            ('统一社会信用代码', r'((?:统一社会信用代码|社会信用代码|信用代码)\s*[：:]?\s*)([0-9A-Z]{18})', self._mask_credit_code),
-            ('银行账号', r'(?<!\d)(\d{14,20})(?!\d)', self._mask_bank_card),
-            ('统一社会信用代码', r'(?<![0-9A-Z])(9[0-9A-Z]{17})(?![0-9A-Z])', self._mask_credit_code_bare),
-            ('案号', r'\(?\d{4}\)?(?![年月日])[\u4e00-\u9fa5]{1,10}\d{0,6}[\u4e00-\u9fa5]{0,6}\d{1,6}号', self._mask_case_number),
-            ('车牌号', r'(?<![A-Za-z0-9])[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}(?![\dA-Za-z])', self._mask_license_plate),
-            ('出生日期', r'((?:出生日期|出生年月|生日|出生于|生于)\s*[：:]?\s*)(\d{4}年\d{1,2}月\d{1,2}日)|(\d{4}年\d{1,2}月\d{1,2}日)\s*(?:出生|生)', self._mask_birthdate),
-            ('人名', r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,，\s]*[\u4e00-\u9fa5]{2,4}(?=[，,。.\s（(的]|\u3001|$)', self._mask_person_name),
-            ('公司名', r'[\u4e00-\u9fa5（）\(\)]{4,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业)|[\u4e00-\u9fa5]{4,20}(?:律师事务所|会计师事务所|资产评估事务所)|(?<!\w)[\u4e00-\u9fa5]{3,6}公司(?![\u4e00-\u9fa5])', self._mask_company_name),
-            ('地址', r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)）\s]{2,29}(?:号|室|层|栋|幢)(?:\d+)?', self._mask_address),
-            ('金额', r'(?:¥)?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?(?:[万千亿])?(?:元|美元|欧元|英镑|港币)(?![.\d万千亿])', self._mask_amount),
+            {'type': '律师执业证号',
+             'pattern': r'((?:执业证号|执业许可证号|律师执业证号|律师执业证|执业证)\s*[：:]?\s*)([0-9A-Z]{17,18})',
+             'handler': self._mask_bar_number, 'group': 2},
+            {'type': '身份证号',
+             'pattern': r'((?:身份证号|身份证号码|身份证|证件号码|证件号)\s*[：:]?\s*)(\d{17}[\dXx])',
+             'handler': self._mask_id_card, 'group': 2, 'validate': id_confidence},
+            {'type': '身份证号',
+             'pattern': r'(?<!\d)(\d{17}[\dXx])(?!\d)',
+             'handler': self._mask_id_card, 'group': 1, 'validate': id_confidence},
+            {'type': '邮箱',
+             'pattern': r'[A-Za-z0-9.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+',
+             'handler': self._mask_email},
+            {'type': '手机号',
+             'pattern': r'(?<!\d)(1[3-9]\d{9})(?!\d)',
+             'handler': self._mask_phone, 'group': 1},
+            {'type': '固定电话',
+             'pattern': r'(?<!\d)(0\d{2,3}[-\s]?\d{7,8})(?!\d)',
+             'handler': self._mask_landline, 'group': 1},
+            {'type': '服务电话',
+             'pattern': r'(?<!\d)([48]00[-\s]?\d{3}[-\s]?\d{4})(?!\d)',
+             'handler': self._mask_landline, 'group': 1},
+            {'type': '微信号',
+             'pattern': r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',
+             'handler': self._mask_wechat, 'group': 1},
+            {'type': 'QQ号',
+             'pattern': r'((?:QQ|Qq|qq)\s*[：:]?\s*)(\d{5,12})(?!\d)',
+             'handler': self._mask_qq, 'group': 2},
+            {'type': '组织机构代码',
+             'pattern': r'(?<![0-9A-Z-])([0-9A-Z]{8}-[0-9A-Z])(?![0-9A-Z-])',
+             'handler': self._mask_org_code, 'group': 1},
+            {'type': '统一社会信用代码',
+             'pattern': r'((?:统一社会信用代码|社会信用代码|信用代码)\s*[：:]?\s*)([0-9A-Z]{18})',
+             'handler': self._mask_credit_code, 'group': 2, 'validate': credit_confidence},
+            {'type': '银行账号',
+             'pattern': r'((?:银行账号|开户账号|账户号码|银行卡号|收款账号|付款账号|卡号)\s*[：:]?\s*)([0-9]{12,24})',
+             'handler': self._mask_bank_card, 'group': 2, 'validate': bank_confidence},
+            {'type': '银行账号',
+             'pattern': r'(?<!\d)(\d{14,20})(?!\d)',
+             'handler': self._mask_bank_card, 'group': 1, 'validate': bank_confidence},
+            {'type': '统一社会信用代码',
+             'pattern': r'(?<![0-9A-Z])(9[0-9A-Z]{17})(?![0-9A-Z])',
+             'handler': self._mask_credit_code_bare, 'group': 1, 'validate': credit_confidence},
+            {'type': '案号',
+             'pattern': r'[（(]?\d{4}[）)]?(?![年月日])[\u4e00-\u9fa5]{1,10}\d{0,6}[\u4e00-\u9fa5]{0,6}\d{1,6}号',
+             'handler': self._mask_case_number},
+            {'type': '车牌号',
+             'pattern': r'(?<![A-Za-z0-9])[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}(?![\dA-Za-z])',
+             'handler': self._mask_license_plate},
+            {'type': '出生日期',
+             'pattern': r'((?:出生日期|出生年月|生日|出生于|生于)\s*[：:]?\s*)(\d{4}年\d{1,2}月\d{1,2}日)|(\d{4}年\d{1,2}月\d{1,2}日)\s*(?:出生|生)',
+             'handler': self._mask_birthdate},
+            {'type': '人名',
+             'pattern': r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,，\s]*[\u4e00-\u9fa5]{2,4}(?=[，,。.\s（(的]|\u3001|$)',
+             'handler': self._mask_person_name},
+            {'type': '公司名',
+             'pattern': r'[\u4e00-\u9fa5（）\(\)]{4,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业)|[\u4e00-\u9fa5]{4,20}(?:律师事务所|会计师事务所|资产评估事务所)|(?<![\u4e00-\u9fa5A-Za-z0-9])[\u4e00-\u9fa5]{3,6}公司',
+             'handler': self._mask_company_name},
+            {'type': '地址',
+             'pattern': r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)）\s]{2,29}(?:号|室|层|栋|幢)(?:\d+)?',
+             'handler': self._mask_address},
+            {'type': '金额（中文大写）',
+             'pattern': r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?[零壹贰叁肆伍陆柒捌玖拾][零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整亿]*(?:元|圆)?(?:整)?',
+             'handler': self._mask_amount},
+            {'type': '金额',
+             'pattern': r'[$¥]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?(?:[万千亿])?(?:元|美元|欧元|英镑|港币)(?![.\d万千亿])',
+             'handler': self._mask_amount},
+            {'type': '金额（口语化）',
+             'pattern': r'(?<!\d)(\d+(?:\.\d+)?)[万千亿](?![.\d万千亿])(?!像素|股|人|户|平方米|平米|瓦|公里|粉丝|预算|年薪|月薪|彩礼)',
+             'handler': self._mask_amount},
+            {'type': '其他证件',
+             'pattern': r'(?:护照|护照号|港澳通行证|往来港澳通行证|港澳居民来往内地通行证|台湾居民来往大陆通行证|台胞证|驾驶证|驾驶证号|驾驶证号码|军官证|士兵证|警官证|工作证|营业执照|营业执照号|营业执照号码|税务登记证号|税务登记号)\s*[：:]?\s*[0-9A-Za-z]{4,20}',
+             'handler': self._mask_other_cert},
         ]
         if self._mask_all_dates:
-            rules.append(('日期', r'(?<!\d)(\d{4}年\d{1,2}月\d{1,2}日)(?!\d)', self._mask_date))
+            rules.append({'type': '日期',
+                          'pattern': r'(?<!\d)(\d{4}年\d{1,2}月\d{1,2}日)(?!\d)',
+                          'handler': self._mask_date})
         return rules
 
 
@@ -783,6 +1129,17 @@ class SecureDesensitizer(Desensitizer):
             self._text_refs.append(text)
 
         result = super().mask(text)
+
+        if self._secure_mode:
+            self._purge_text_refs()
+        return result
+
+    def mask_with_ner(self, text: str, ner_backend=None) -> MaskResult:
+        """规则层 + 本地 NER 脱敏（安全增强版）"""
+        if self._secure_mode:
+            self._text_refs.append(text)
+
+        result = super().mask_with_ner(text, ner_backend)
 
         if self._secure_mode:
             self._purge_text_refs()
@@ -1199,6 +1556,107 @@ def write_desensitized_file(input_path: str, output_path: str, masked_text: str)
 
 
 # ============================================================
+# 还原（restore）— 用映射表把脱敏文本还原为原文
+# ============================================================
+
+def parse_mapping_text(content: str) -> List[Mapping]:
+    """从 Markdown 映射表或 JSON 映射表中解析出 Mapping 列表。
+
+    支持 desensitize.py 自身输出的两种格式：
+    - MaskResult.to_markdown()：'| 序号 | 原始值 | 替换值 | 类型 | 出现次数 |' 表格
+    - MaskResult.to_json()：{"mapping": [{"original":..., "replacement":..., ...}]}
+    """
+    stripped = content.strip()
+    if not stripped:
+        return []
+
+    # JSON 格式
+    if stripped.startswith('{'):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            return []
+        mappings = []
+        for item in data.get('mapping', []):
+            mappings.append(Mapping(
+                original=item.get('original', ''),
+                replacement=item.get('replacement', ''),
+                type=item.get('type', ''),
+                count=int(item.get('count', 1) or 1),
+                order=int(item.get('order', 0) or 0),
+            ))
+        return mappings
+
+    # Markdown 表格格式
+    mappings = []
+    for line in stripped.splitlines():
+        line = line.strip()
+        if not line.startswith('|'):
+            continue
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        if len(cells) < 3:
+            continue
+        if cells[0] in ('序号', '') or set(cells[0]) == {'-'}:
+            continue  # 表头或分隔线
+        original = cells[1]
+        replacement = cells[2]
+        if not original or not replacement:
+            continue
+        typ = cells[3] if len(cells) > 3 else ''
+        count = int(cells[4]) if len(cells) > 4 and cells[4].isdigit() else 1
+        # Markdown 序号列即首次出现顺序（第 i 行）
+        order = int(cells[0]) if cells[0].isdigit() else 0
+        mappings.append(Mapping(original=original, replacement=replacement,
+                                type=typ, count=count, order=order))
+    return mappings
+
+
+def restore_text(masked_text: str, mappings: List[Mapping]) -> str:
+    """用映射表把占位符还原为原始值。
+
+    策略：
+    1. 按占位符长度降序处理，避免长占位符（如 [当事人甲（原告）]）
+       被短占位符（如 [当事人甲]）先替换掉一部分。
+    2. 同一占位符多次出现（如多个 [金额]）时，按映射条目的
+       "首次出现顺序"与原文出现顺序逐一配对，确保还原准确。
+    """
+    # 按占位符分组，组内按首次出现顺序排队
+    groups = {}
+    for m in mappings:
+        if not m.replacement or not m.original:
+            continue
+        groups.setdefault(m.replacement, []).append(m)
+    for q in groups.values():
+        q.sort(key=lambda m: m.order)
+
+    # 长占位符优先替换
+    for placeholder, queue in sorted(groups.items(),
+                                     key=lambda kv: len(kv[0]), reverse=True):
+        if len(queue) == 1:
+            masked_text = masked_text.replace(placeholder, queue[0].original)
+            continue
+        # 同一占位符多次出现：按顺序逐一配对
+        queue_idx = 0
+        out = []
+        pos = 0
+        while True:
+            found = masked_text.find(placeholder, pos)
+            if found == -1:
+                out.append(masked_text[pos:])
+                break
+            out.append(masked_text[pos:found])
+            if queue_idx < len(queue):
+                out.append(queue[queue_idx].original)
+                queue_idx += 1
+            else:
+                # 映射表条目不足（理论上不应发生），保留占位符并警告由调用方处理
+                out.append(placeholder)
+            pos = found + len(placeholder)
+        masked_text = ''.join(out)
+    return masked_text
+
+
+# ============================================================
 # CLI 入口
 # ============================================================
 
@@ -1238,6 +1696,10 @@ def main():
 
   # 解密映射表（v2.1 AES-GCM）
   python desensitize.py decrypt -f 映射表.enc -p "your-password"
+
+  # v2.2: 用映射表还原脱敏文本（律师庭审/归档等需要原文时）
+  python desensitize.py restore -f 脱敏后.txt -m 映射表.md
+  python desensitize.py restore -f 脱敏后.docx -m 映射表.enc -o 还原.docx
         """
     )
 
@@ -1257,6 +1719,13 @@ def main():
     mask_parser.add_argument('--no-sanitize-filename', action='store_true', default=False, help='禁用输出文件名自动脱敏')
     mask_parser.add_argument('--all-dates', action='store_true', default=False,
                              help='把文中所有"年月日"日期也替换为 [日期]（默认只处理出生日期）')
+    mask_parser.add_argument('--ner-backend', default=None,
+                             choices=['regex', 'spacy', 'huggingface', 'llm'],
+                             help='规则层后追加本地 NER 层：spacy（需中文模型）/ huggingface（需 transformers）/ llm（本地 Ollama）')
+    mask_parser.add_argument('--ner-model', default=None,
+                             help='NER 模型名（如 zh_core_web_trf / qwen2.5，按后端默认取）')
+    mask_parser.add_argument('--ner-endpoint', default=None,
+                             help='LLM 后端端点（默认 http://localhost:11434/api/generate）')
 
     # scan 命令
     scan_parser = subparsers.add_parser('scan', help='扫描敏感信息（不替换）')
@@ -1275,6 +1744,13 @@ def main():
     decrypt_parser.add_argument('-k', '--key', help='Fernet 解密密钥（v2.0 旧格式兼容，不推荐）')
     decrypt_parser.add_argument('-p', '--password', help='AES-GCM 解密密码（v2.1+，优先使用。也可通过环境变量 DESENSITIZER_MAPPING_PASSWORD 设置）')
     decrypt_parser.add_argument('-o', '--output', help='输出路径（默认输出到 stdout）')
+
+    # restore 命令
+    restore_parser = subparsers.add_parser('restore', help='用映射表把脱敏文本还原为原文（庭审、归档等需要原文时使用）')
+    restore_parser.add_argument('-f', '--file', required=True, help='脱敏后的文件路径（.txt / .docx）')
+    restore_parser.add_argument('-m', '--mapping', required=True, help='映射表文件（.md 表格 / .json / 加密 .enc）')
+    restore_parser.add_argument('-p', '--password', help='加密映射表密码（也可用环境变量 DESENSITIZER_MAPPING_PASSWORD）')
+    restore_parser.add_argument('-o', '--output', help='还原后的输出路径（默认输出到 stdout）')
 
     args = parser.parse_args()
 
@@ -1318,7 +1794,23 @@ def main():
             print(f'   ⚠️  Python 字符串不可变，内存清理为"尽力而为"的纵深防御', file=sys.stderr)
 
     if args.command == 'mask':
-        result = d.mask(text)
+        ner = None
+        if getattr(args, 'ner_backend', None):
+            from ner_interface import LegalNER
+            ner_kwargs = {}
+            if args.ner_model:
+                ner_kwargs['model'] = args.ner_model
+            if args.ner_backend == 'llm' and args.ner_endpoint:
+                ner_kwargs['endpoint'] = args.ner_endpoint
+            ner = LegalNER(backend=args.ner_backend, **ner_kwargs)
+            if sys.stderr.isatty():
+                print(f'🤖 本地 NER 层已启用（{ner.backend_name}）', file=sys.stderr)
+        try:
+            result = d.mask_with_ner(text, ner) if ner else d.mask(text)
+        except NotImplementedError as e:
+            sys.exit(f'❌ {e}')
+        except ImportError as e:
+            sys.exit(f'❌ NER 后端依赖缺失：{e}')
 
         # 保存映射表到文件（如果指定了 --save-mapping）
         if hasattr(args, 'save_mapping') and args.save_mapping:
@@ -1370,6 +1862,8 @@ def main():
                 print(result.to_markdown())
             elif args.json:
                 print(result.to_json())
+            else:
+                print(result.text)
 
     elif args.command == 'scan':
         findings = d.scan(text)
@@ -1444,6 +1938,36 @@ def main():
             print(f'✅ 已解密: {args.output}')
         else:
             print(decrypted.decode('utf-8') if isinstance(decrypted, bytes) else decrypted)
+
+    elif args.command == 'restore':
+        # 读取脱敏后的文本（支持 .txt / .docx / .pdf）
+        masked_text = read_text_from_file(args.file)
+
+        # 读取映射表：加密 .enc 需要解密，其余按文本解析
+        ext = os.path.splitext(args.mapping)[1].lower()
+        if ext == '.enc':
+            password = args.password or os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '')
+            if not password:
+                import getpass
+                password = getpass.getpass('🔑 请输入映射表解密密码（不显示）：')
+                if not password:
+                    sys.exit('❌ 密码不能为空')
+            content = decrypt_mapping_encrypted(args.mapping, password)
+            password = ''
+        else:
+            with open(args.mapping, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+        mappings = parse_mapping_text(content)
+        if not mappings:
+            sys.exit('❌ 未能从映射表解析出任何条目（支持 .md 表格 / .json / 加密 .enc）')
+
+        restored = restore_text(masked_text, mappings)
+        if args.output:
+            write_desensitized_file(args.file, args.output, restored)
+            print(f'✅ 已还原 {len(mappings)} 个映射条目，保存至: {args.output}')
+        else:
+            print(restored)
 
     else:
         parser.print_help()

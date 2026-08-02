@@ -6,3 +6,7 @@ python-docx>=1.0.0
 PyMuPDF>=1.23.0
 # 如需加密保存映射表（--encrypt-mapping）：
 cryptography>=41.0.0
+# 如需本地 NER 层（--ner-backend，三选一，均可选安装）：
+# spaCy 后端：pip install spacy && python -m spacy download zh_core_web_trf
+# HuggingFace 后端：pip install transformers
+# Ollama 后端：无需安装 Python 依赖，启动 ollama serve 并 ollama pull qwen2.5

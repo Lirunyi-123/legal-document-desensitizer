@@ -6,3 +6,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# 评测报告为运行产物，每次 evaluate 重新生成，不入库
+测试/脱敏评测报告*.md

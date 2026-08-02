@@ -161,19 +161,33 @@ class RegexNERBackend:
             ))
         
         # COMPANY：公司/机构名称
+        role_prefixes = ['原告', '被告', '上诉人', '被上诉人', '第三人',
+                         '申请执行人', '被执行人', '法定代表人', '委托诉讼代理人',
+                         '委托代理人', '甲方', '乙方']
         for m in re.finditer(
             r'([\u4e00-\u9fa5（）\(\)]{2,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业|律师事务所|会计师事务所))',
             text
         ):
-            # 排除公司名开头的人物角色词
             name = m.group(1)
-            if any(name.startswith(role) for role in ['原告','被告','法定代表人','委托诉讼代理人']):
+            start = m.start(1)
+            # 剥离被贪婪匹配吞入的角色词（如"被告杭州鼎盛..."→"杭州鼎盛..."）
+            trimmed = False
+            for role in role_prefixes:
+                if name.startswith(role):
+                    name = name[len(role):]
+                    start += len(role)
+                    trimmed = True
+                    break
+            if trimmed and len(name) < 4:
+                # 剥掉角色词后只剩碎片，不构成公司名
+                continue
+            if len(name) < 4:
                 continue
             entities.append(Entity(
                 type=EntityType.COMPANY,
-                text=m.group(1),
-                start=m.start(1),
-                end=m.end(1),
+                text=name,
+                start=start,
+                end=start + len(name),
                 confidence=0.9,
             ))
         
@@ -251,46 +265,136 @@ class RegexNERBackend:
 # ═══════════════════════════════════════════════════════════
 
 class SpacyNERBackend:
-    """spaCy NER 后端桩 — 待接入"""
+    """spaCy NER 后端（需 pip install spacy + 中文模型）。
+
+    标签映射：
+    - PER   → PERSON（自然人）
+    - ORG   → COMPANY（公司/机构）
+    - GPE/LOC → ADDRESS（含法院等地理实体，交由上层判断）
+    """
     
     def __init__(self, model: str = 'zh_core_web_trf'):
         self._model_name = model
         self._name = f'spacy-{model}'
+        self._nlp = None
     
     @property
     def name(self) -> str:
         return self._name
     
     def extract(self, text: str) -> ExtractionResult:
-        raise NotImplementedError(
-            "spaCy 后端尚未接入。\n"
-            f"  安装: python -m spacy download {self._model_name}\n"
-            "  接入后替换此处实现即可。"
-        )
+        import time
+        start = time.monotonic()
+        if self._nlp is None:
+            try:
+                import spacy
+            except ImportError:
+                raise NotImplementedError(
+                    f"需要安装 spaCy 才能使用该后端：\n"
+                    f"  pip install spacy\n"
+                    f"  python -m spacy download {self._model_name}"
+                )
+            try:
+                self._nlp = spacy.load(self._model_name)
+            except Exception:
+                raise NotImplementedError(
+                    f"spaCy 模型加载失败：{self._model_name}\n"
+                    f"  请先下载：python -m spacy download {self._model_name}"
+                )
+        doc = self._nlp(text)
+        entities = []
+        for ent in doc.ents:
+            label = ent.label_
+            if label == 'PER' or label == 'PERSON':
+                etype = EntityType.PERSON
+            elif label == 'ORG':
+                etype = EntityType.COMPANY
+            elif label in ('GPE', 'LOC'):
+                etype = EntityType.ADDRESS
+            else:
+                continue
+            entities.append(Entity(
+                type=etype, text=ent.text, start=ent.start_char, end=ent.end_char,
+                confidence=0.9,
+                metadata={'source': 'spacy', 'label': label},
+            ))
+        latency = (time.monotonic() - start) * 1000
+        return ExtractionResult(text=text, entities=entities,
+                                backend=self.name, latency_ms=latency)
 
 
 class HuggingFaceNERBackend:
-    """HuggingFace NER 后端桩 — 待接入"""
+    """HuggingFace Transformers NER 后端（需 pip install transformers）。
+
+    默认面向中文法律/通用 NER 模型（BERT 系 BIO 标签），
+    自动合并 B-/I- 片段；可通过 model 指定如
+    'ckiplab/bert-base-chinese-ner' 或 'dslim/bert-base-NER'。
+    """
     
     def __init__(self, model: str = 'bert-base-chinese'):
         self._model_name = model
         self._name = f'hf-{model}'
+        self._pipeline = None
     
     @property
     def name(self) -> str:
         return self._name
     
     def extract(self, text: str) -> ExtractionResult:
-        raise NotImplementedError(
-            "HuggingFace 后端尚未接入。\n"
-            f"  安装: pip install transformers\n"
-            f"  模型: {self._model_name}\n"
-            "  接入后替换此处实现即可。"
-        )
+        import time
+        start = time.monotonic()
+        if self._pipeline is None:
+            try:
+                from transformers import pipeline
+            except ImportError:
+                raise NotImplementedError(
+                    f"需要安装 transformers 才能使用该后端：\n"
+                    f"  pip install transformers\n"
+                    f"  模型: {self._model_name}"
+                )
+            try:
+                self._pipeline = pipeline(
+                    'ner', model=self._model_name,
+                    aggregation_strategy='simple',
+                )
+            except Exception as e:
+                raise NotImplementedError(
+                    f"HuggingFace 模型加载失败：{self._model_name}\n  {e}"
+                )
+        raw = self._pipeline(text)
+        entities = []
+        for item in raw:
+            label = str(item.get('entity_group') or item.get('entity') or '')
+            label = label.upper()
+            etype = None
+            if 'PER' in label:
+                etype = EntityType.PERSON
+            elif 'ORG' in label:
+                etype = EntityType.COMPANY
+            elif 'LOC' in label:
+                etype = EntityType.ADDRESS
+            else:
+                continue
+            entities.append(Entity(
+                type=etype,
+                text=item['word'],
+                start=int(item['start']),
+                end=int(item['end']),
+                confidence=float(item.get('score', 0.9)),
+                metadata={'source': 'huggingface', 'label': label},
+            ))
+        latency = (time.monotonic() - start) * 1000
+        return ExtractionResult(text=text, entities=entities,
+                                backend=self.name, latency_ms=latency)
 
 
 class LLMNERBackend:
-    """本地/云端 LLM NER 后端桩 — 待接入"""
+    """本地 LLM（Ollama 兼容 API）NER 后端。
+
+    默认端点 http://localhost:11434/api/generate，模型可用 qwen2.5 等
+    中文模型。请求体为 OpenAI 兼容 messages 格式，Ollama 会忽略无关字段。
+    依赖纯标准库 urllib，无需安装 requests。
+    """
     
     def __init__(self, 
                  endpoint: str = 'http://localhost:11434/api/generate',
@@ -319,13 +423,93 @@ class LLMNERBackend:
         return self._name
     
     def extract(self, text: str) -> ExtractionResult:
-        raise NotImplementedError(
-            "LLM 后端尚未接入。\n"
-            f"  端点: {self._endpoint}\n"
-            f"  模型: {self._model}\n"
-            "  接入后替换此处实现即可。\n"
-            "  支持：Ollama / OpenAI API / Claude API"
+        import json
+        import time
+        import urllib.request
+
+        start = time.monotonic()
+        prompt = self._prompt_template.replace('{text}', text)
+        payload = json.dumps({
+            'model': self._model,
+            'prompt': prompt,
+            'stream': False,
+            'format': 'json',
+        }).encode('utf-8')
+
+        req = urllib.request.Request(
+            self._endpoint, data=payload,
+            headers={'Content-Type': 'application/json'},
         )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+        except Exception as e:
+            raise NotImplementedError(
+                f"无法连接本地 LLM（{self._endpoint}）：{e}\n"
+                f"  请确认已启动：ollama serve，并已拉取模型：ollama pull {self._model}"
+            )
+
+        answer = data.get('response', '')
+        entities = self._parse_llm_entities(answer, text)
+        latency = (time.monotonic() - start) * 1000
+        return ExtractionResult(text=text, entities=entities,
+                                backend=self.name, latency_ms=latency)
+
+    def _parse_llm_entities(self, answer: str, original: str) -> List[Entity]:
+        """解析 LLM 返回的 JSON 实体列表；容错处理代码块/前后缀文本。"""
+        import json
+        import re
+        answer = answer.strip()
+        # 去掉 ```json ... ``` 代码块
+        fence = re.search(r'```(?:json)?\s*(.*?)```', answer, re.S)
+        if fence:
+            answer = fence.group(1).strip()
+        # 截取第一个 [ ... ] 数组
+        arr = re.search(r'\[.*\]', answer, re.S)
+        if not arr:
+            return []
+        try:
+            items = json.loads(arr.group(0))
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(items, list):
+            return []
+
+        type_map = {
+            'PERSON': EntityType.PERSON, '人': EntityType.PERSON, '人名': EntityType.PERSON,
+            'COMPANY': EntityType.COMPANY, '公司': EntityType.COMPANY, '公司名': EntityType.COMPANY,
+            'COURT': EntityType.COURT, '法院': EntityType.COURT,
+            'LAWYER': EntityType.LAWYER, '律师': EntityType.LAWYER,
+            'ADDRESS': EntityType.ADDRESS, '地址': EntityType.ADDRESS,
+        }
+        entities = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            etype = type_map.get(str(item.get('type', '')).upper())
+            if etype is None:
+                continue
+            value = str(item.get('text', '')).strip()
+            if not value:
+                continue
+            start = original.find(value)
+            if start == -1:
+                # 位置无法定位则跳过（避免破坏文本）
+                continue
+            entities.append(Entity(
+                type=etype, text=value, start=start, end=start + len(value),
+                confidence=float(item.get('confidence', 0.8)),
+                metadata={'source': 'llm'},
+            ))
+        # 按位置升序、过滤重叠
+        entities.sort(key=lambda e: (e.start, -e.end))
+        filtered = []
+        last_end = -1
+        for e in entities:
+            if e.start >= last_end:
+                filtered.append(e)
+                last_end = e.end
+        return filtered
 
 
 # ═══════════════════════════════════════════════════════════

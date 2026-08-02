@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
-"""v2.1 合并版回归测试（纯标准库，python -m unittest test_desensitize）"""
+"""v2.2 回归测试（纯标准库，python -m unittest test_desensitize）"""
 
 import unittest
 
-from desensitize import Desensitizer, SecureDesensitizer  # 导入成功即验证类定义顺序修复
+from desensitize import (
+    Desensitizer, SecureDesensitizer,
+    parse_mapping_text, restore_text,
+    _is_valid_id_checksum, _is_valid_credit_code, _luhn_check,
+)  # 导入成功即验证类定义顺序修复
 
 
 class TestRuleLayerFixes(unittest.TestCase):
@@ -86,6 +90,125 @@ class TestRuleLayerFixes(unittest.TestCase):
         self.assertIn('手机号', types)
         self.assertIn('QQ号', types)
         self.assertIn('身份证号', types)
+
+
+class TestChecksumValidation(unittest.TestCase):
+    """GB 11643 / GB 32100 / Luhn 校验码"""
+
+    def test_id_checksum_valid(self):
+        # 手工推导：前17位加权和 120，120 % 11 = 10 → 校验码 '2'
+        self.assertTrue(_is_valid_id_checksum('110101198001011232'))
+
+    def test_id_checksum_invalid(self):
+        self.assertFalse(_is_valid_id_checksum('110101198001011234'))
+
+    def test_credit_code_checksum(self):
+        # GB 32100 公开示例：91350100M000100Y43 通过校验
+        self.assertTrue(_is_valid_credit_code('91350100M000100Y43'))
+        self.assertFalse(_is_valid_credit_code('91350100M000100Y4X'))
+
+    def test_luhn(self):
+        # 标准 Luhn 测试卡号
+        self.assertTrue(_luhn_check('4111111111111111'))
+        self.assertTrue(_luhn_check('4012888888881881'))
+        self.assertFalse(_luhn_check('4111111111111112'))
+
+
+class TestV22NewRules(unittest.TestCase):
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_passport_not_wechat(self):
+        result = self.d.mask('护照：E12345678')
+        self.assertIn('[护照号]', result.text)
+        self.assertNotIn('[微信号]', result.text)
+
+    def test_driving_license_type(self):
+        result = self.d.mask('驾驶证号330106198001011234')
+        self.assertIn('[驾驶证号]', result.text)
+        for m in result.mapping:
+            self.assertNotEqual(m.type, '身份证号')
+
+    def test_org_code(self):
+        result = self.d.mask('组织机构代码69920000-2')
+        self.assertIn('[组织机构代码]', result.text)
+
+    def test_account_context(self):
+        result = self.d.mask('收款账号：6222020200012345678')
+        self.assertIn('收款账号：[银行账号]', result.text)
+
+    def test_amount_full_match(self):
+        result = self.d.mask('尾款80万元应于三日内支付')
+        self.assertIn('尾款[金额]应于三日内支付', result.text)
+        for m in result.mapping:
+            if m.type == '金额':
+                self.assertEqual(m.original, '80万元')
+
+    def test_amount_not_pixel_or_share(self):
+        result = self.d.mask('设备60万像素，持股8万股')
+        self.assertIn('60万像素', result.text)
+        self.assertIn('8万股', result.text)
+
+    def test_fullwidth_case_number(self):
+        result = self.d.mask('本院（2025）浙民终123号民事判决书')
+        self.assertIn('[案号]', result.text)
+
+    def test_scan_has_confidence(self):
+        findings = self.d.scan('身份证号110101198001011232')
+        self.assertIn('confidence', findings[0])
+        self.assertGreater(findings[0]['confidence'], 0.9)
+
+
+class TestRestore(unittest.TestCase):
+    """mask → 映射表 → restore 无损往返"""
+
+    def _roundtrip(self, text):
+        d = Desensitizer()
+        r = d.mask(text)
+        restored = restore_text(r.text, parse_mapping_text(r.to_json()))
+        self.assertEqual(restored, text)
+
+    def test_restore_basic(self):
+        self._roundtrip('原告：陈建国，男，身份证号110101198001011232，手机13800138000。')
+
+    def test_restore_repeated_amounts(self):
+        # 多个 [金额] 按原文顺序配对
+        self._roundtrip('尾款80万元、违约金人民币伍佰万元整，另借3.6万利息。')
+
+    def test_restore_birthdate_suffix(self):
+        self._roundtrip('原告1985年8月15日出生，住浙江省杭州市西湖区文一西路1号。')
+
+    def test_restore_from_markdown(self):
+        d = Desensitizer()
+        r = d.mask('原告：陈建国。尾款80万元。')
+        restored = restore_text(r.text, parse_mapping_text(r.to_markdown()))
+        self.assertEqual(restored, '原告：陈建国。尾款80万元。')
+
+    def test_restore_person_no_delimiter(self):
+        # 无分隔符人名不插空格，还原后与原文完全一致
+        self._roundtrip('原告陈建国，被告李四。')
+
+
+class TestNerIntegration(unittest.TestCase):
+    """mask_with_ner（regex 后端，无额外依赖）"""
+
+    def test_mask_with_ner_regex_backend(self):
+        from ner_interface import LegalNER
+        d = Desensitizer()
+        result = d.mask_with_ner(
+            '原告：陈建国，被告：杭州鼎盛房地产开发有限公司。',
+            LegalNER(backend='regex'),
+        )
+        self.assertIn('[当事人甲（原告）]', result.text)
+        self.assertIn('[合同乙方]', result.text)
+
+    def test_regex_ner_backend_extract(self):
+        from ner_interface import LegalNER
+        ner = LegalNER(backend='regex')
+        result = ner.extract('原告金进跃，被告杭州鼎盛房地产开发有限公司')
+        types = {e.type.value for e in result.entities}
+        self.assertIn('PERSON', types)
+        self.assertIn('COMPANY', types)
 
 
 if __name__ == '__main__':

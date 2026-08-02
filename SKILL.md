@@ -1,6 +1,6 @@
 ---
 name: legal-document-desensitization
-description: 法律文书涉密脱敏工具 — 规则+LLM混合引擎，对合同/协议/沟通记录/证据材料中的敏感信息进行语义替换脱敏，生成脱敏映射表。
+description: 法律文书涉密脱敏工具 — 规则+本地NER+LLM混合引擎，对合同/协议/沟通记录/证据材料中的敏感信息进行语义替换脱敏，生成映射表并可一键还原、红队评测。
 runAs: subagent
 allowed-tools: read_file, write_file, grep, ls, glob
 ---
@@ -87,8 +87,11 @@ python3 desensitize.py mask -f 证据.pdf -o 脱敏后.txt
 | 类型 | 正则表达式 | 替换格式 |
 |------|-----------|---------|
 | 银行卡号 | `(?<!\d)\d{14,20}(?!\d)` | `[银行账号]` | 无标签的18位数字若内嵌有效出生日期则优先归为身份证号 |
+| 银行卡号（带上下文） | `(账号\|账户\|卡号...)` + `\d{12,24}` | `[银行账号]` | 标签权威，无条件替换 |
 | 统一社会信用代码 | 带"信用代码"上下文：`[0-9A-Z]{18}`；无标签：`9[0-9A-Z]{17}`（9开头18位） | `[统一社会信用代码]` |
 | 律师执业证号 | `(执业证号\|执业许可证号\|律师执业证号\|律师执业证\|执业证)` + `[0-9A-Z]{17,18}` | `[律师执业证号]` | 优先于身份证号/信用代码，避免律所执业许可证被误判 |
+| 组织机构代码 | `[0-9A-Z]{8}-[0-9A-Z]`（8-1位老格式） | `[组织机构代码]` | 常见于旧合同与备案材料 |
+| 其他证件 | `护照/港澳通行证/台胞证/驾驶证/军官证/营业执照/税务登记号` + 号码 | `[护照号]` 等对应占位符 | 优先于身份证/微信号规则，避免"护照：E12345678"被当微信号 |
 
 #### 案件程序信息类
 
@@ -170,6 +173,60 @@ python3 desensitize.py mask -f 证据.pdf -o 脱敏后.txt
 | 3 | 13800138000 | [手机号] | 手机号 | 2 |
 | ... | ... | ... | ... | ... |
 ```
+
+> 映射表每条记录含"首次出现顺序"，多个同类型占位符（如多个 `[金额]`）按原文顺序配对，
+> 保证 `restore` 无损还原。
+
+## v2.2 校验码验证（准确性）
+
+- **身份证号**：GB 11643-1999 第18位校验码。带"身份证/证件"上下文时无条件脱敏；
+  无标签时要求"校验码合法 **或** 内嵌有效出生日期"（兼容录入错误，宁替勿漏）
+- **统一社会信用代码**：GB 32100-2015 校验码（字符集排除 I O S V Z）
+- **银行卡号**：Luhn 算法
+- `scan` 输出 `confidence` 字段：校验码通过=1.0，仅格式相似=0.5~0.6
+
+## v2.2 一键还原 restore
+
+律师庭审、归档、复核时需要原文时，用映射表把脱敏文本无损还原：
+
+```bash
+# 脱敏并加密保存映射表
+export DESENSITIZER_MAPPING_PASSWORD="your-password"
+python3 desensitize.py mask -f 起诉状.docx --save-mapping 映射表.enc --encrypt-mapping
+
+# 一键还原（支持 .md 表格 / .json / 加密 .enc）
+python3 desensitize.py restore -f 起诉状_desensitized.docx -m 映射表.enc -o 还原.docx
+```
+
+还原与原文逐字节一致（已覆盖：多个同类型占位符、上下文日期"1980年1月1日出生"、
+无分隔符人名"原告陈建国"、地址前缀等边界）。
+
+## v2.2 红队评测 evaluate（量化可信度）
+
+```bash
+python3 evaluate.py                          # 43 个用例，分类型召回率
+python3 evaluate.py --report 评测报告.md      # 输出 Markdown 报告
+```
+
+语料库：`测试/红队语料库.jsonl`（19 类结构化数据 + 负样本，可自行增删）。
+每次修改规则后运行一次，作为质量回归基线。
+
+## v2.2 本地 NER 层（可选）
+
+规则层把身份证/手机号等替换为占位符后，本地模型只看到脱敏文本：
+
+```bash
+# spaCy 中文模型
+python3 desensitize.py mask -f 合同.docx --ner-backend spacy --ner-model zh_core_web_trf
+
+# HuggingFace 中文 NER
+python3 desensitize.py mask -f 合同.docx --ner-backend huggingface --ner-model ckiplab/bert-base-chinese-ner
+
+# 本地 Ollama（数据不出本机）
+python3 desensitize.py mask -f 合同.docx --ner-backend llm --ner-model qwen2.5
+```
+
+后端缺失时给出安装指引并优雅退出，不影响纯规则层。
 
 ## 执行流程
 

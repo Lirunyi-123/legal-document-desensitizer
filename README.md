@@ -1,7 +1,8 @@
 # 法律文书脱敏工具 (Legal Document Desensitizer)
 
-规则引擎 + EntityResolver 实体归一化 + LLM 混合脱敏工具，专为法律文书设计。
+规则引擎 + EntityResolver 实体归一化 + 本地 NER + LLM 混合脱敏工具，专为中国法律文书设计。
 
+> **v2.2 新特性**：GB 11643/GB 32100 校验码 | 一键还原 restore | 红队评测 evaluate | 本地 NER 接入
 > **v2.1 新特性**：EntityResolver 实体归一化 | SecureDesensitizer 内存安全模式 | 零信任 AES-256-GCM 加密映射表 | 文件名自动脱敏
 
 ## 功能
@@ -43,6 +44,16 @@ python desensitize.py mask -f 合同.docx --save-mapping 映射表.enc --encrypt
 # v2.1 解密映射表
 python desensitize.py decrypt -f 映射表.enc -p "your-password"
 
+# v2.2 一键还原（庭审、归档需要原文时）
+python desensitize.py restore -f 脱敏后.docx -m 映射表.enc -p "your-password" -o 还原.docx
+
+# v2.2 红队评测（43 个用例，输出分类型召回率）
+python3 evaluate.py --report 评测报告.md
+
+# v2.2 本地 NER 层（可选：spaCy / HuggingFace / 本地 Ollama）
+python desensitize.py mask -f 合同.docx --ner-backend spacy --ner-model zh_core_web_trf
+python desensitize.py mask -f 合同.docx --ner-backend llm --ner-model qwen2.5
+
 # JSON 格式输出
 python desensitize.py mask --json -f 文档.docx
 
@@ -53,10 +64,58 @@ python desensitize.py mask -f 聊天记录.txt --all-dates
 ## 脱敏覆盖范围
 
 ### 规则层（18类）+ EntityResolver 实体归一化
-身份证号、手机号、固定电话、服务电话（400/800）、邮箱、微信号、QQ号、银行卡号、统一社会信用代码、案号、律师执业证号、车牌号、出生日期、金额、人名、公司名、地址、案号
+身份证号、手机号、固定电话、服务电话（400/800）、邮箱、微信号、QQ号、银行卡号、统一社会信用代码、组织机构代码、案号、律师执业证号、车牌号、出生日期、金额、人名、公司名、地址、护照/港澳通行证/驾驶证等其他证件
+
+### 本地 NER 层（可选，3 种后端）
+spaCy（zh_core_web_trf）| HuggingFace（bert 系中文 NER）| 本地 Ollama（qwen2.5 等）——识别规则层覆盖不到的人名、公司名、地址、法院
 
 ### LLM层（5类）
-自然人姓名、公司/机构名称、地址信息、金额、敏感案情细节
+自然人姓名、公司/机构名称、地址信息、金额、敏感案情细节（通过 `llm-prompt` 生成提示词）
+
+## v2.2 新增能力
+
+### 校验码验证（准确性）
+- **身份证**：GB 11643-1999 第 18 位校验码，`scan` 输出置信度（校验码合法=1.0，仅出生日期合法=0.6）
+- **统一社会信用代码**：GB 32100-2015 校验码（`91350100M000100Y43` 为官方示例通过码）
+- **银行卡**：Luhn 算法，`scan` 标注置信度
+
+### 一键还原 restore
+用映射表（Markdown / JSON / AES-256-GCM 加密 .enc）把脱敏文本无损还原为原文：
+
+```bash
+python desensitize.py mask -f 起诉状.docx --save-mapping 映射表.enc --encrypt-mapping
+python desensitize.py restore -f 起诉状_desensitized.docx -m 映射表.enc -o 还原.docx
+```
+
+映射表自动记录"首次出现顺序"，多个同类型占位符（如多个 `[金额]`）按原文顺序逐一配对，
+往返还原与原文逐字节一致（含"1980年1月1日出生"这类上下文、无分隔符人名等边界）。
+
+### 红队评测 evaluate
+`测试/红队语料库.jsonl` 内置 43 个用例（19 类结构化数据 + 负样本），量化规则层表现：
+
+```bash
+python3 evaluate.py                          # 控制台报告
+python3 evaluate.py --report 评测报告.md      # Markdown 报告
+python3 evaluate.py --json 结果.json          # JSON 结果
+```
+
+当前基线（v2.2）：**43/43 用例通过，结构化召回率 100%，保留项误报 0，泄露 0**。
+语料库可自行增删用例，作为脱敏质量回归基线——每次改动规则后跑一遍即可量化"有没有变差"。
+
+### 本地 NER 接入
+```bash
+# spaCy（中文模型）
+python desensitize.py mask -f 合同.docx --ner-backend spacy --ner-model zh_core_web_trf
+
+# HuggingFace（中文 NER 模型）
+python desensitize.py mask -f 合同.docx --ner-backend huggingface --ner-model ckiplab/bert-base-chinese-ner
+
+# 本地 Ollama（数据不出本机）
+python desensitize.py mask -f 合同.docx --ner-backend llm --ner-model qwen2.5
+```
+
+规则层先把身份证/手机号等替换为占位符，**本地模型看到的已经是脱敏后的文本**；
+后端缺失时给出安装指引并优雅退出，不影响纯规则层使用。
 
 ## 安全设计
 

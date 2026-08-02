@@ -209,7 +209,7 @@ class TestRestore(unittest.TestCase):
 
     def test_restore_mixed_rules_order(self):
         # 人名/公司/金额/地址混排，规则 pass 顺序与原文顺序不同时也能无损还原
-        self._roundtrip('原告金进跃与被告浙江华临建设集团有限公司（以下简称华临公司）'
+        self._roundtrip('原告王强与被告杭州恒达建设集团有限公司（以下简称恒达公司）'
                         '签订合同，尾款408669212.49元，住浙江省杭州市西湖区文一西路1号。')
 
     def test_restore_trailing_space_original(self):
@@ -220,8 +220,8 @@ class TestRestore(unittest.TestCase):
         self.assertEqual(restored, '总金额为 349976351 元 ，故需支付。')
 
     def test_restore_ocr_spaced_company(self):
-        self._roundtrip('被告：浙江华临建设集团有限公司（以下简称华 临公司）。'
-                        '华 临公司施工，方汇公司分包。')
+        self._roundtrip('被告：杭州恒达建设集团有限公司（以下简称恒 达公司）。'
+                        '恒 达公司施工，景鸿公司分包。')
 
 
 class TestRealCaseFixes(unittest.TestCase):
@@ -246,30 +246,31 @@ class TestRealCaseFixes(unittest.TestCase):
         self.assertNotIn('[当事人甲', r.text)
 
     def test_role_words_anwai_and_witness(self):
-        r = self.d.mask('案外人张先政向本院起诉，证人吴琳作证，'
-                        '物业工作人员吴琳陆续沟通。')
+        r = self.d.mask('案外人刘刚向本院起诉，证人王芳作证，'
+                        '物业工作人员王芳陆续沟通。')
         self.assertIn('[当事人丙（第三人）]', r.text)
         self.assertEqual(r.text.count('[证人]'), 1)
-        self.assertNotIn('张先政', r.text)
+        self.assertNotIn('刘刚', r.text)
+        self.assertNotIn('王芳', r.text)
 
     def test_company_no_overcapture(self):
-        r = self.d.mask('原告金进跃与被告浙江华临建设集团有限公司'
-                        '(以下简称华 临公司)一案')
+        r = self.d.mask('原告王强与被告杭州恒达建设集团有限公司'
+                        '(以下简称恒 达公司)一案')
         self.assertIn('原告[当事人甲（原告）]与被告[合同乙方]', r.text)
         self.assertIn('(以下简称[合同乙方])', r.text)
-        self.assertNotIn('金进跃', r.text)
-        self.assertNotIn('华临', r.text)
+        self.assertNotIn('王强', r.text)
+        self.assertNotIn('恒达', r.text)
 
     def test_short_company_ocr_space(self):
-        r = self.d.mask('华 临公司施工，元勤公 司收款，方汇公司分包。')
-        self.assertNotIn('华 临公司', r.text)
-        self.assertNotIn('元勤公 司', r.text)
-        self.assertNotIn('方汇公司', r.text)
+        r = self.d.mask('恒 达公司施工，昊辰公 司收款，景鸿公司分包。')
+        self.assertNotIn('恒 达公司', r.text)
+        self.assertNotIn('昊辰公 司', r.text)
+        self.assertNotIn('景鸿公司', r.text)
 
     def test_company_does_not_eat_placeholder(self):
         # 曾出现：简称规则把 "[第三方公司]" 里的内容再包一层括号
-        r = self.d.mask('并将原由案外人杭州方汇建筑工程有限公司'
-                        '(以下简称方汇公司)未施工完毕的二标段工程交由华临公司。')
+        r = self.d.mask('并将原由案外人杭州景鸿建筑工程有限公司'
+                        '(以下简称景鸿公司)未施工完毕的二标段工程交由恒达公司。')
         self.assertNotIn('[[', r.text)
         self.assertNotIn(']]', r.text)
 
@@ -311,7 +312,7 @@ class TestNerIntegration(unittest.TestCase):
     def test_regex_ner_backend_extract(self):
         from ner_interface import LegalNER
         ner = LegalNER(backend='regex')
-        result = ner.extract('原告金进跃，被告杭州鼎盛房地产开发有限公司')
+        result = ner.extract('原告王强，被告杭州鼎盛房地产开发有限公司')
         types = {e.type.value for e in result.entities}
         self.assertIn('PERSON', types)
         self.assertIn('COMPANY', types)

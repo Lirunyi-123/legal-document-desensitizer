@@ -1382,7 +1382,10 @@ class Desensitizer:
                 for cut in (1, 2):
                     cand = name[:-cut]
                     removed = name[len(cand):]
-                    if (len(cand) >= 2 and removed in _NAME_TAIL_WORDS
+                    if (len(cand) >= 2
+                            and (removed in _NAME_TAIL_WORDS
+                                 or all(ch in _NAME_TAIL_WORDS
+                                        for ch in removed))
                             and self._is_plausible_role_name(
                                 cand, text[name_start + len(cand):])):
                         name = cand

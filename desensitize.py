@@ -2474,6 +2474,98 @@ def restore_text(masked_text: str, mappings: List[Mapping]) -> str:
 
 
 # ============================================================
+# 审阅文本（阶段一输出 + 审阅清单，供律师把关后再决定是否语义层）
+# ============================================================
+
+_CRITICAL_TYPES = ('身份证号', '手机号', '银行账号', '案号', '统一社会信用代码',
+                   '律师执业证号', '固定电话', '邮箱', '微信号', 'QQ号')
+
+# 规则层覆盖不到、需律师/AI 判断的低优先级残留（语义层职责）
+_REMAINING_PATTERNS = (
+    ('法院名称', re.compile(r'[\u4e00-\u9fa5]{2,12}?(?:人民法院|中级人民法院|高级人民法院|法院)')),
+    ('角色词人名残留', re.compile(
+        r'(原告|被告|上诉人|被上诉人|案外人|证人|法定代表人|负责人|审判员|书记员|'
+        r'委托诉讼代理人|委托代理人|项目经理|财务人员|发包人|承包人|分包人)'
+        r'[：:，,， ]*[\u4e00-\u9fa5]{2,4}')),
+    ('公司/机构简称残留', re.compile(
+        r'(?<![\u4e00-\u9fa5A-Za-z0-9\]])[\u4e00-\u9fa5]{2,8}'
+        r'(?:公司|事务所|集团|商行|经营部|服务部|商店)')),
+    ('地址残留', re.compile(
+        r'[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,12}(?:市)'
+        r'[\u4e00-\u9fa5 ]{1,12}(?:区|县|市)[\u4e00-\u9fa5\d\- ]{3,30}(?:号|室|层)'
+        r'|[\u4e00-\u9fa5]{2,10}(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-]{1,10}(?:号|栋|弄)')),
+    ('金额残留', re.compile(
+        r'\d[\d,，.]{3,}[ \t]*[万千亿]?[ \t]*(?:元|美元|欧元)'
+        r'|(?<!\d)\d{7,}(?:\.\d{1,3})?(?!\d)')),
+    ('案号', re.compile(r'[（(]\d{4}[）)]\s*[\u4e00-\u9fa5]{1,12}\s*\d{1,8}\s*号')),
+    ('身份证号/手机号/银行账号', re.compile(
+        r'(?<!\d)(?:1[3-9]\d{9}|\d{17}[\dXx]|\d{14,20})(?!\d)')),
+)
+
+
+def _inside_placeholder(text: str, pos: int) -> bool:
+    """位置 pos 是否落在 [占位符] 内部。"""
+    return text.rfind('[', 0, pos) > text.rfind(']', 0, pos)
+
+
+def scan_remaining_risk(masked_text: str) -> list:
+    """在规则层脱敏后的文本上扫描"剩余低优先级敏感信息"，返回审阅清单项。"""
+    findings = []
+    for typ, pat in _REMAINING_PATTERNS:
+        for m in pat.finditer(masked_text):
+            if _inside_placeholder(masked_text, m.start()):
+                continue
+            value = m.group(0)
+            start = max(0, m.start() - 12)
+            ctx = masked_text[start:m.end() + 12].replace('\n', ' ')
+            findings.append({'type': typ, 'value': value, 'context': ctx})
+    return findings
+
+
+def build_review_text(masked_text: str, stats: dict,
+                      remaining: list = None) -> str:
+    """生成"规则层脱敏结果 + 审阅清单"文本（阶段一交付物）。"""
+    if remaining is None:
+        remaining = scan_remaining_risk(masked_text)
+    lines = []
+    lines.append('=' * 62)
+    lines.append('法律文书脱敏 · 阶段一结果（规则层）与审阅清单')
+    lines.append('=' * 62)
+    lines.append('')
+    lines.append('【一、规则层已替换统计】')
+    for k, v in sorted(stats.items()):
+        lines.append(f'  - {k}: {v}')
+    lines.append('')
+    lines.append('【二、关键信息校验（必须全部清零后才可用于后续分享）】')
+    critical_hits = {f['type'] for f in remaining
+                     if any(c in f['type'] for c in _CRITICAL_TYPES)}
+    if not critical_hits:
+        lines.append('  ✅ 身份证/手机号/银行卡/案号/信用代码/执业证号等关键信息：0 残留')
+    else:
+        lines.append(f'  ❌ 仍有关键信息残留：{"、".join(sorted(critical_hits))}'
+                     '（请勿继续分享，需人工处理或反馈修复规则）')
+    lines.append('')
+    lines.append('【三、剩余低优先级信息（供审阅；如确认需要，再做语义层脱敏）】')
+    if remaining:
+        for f in remaining:
+            if any(c in f['type'] for c in _CRITICAL_TYPES):
+                continue
+            lines.append(f"  - [{f['type']}] {f['value']}  （…{f['context']}…）")
+    else:
+        lines.append('  （未发现明显残留，仍建议人工抽查案情细节）')
+    lines.append('')
+    lines.append('【四、审阅结论】')
+    lines.append('  确认关键信息已清零后，本文件可用于内部流转；')
+    lines.append('  如需进一步去掉案情敏感细节/公司简称等，请对配置了本技能的 AI 说'
+                 '"继续语义层脱敏"，AI 会直接执行，无需外部 API。')
+    lines.append('')
+    lines.append('【五、阶段一脱敏后全文】')
+    lines.append('-' * 62)
+    lines.append(masked_text)
+    return '\n'.join(lines)
+
+
+# ============================================================
 # CLI 入口
 # ============================================================
 
@@ -2534,6 +2626,9 @@ def main():
     mask_parser.add_argument('--mapping', action='store_true', help='仅输出脱敏映射表')
     mask_parser.add_argument('--save-mapping', help='脱敏映射表另存为文件（⚠️ 包含原始值，建议配合 --encrypt-mapping 使用）')
     mask_parser.add_argument('--encrypt-mapping', action='store_true', help='对映射表进行 AES-256 加密保存（需配合 --save-mapping 使用）')
+    mask_parser.add_argument('--review', action='store_true', default=False,
+                             help='两阶段工作流阶段一：额外生成"规则层结果+审阅清单"文本'
+                                  '（供律师审阅；确认后再由 AI 执行语义层，无需外部 API）')
     mask_parser.add_argument('--secure', action='store_true', default=False, help='启用内存安全增强模式（尽力清空原始文本引用）')
     mask_parser.add_argument('--security-level', default='strict', choices=['strict', 'high', 'standard'],
                              help='安全等级：strict/high（启用纵深防御）、standard（默认，无额外内存清理）')
@@ -2714,6 +2809,21 @@ def main():
                 print(result.to_json())
             else:
                 print(result.text)
+
+        # 两阶段工作流阶段一：生成"规则层结果 + 审阅清单"（供律师审阅）
+        if getattr(args, 'review', False):
+            review_text = build_review_text(result.text, result.stats)
+            if output_path:
+                base, ext = os.path.splitext(output_path)
+                review_path = f'{base}_审阅.txt'
+                with open(review_path, 'w', encoding='utf-8') as f:
+                    f.write(review_text)
+                print(f'📋 审阅清单已生成: {review_path}')
+                print('   律师审阅确认后，如需继续语义层脱敏，直接对配置了本技能的 AI'
+                      '说"继续语义层脱敏"即可（无需外部 API/本地模型）')
+            else:
+                print()
+                print(review_text)
 
     elif args.command == 'scan':
         findings = d.scan(text)

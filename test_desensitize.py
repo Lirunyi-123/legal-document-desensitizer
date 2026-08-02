@@ -287,6 +287,24 @@ class TestRealCaseFixes(unittest.TestCase):
         self.assertIn('陆续', r.text)
         self.assertEqual(r.text.count('[金额]'), 2)
 
+    def test_review_text_checklist(self):
+        # 两阶段工作流阶段一：审阅清单应校验关键信息清零、列出低优先级残留
+        from desensitize import build_review_text, scan_remaining_risk
+        r = self.d.mask('原告王强与被告杭州恒达建设集团有限公司纠纷，'
+                        '身份证号110101198001011232，浙江省杭州市余杭区人民法院已受理。')
+        remaining = scan_remaining_risk(r.text)
+        review = build_review_text(r.text, r.stats, remaining)
+        self.assertIn('关键信息校验', review)
+        self.assertIn('✅', review)
+        self.assertTrue(any(f['type'] == '法院名称' for f in remaining))
+        self.assertIn('法院名称', review)
+
+    def test_scan_remaining_ignores_placeholders(self):
+        # 占位符内部的"法院/公司"等字样不应被当成残留
+        from desensitize import scan_remaining_risk
+        remaining = scan_remaining_risk('[审理法院]已受理，[合同乙方]施工。')
+        self.assertEqual(remaining, [])
+
     def test_restore_person_no_delimiter(self):
         # 无分隔符人名不插空格，还原后与原文完全一致
         self._roundtrip('原告陈建国，被告李四。')

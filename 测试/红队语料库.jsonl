@@ -1,0 +1,43 @@
+{"id": "id_01", "note": "带上下文身份证（校验码合法）", "text": "身份证号110101198001011232", "expect_masked": [{"type": "身份证号", "value": "110101198001011232"}], "expect_kept": []}
+{"id": "id_02", "note": "无标签身份证（校验码合法）", "text": "原告提交的身份证为110101198001011232，与登记一致", "expect_masked": [{"type": "身份证号", "value": "110101198001011232"}], "expect_kept": []}
+{"id": "id_03", "note": "无标签18位含有效出生日期但校验码不符（兼容录入错误，仍按身份证脱敏）", "text": "号码110101198001011234", "expect_masked": [{"type": "身份证号", "value": "110101198001011234"}], "expect_kept": []}
+{"id": "id_04", "note": "18位数字且出生日期无效+校验码无效 → 应为银行账号而非身份证", "text": "账户622202020001234567", "expect_masked": [{"type": "银行账号", "value": "622202020001234567"}], "expect_kept": []}
+{"id": "phone_01", "note": "带上下文手机号", "text": "联系电话：13800138000", "expect_masked": [{"type": "手机号", "value": "13800138000"}], "expect_kept": []}
+{"id": "phone_02", "note": "裸手机号", "text": "双方确认13800138000为送达号码", "expect_masked": [{"type": "手机号", "value": "13800138000"}], "expect_kept": []}
+{"id": "tel_01", "note": "固定电话", "text": "公司电话0571-88888888", "expect_masked": [{"type": "固定电话", "value": "0571-88888888"}], "expect_kept": []}
+{"id": "tel_02", "note": "400服务电话", "text": "客服热线400-800-1234", "expect_masked": [{"type": "固定电话", "value": "400-800-1234"}], "expect_kept": []}
+{"id": "email_01", "note": "邮箱优先于手机号，不得拆成手机号+邮箱", "text": "联系邮箱13800138000@qq.com", "expect_masked": [{"type": "邮箱", "value": "13800138000@qq.com"}], "expect_absent": ["13800138000"]}
+{"id": "wx_01", "note": "带上下文微信号", "text": "微信号：lawyer_wang888", "expect_masked": [{"type": "微信号", "value": "lawyer_wang888"}], "expect_kept": []}
+{"id": "wx_02", "note": "裸微信号（字母开头6-20位）", "text": "加我 lawyer_wang888 详谈", "expect_masked": [{"type": "微信号", "value": "lawyer_wang888"}], "expect_kept": []}
+{"id": "wx_03", "note": "车牌不是微信号", "text": "我开保时捷粤B88888去法院", "expect_masked": [{"type": "车牌号", "value": "粤B88888"}], "expect_kept": []}
+{"id": "qq_01", "note": "QQ号", "text": "QQ：12345678", "expect_masked": [{"type": "QQ号", "value": "12345678"}], "expect_kept": []}
+{"id": "bank_01", "note": "带账号上下文", "text": "收款账号：6222020200012345678", "expect_masked": [{"type": "银行账号", "value": "6222020200012345678"}], "expect_kept": []}
+{"id": "bank_02", "note": "裸19位银行卡号", "text": "尾款支付至6222020200012345678账户", "expect_masked": [{"type": "银行账号", "value": "6222020200012345678"}], "expect_kept": []}
+{"id": "credit_01", "note": "带上下文统一社会信用代码", "text": "统一社会信用代码：91350100M000100Y43", "expect_masked": [{"type": "统一社会信用代码", "value": "91350100M000100Y43"}], "expect_kept": []}
+{"id": "credit_02", "note": "裸信用代码（9开头，校验码合法）", "text": "该企业信用代码91350100M000100Y43已备案", "expect_masked": [{"type": "统一社会信用代码", "value": "91350100M000100Y43"}], "expect_kept": []}
+{"id": "bar_01", "note": "律所执业许可证不是信用代码", "text": "执业许可证号：31110000E000123456", "expect_masked": [{"type": "律师执业证号", "value": "31110000E000123456"}], "expect_kept": []}
+{"id": "case_01", "note": "民事案号", "text": "案号：(2024)京0108民初12345号", "expect_masked": [{"type": "案号", "value": "(2024)京0108民初12345号"}], "expect_kept": []}
+{"id": "case_02", "note": "省高院案号", "text": "本院（2025）浙民终123号民事判决书", "expect_masked": [{"type": "案号", "value": "（2025）浙民终123号"}], "expect_kept": []}
+{"id": "case_03", "note": "普通年份文本不是案号", "text": "2024年签订的合同继续有效", "expect_masked": [], "expect_kept": ["2024年签订的合同继续有效"]}
+{"id": "plate_01", "note": "新能源车牌", "text": "车辆浙AD12345停于车库", "expect_masked": [{"type": "车牌号", "value": "浙AD12345"}], "expect_kept": []}
+{"id": "birth_01", "note": "出生日期（上下文在前）", "text": "出生日期：1985年8月15日", "expect_masked": [{"type": "出生日期", "value": "1985年8月15日"}], "expect_kept": []}
+{"id": "birth_02", "note": "出生日期（上下文在后）", "text": "原告1985年8月15日出生", "expect_masked": [{"type": "出生日期", "value": "1985年8月15日"}], "expect_kept": []}
+{"id": "date_01", "note": "普通日期默认保留", "text": "签订日期：2024年1月15日", "expect_masked": [], "expect_kept": ["2024年1月15日"]}
+{"id": "person_01", "note": "原告人名（角色词+姓名）", "text": "原告：陈建国，男，汉族", "expect_masked": [{"type": "人名", "value": "陈建国"}], "expect_kept": []}
+{"id": "person_02", "note": "被告/法定代表人", "text": "被告：杭州鼎盛房地产开发有限公司，法定代表人：李四", "expect_masked": [{"type": "人名", "value": "李四"}, {"type": "公司名", "value": "杭州鼎盛房地产开发有限公司"}], "expect_kept": []}
+{"id": "person_03", "note": "委托诉讼代理人", "text": "委托诉讼代理人：赵敏，浙江泽大律师事务所律师", "expect_masked": [{"type": "人名", "value": "赵敏"}, {"type": "公司名", "value": "浙江泽大律师事务所"}], "expect_kept": []}
+{"id": "person_04", "note": "LLM层覆盖项（裸人名，规则层不承诺）", "text": "张三欠李四钱不还", "expect_masked": [], "expect_kept": ["张三欠李四钱不还"], "llm_only": ["人名", "人名"]}
+{"id": "company_01", "note": "有限责任公司全称", "text": "甲方：北京华信科技有限公司", "expect_masked": [{"type": "公司名", "value": "北京华信科技有限公司"}], "expect_kept": []}
+{"id": "company_02", "note": "公司简称", "text": "华信置业公司应于三日内付款", "expect_masked": [{"type": "公司名", "value": "华信置业公司"}], "expect_kept": []}
+{"id": "addr_01", "note": "住所地地址", "text": "住所地浙江省杭州市西湖区文一西路1号", "expect_masked": [{"type": "地址", "value": "浙江省杭州市西湖区文一西路1号"}], "expect_kept": []}
+{"id": "addr_02", "note": "独立省市区地址", "text": "现住浙江省杭州市拱墅区莫干山路100号", "expect_masked": [{"type": "地址", "value": "浙江省杭州市拱墅区莫干山路100号"}], "expect_kept": []}
+{"id": "amount_01", "note": "带单位金额", "text": "尾款80万元应于验收后支付", "expect_masked": [{"type": "金额", "value": "80万元"}], "expect_kept": []}
+{"id": "amount_02", "note": "中文大写金额", "text": "违约金人民币伍佰万元整", "expect_masked": [{"type": "金额", "value": "人民币伍佰万元整"}], "expect_kept": []}
+{"id": "amount_03", "note": "口语化金额", "text": "借款3.6万，按月付息", "expect_masked": [{"type": "金额", "value": "3.6万"}], "expect_kept": []}
+{"id": "amount_04", "note": "非金额搭配不脱敏", "text": "设备分辨率60万像素，持股8万股", "expect_masked": [], "expect_kept": ["60万像素", "8万股"]}
+{"id": "org_01", "note": "老式组织机构代码", "text": "组织机构代码69920000-2", "expect_masked": [{"type": "组织机构代码", "value": "69920000-2"}], "expect_kept": []}
+{"id": "cert_01", "note": "护照号", "text": "护照：E12345678", "expect_masked": [{"type": "护照号", "value": "E12345678"}], "expect_kept": []}
+{"id": "cert_02", "note": "驾驶证号", "text": "驾驶证号330106198001011234", "expect_masked": [{"type": "驾驶证号", "value": "330106198001011234"}], "expect_kept": []}
+{"id": "cert_03", "note": "港澳通行证", "text": "港澳通行证C12345678", "expect_masked": [{"type": "港澳通行证", "value": "C12345678"}], "expect_kept": []}
+{"id": "neg_01", "note": "普通数字不脱敏", "text": "系统编号为12345，无其他标识", "expect_masked": [], "expect_kept": ["12345"]}
+{"id": "neg_02", "note": "美元符号金额需完整替换", "text": "预付款$5000美元", "expect_masked": [{"type": "金额", "value": "$5000美元"}], "expect_kept": []}

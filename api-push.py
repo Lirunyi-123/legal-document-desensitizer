@@ -149,7 +149,20 @@ def collect_changes(all_flag, file_args):
         st, path = item[:2], item[3:]  # 格式为 "XY <path>"，跳过状态码后的空格
         if "D" in st or "M" in st or "A" in st or "?" in st or "U" in st:
             changes.append(("D" if "D" in st else "M", path))
-    return changes
+
+    # 展开目录：--all 时把目录递归展开为其下所有文件，避免新目录被静默跳过
+    expanded = []
+    for st, path in changes:
+        full = os.path.join(REPO_DIR, path)
+        if os.path.isdir(full):
+            for root, dirs, files in os.walk(full):
+                dirs.sort()
+                for name in sorted(files):
+                    rel = os.path.relpath(os.path.join(root, name), REPO_DIR)
+                    expanded.append(("M", rel))
+        else:
+            expanded.append((st, path))
+    return expanded
 
 
 # ------------------------------------------------------------
@@ -242,6 +255,42 @@ def push(repo, branch, token, changes, message, dry_run):
 # 本地历史同步（可选，--sync-local）
 # ------------------------------------------------------------
 
+def _git_tree_order(name, is_tree):
+    """git 树条目排序键：目录按 名称+'/' 参与比较。"""
+    return (name + ('/' if is_tree else '')).encode('utf-8')
+
+
+def _rebuild_tree_entries(flat, prefix=''):
+    """把递归树条目重建为目录层级（含子树），返回 [(mode,type,sha,name)]。
+
+    GitHub git/trees?recursive=1 返回扁平条目（含 '测试' 目录对象和
+    '测试/红队语料库.jsonl' 嵌套文件），git mktree 不接受带 '/' 的路径，
+    因此需要按目录分组逐层重建，并校验子树 SHA。
+    """
+    direct = []
+    subdirs = {}
+    for e in flat:
+        p = e['path']
+        if prefix and not p.startswith(prefix + '/'):
+            continue
+        rel = p[len(prefix):].lstrip('/') if prefix else p
+        if '/' in rel:
+            d, _ = rel.split('/', 1)
+            subdirs.setdefault(d, []).append(e)
+        elif e['type'] != 'tree':
+            # 目录对象本身由递归重建（其 SHA 由内容决定）
+            direct.append((e['mode'], e['type'], e['sha'], rel))
+    for d in sorted(subdirs, key=lambda x: x.encode('utf-8')):
+        child = _rebuild_tree_entries(subdirs[d], f"{prefix}/{d}" if prefix else d)
+        lines = [f"{m} {t} {s}\t{n}" for m, t, s, n in child]
+        p = git("mktree", input_bytes=("\n".join(lines) + "\n").encode('utf-8'))
+        if p.returncode != 0:
+            raise SystemExit(f"子树 mktree 失败: {prefix}/{d}\n{p.stderr.decode()}")
+        direct.append(("040000", "tree", p.stdout.decode().strip(), d))
+    direct.sort(key=lambda e: _git_tree_order(e[3], e[1] == 'tree'))
+    return direct
+
+
 def sync_local(repo, branch, new_head, token):
     """把远程提交历史重建到本地，使本地 main 与远程 SHA 完全一致。"""
     chain = []
@@ -270,12 +319,12 @@ def sync_local(repo, branch, new_head, token):
                 p = git("hash-object", "-w", "--stdin", input_bytes=raw)
                 if p.returncode != 0:
                     raise SystemExit(f"blob 写入失败 {e['sha']}")
-        # 2) 树对象（逐项校验 SHA）
-        lines = []
-        for e in tree:
-            mode = e["mode"] if e["type"] == "blob" else "040000"
-            lines.append(f"{mode} {e['type']} {e['sha']}\t{e['path']}")
-        p = git("mktree", input_bytes="\n".join(lines).encode("utf-8"))
+        # 2) 树对象（含子目录，逐层重建并校验 SHA）
+        root = _rebuild_tree_entries(tree)
+        lines = [f"{m} {t} {s}\t{n}" for m, t, s, n in root]
+        p = git("mktree", input_bytes=("\n".join(lines) + "\n").encode('utf-8'))
+        if p.returncode != 0:
+            raise SystemExit(f"mktree 失败: {c['sha'][:12]}\n{p.stderr.decode()}")
         local_tree = p.stdout.decode().strip()
         if local_tree != c["tree"]["sha"]:
             raise SystemExit(f"树 SHA 不一致: {c['sha'][:12]}")

@@ -22,6 +22,7 @@ import sys
 import json
 import os
 import secrets
+import calendar
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
@@ -73,6 +74,47 @@ class MaskResult:
             lines.append(f"- **{k}**: {v}")
 
         return "\n".join(lines)
+
+
+# ============================================================
+# 规则辅助函数（mask 与 scan 共用）
+# ============================================================
+
+def _is_valid_id_birthdate(value: str) -> bool:
+    """粗略校验身份证号第 6-14 位是否为有效出生日期（无标签身份证的判据）。"""
+    if len(value) != 18:
+        return False
+    try:
+        year = int(value[6:10])
+        month = int(value[10:12])
+        day = int(value[12:14])
+    except ValueError:
+        return False
+    if not (1900 <= year <= 2100) or not (1 <= month <= 12):
+        return False
+    return 1 <= day <= calendar.monthrange(year, month)[1]
+
+
+# 带上下文的规则：前缀组保留原文，目标值进入映射表
+_BAR_PATTERN = re.compile(
+    r'((?:执业证号|执业许可证号|律师执业证号|律师执业证|执业证)\s*[：:]?\s*)'
+    r'([0-9A-Z]{17,18})'
+)
+_ID_CONTEXT = re.compile(
+    r'((?:身份证号|身份证号码|身份证|证件号码|证件号)\s*[：:]?\s*)'
+    r'(\d{17}[\dXx])'
+)
+_CREDIT_CONTEXT = re.compile(
+    r'((?:统一社会信用代码|社会信用代码|信用代码)\s*[：:]?\s*)'
+    r'([0-9A-Z]{18})'
+)
+_BIRTHDATE_CONTEXT = re.compile(
+    r'((?:出生日期|出生年月|生日|出生于|生于)\s*[：:]?\s*)(\d{4}年\d{1,2}月\d{1,2}日)'
+    r'|(\d{4}年\d{1,2}月\d{1,2}日)\s*(?:出生|生)'
+)
+_QQ_PATTERN = re.compile(
+    r'((?:QQ|Qq|qq)\s*[：:]?\s*)(\d{5,12})(?!\d)'
+)
 
 
 # ============================================================
@@ -231,93 +273,6 @@ class EntityResolver:
         self._id_original.clear()
         self._person_counter = 0
         self._company_counter = 0
-
-
-# ============================================================
-# SecureDesensitizer — 内存安全包装层
-# ============================================================
-
-class SecureDesensitizer(Desensitizer):
-    """安全增强版脱敏器 — 在标准脱敏基础上增加纵深防御措施。
-
-    与标准 Desensitizer 的区别：
-    - 脱敏完成后尽力清空传入文本对象的内存引用
-    - 触发垃圾回收以尽早释放中间字符串
-
-    局限性（Python 字符串不可变）：
-    - 无法真正擦除内存中的原始字符串（字符串不可变，旧对象可能仍被引用）
-    - 这是"尽力而为"的纵深防御，不是绝对的内存擦除
-    - 如需真正的内存安全，请在硬件安全模块 (HSM) 或机密计算环境中运行
-    """
-
-    def __init__(self, security_level: str = 'strict'):
-        super().__init__()
-        self._security_level = security_level
-        self._secure_mode = security_level in ('strict', 'high')
-        self._text_refs = []  # 跟踪传入的文本引用，便于后续清理
-
-    def mask(self, text: str) -> MaskResult:
-        """对文本执行规则层脱敏（安全增强版）"""
-        if self._secure_mode:
-            self._text_refs.append(text)
-
-        result = super().mask(text)
-
-        if self._secure_mode:
-            self._purge_text_refs()
-        return result
-
-    def _safe_replace(self, text: str, pattern: str, replacement: str,
-                      typ: str, original_group: int = 0) -> str:
-        """安全替换（安全增强版）：替换完成后尝试清除原字符串引用"""
-        result = super()._safe_replace(text, pattern, replacement, typ, original_group)
-
-        if self._secure_mode:
-            try:
-                text = ''
-            except Exception:
-                pass
-
-        return result
-
-    def _safe_replace_wechat(self, original: str, prefix: str = '') -> str:
-        """记录微信号替换（安全增强版）"""
-        result = super()._safe_replace_wechat(original, prefix)
-        if self._secure_mode:
-            try:
-                original = ''
-            except Exception:
-                pass
-        return result
-
-    def _record_addr(self, addr: str, prefix: str = '') -> str:
-        """记录地址替换（安全增强版）"""
-        result = super()._record_addr(addr, prefix)
-        if self._secure_mode:
-            try:
-                addr = ''
-            except Exception:
-                pass
-        return result
-
-    def _purge_text_refs(self):
-        """清空所有跟踪的文本引用并触发垃圾回收。"""
-        import gc
-        for i in range(len(self._text_refs)):
-            try:
-                self._text_refs[i] = ''
-            except Exception:
-                pass
-        self._text_refs.clear()
-        gc.collect()
-
-    def flush(self):
-        """手动触发内存清理（如多次调用 mask 后集中清理）。"""
-        self._purge_text_refs()
-        import gc
-        gc.collect()
-
-
 # ============================================================
 # 脱敏规则引擎
 # ============================================================
@@ -325,12 +280,15 @@ class SecureDesensitizer(Desensitizer):
 class Desensitizer:
     """法律文书脱敏器 — 规则引擎层"""
 
-    def __init__(self):
+    def __init__(self, mask_all_dates: bool = False):
         # 实体归一化解析器（用于人名/公司名的角色绑定）
         self._resolver = EntityResolver()
-        
+        # True 时把所有"年月日"日期替换为 [日期]；默认仅处理带出生上下文的日期
+        self._mask_all_dates = mask_all_dates
+
         # 已替换的记录，避免重复替换
         self._replaced = {}   # original -> (replacement, type)
+        self._counts = {}     # original -> 出现次数（按原始值统计）
         self._counter = {}    # type -> counter for unique naming
         self._stats = {}      # type -> count
 
@@ -346,18 +304,22 @@ class Desensitizer:
         text = self._preprocess(text)
 
         # 按顺序执行各规则（先精确匹配再宽泛匹配）
-        text = self._mask_bar_number(text)    # 17位执业证号（优先于身份证号）
-        text = self._mask_id_card(text)        # 18位身份证号
+        text = self._mask_bar_number(text)    # 律师执业证号（带上下文，优先）
+        text = self._mask_id_card(text)        # 身份证号（上下文优先，无标签需内嵌有效出生日期）
+        text = self._mask_email(text)           # 邮箱（优先于手机号，避免"138...@qq.com"被拆开）
         text = self._mask_phone(text)           # 手机号
         text = self._mask_landline(text)        # 固定电话
-        text = self._mask_email(text)           # 邮箱
         text = self._mask_wechat(text)          # 微信号
         text = self._mask_qq(text)              # QQ号
-        text = self._mask_credit_code(text)     # 统一社会信用代码（含字母）
-        text = self._mask_bank_card(text)       # 16-19位数字（排除了已匹配的）
+        text = self._mask_credit_code(text)     # 统一社会信用代码（带"信用代码"上下文）
+        text = self._mask_bank_card(text)       # 14-20位纯数字银行账号
+        text = self._mask_credit_code_bare(text)  # 统一社会信用代码（无标签，9开头18位）
         text = self._mask_case_number(text)     # 案号
         text = self._mask_license_plate(text)  # 车牌号
-        text = self._mask_date(text)           # 日期
+        if self._mask_all_dates:
+            text = self._mask_date(text)        # 全部"年月日"日期
+        else:
+            text = self._mask_birthdate(text)   # 仅带出生上下文的日期
         text = self._mask_person_name(text)    # 人名（角色词上下文）
         text = self._mask_company_name(text)   # 公司名
         text = self._mask_address(text)        # 地址
@@ -370,7 +332,7 @@ class Desensitizer:
                 original=original,
                 replacement=replacement,
                 type=typ,
-                count=self._stats.get(typ, 0)
+                count=self._counts.get(original, 0)
             ))
 
         # 排序：按出现次数降序
@@ -403,6 +365,7 @@ class Desensitizer:
     def _reset(self):
         self._resolver.reset()
         self._replaced = {}
+        self._counts = {}
         self._counter = {}
         self._stats = {}
         self._court_counter = 0
@@ -432,45 +395,57 @@ class Desensitizer:
 
     def _mask_bar_number(self, text: str) -> str:
         """
-        律师执业证号：17-18位纯数字（必须优先于身份证号匹配）。
-        注意：以执业证/律师证等关键词为上下文线索，捕获全部数字避免残留。
+        律师执业证号：带"执业证"上下文（含"执业许可证号"）的 17-18 位字母数字，
+        必须优先于身份证号/信用代码匹配，避免律所执业许可证被误判为信用代码。
         """
-        # 有明确上下文提示的：执业证号: 17位或18位数字
         def bar_replacer(m):
-            original = m.group(2)
-            replacement = '[律师执业证号]'
-            self._replaced[original] = (replacement, '律师执业证号')
-            self._stats['律师执业证号'] = self._stats.get('律师执业证号', 0) + 1
-            return m.group(1) + '：' + replacement
+            self._record(m.group(2), '[律师执业证号]', '律师执业证号')
+            return m.group(1) + '[律师执业证号]'
+        return _BAR_PATTERN.sub(bar_replacer, text)
 
-        text = re.sub(
-            r'(执业证号|律师执业证|执业证)[\s]*[：:]?[\s]*(\d{17,18})',
-            bar_replacer,
-            text
-        )
-        return text
+    def _record(self, original: str, replacement: str, typ: str) -> None:
+        """记录一次替换：去重、按原始值计数、按类型统计。"""
+        self._replaced[original] = (replacement, typ)
+        self._counts[original] = self._counts.get(original, 0) + 1
+        self._stats[typ] = self._stats.get(typ, 0) + 1
 
     def _safe_replace(self, text: str, pattern: str, replacement: str,
-                       typ: str, original_group: int = 0) -> str:
-        """安全替换：记录替换日志，避免重复替换已替换的内容"""
+                       typ: str, original_group: int = 0,
+                       validate=None) -> str:
+        """安全替换：记录替换日志，同一原始值沿用同一占位符，出现次数按值累计。
+
+        validate: 可选校验函数，返回 False 时不替换（保留原文本）。
+        """
         def replacer(m):
             original = m.group(original_group) if original_group > 0 else m.group()
+            if validate is not None and not validate(original):
+                return m.group(0)
             if original in self._replaced:
+                # 同一原始值再次出现：沿用原占位符，计数照常累加
+                self._counts[original] = self._counts.get(original, 0) + 1
+                self._stats[typ] = self._stats.get(typ, 0) + 1
                 return self._replaced[original][0]
-            self._replaced[original] = (replacement, typ)
-            self._stats[typ] = self._stats.get(typ, 0) + 1
+            self._record(original, replacement, typ)
             return replacement
 
         return re.sub(pattern, replacer, text)
 
     def _mask_id_card(self, text: str) -> str:
-        """身份证号：18位，末位可能为X"""
-        # 匹配18位数字，末位可能是X
+        """身份证号：18位，末位可能为X。
+
+        带"身份证/证件"上下文时无条件替换；无标签的 18 位数字要求内嵌有效
+        出生日期，其余由银行卡规则处理，避免 18 位银行账号被误判为身份证号。
+        """
+        def context_replacer(m):
+            self._record(m.group(2), '[身份证号]', '身份证号')
+            return m.group(1) + '[身份证号]'
+        text = _ID_CONTEXT.sub(context_replacer, text)
         return self._safe_replace(
             text,
             r'(?<!\d)(\d{17}[\dXx])(?!\d)',
             '[身份证号]',
-            '身份证号'
+            '身份证号',
+            validate=_is_valid_id_birthdate
         )
 
     def _mask_phone(self, text: str) -> str:
@@ -518,9 +493,9 @@ class Desensitizer:
         )
         # 独立微信号：字母开头 + 字母数字下划线，6-20位
         # 使用 [a-zA-Z0-9_] 而非 \w 避免匹配中文
-        # 排除邮箱（含@）、URL、纯数字
+        # 排除邮箱（含@）、URL、纯数字；前面紧贴中文时不算（避免误吞"粤B88888"这类车牌）
         text = re.sub(
-            r'(?<![a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',
+            r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',
             lambda m: self._safe_replace_wechat(m.group(1)),
             text
         )
@@ -528,18 +503,15 @@ class Desensitizer:
 
     def _safe_replace_wechat(self, original: str, prefix: str = '') -> str:
         """记录微信号替换"""
-        self._replaced[original] = ('[微信号]', '微信号')
-        self._stats['微信号'] = self._stats.get('微信号', 0) + 1
+        self._record(original, '[微信号]', '微信号')
         return f'{prefix}：[微信号]' if prefix else '[微信号]'
 
     def _mask_qq(self, text: str) -> str:
-        """QQ号"""
-        text = re.sub(
-            r'[Qq][Qq]\s*[：:]?\s*(\d{5,12})',
-            lambda m: '[QQ号]',
-            text
-        )
-        return text
+        """QQ号：保留前缀并记录映射"""
+        def qq_replacer(m):
+            self._record(m.group(2), '[QQ号]', 'QQ号')
+            return m.group(1) + '[QQ号]'
+        return _QQ_PATTERN.sub(qq_replacer, text)
 
     def _mask_bank_card(self, text: str) -> str:
         """银行卡号：14-20位纯数字（覆盖各银行不同长度）"""
@@ -553,10 +525,20 @@ class Desensitizer:
         )
 
     def _mask_credit_code(self, text: str) -> str:
-        """统一社会信用代码：18位字母数字（通常以9开头或特定规则）"""
+        """统一社会信用代码：带"信用代码"上下文时按标签识别（18位字母数字）。"""
+        def context_replacer(m):
+            self._record(m.group(2), '[统一社会信用代码]', '统一社会信用代码')
+            return m.group(1) + '[统一社会信用代码]'
+        return _CREDIT_CONTEXT.sub(context_replacer, text)
+
+    def _mask_credit_code_bare(self, text: str) -> str:
+        """统一社会信用代码（无标签）：仅匹配以 9 开头的 18 位字母数字。
+
+        放在银行卡规则之后执行：纯数字账号优先归银行/身份证规则，避免误判。
+        """
         return self._safe_replace(
             text,
-            r'(?<!\d)([0-9A-Z]{18})(?!\d)',
+            r'(?<![0-9A-Z])(9[0-9A-Z]{17})(?![0-9A-Z])',
             '[统一社会信用代码]',
             '统一社会信用代码'
         )
@@ -580,13 +562,24 @@ class Desensitizer:
         )
 
     def _mask_date(self, text: str) -> str:
-        """日期：年月日格式"""
+        """日期（全量模式 --all-dates）：所有"年月日"格式"""
         return self._safe_replace(
             text,
-            r'(\d{4})年(\d{1,2})月(\d{1,2})日',
+            r'(?<!\d)(\d{4}年\d{1,2}月\d{1,2}日)(?!\d)',
             '[日期]',
             '日期'
         )
+
+    def _mask_birthdate(self, text: str) -> str:
+        """出生日期（默认模式）：仅脱敏带"出生/生日/生于"等上下文的日期"""
+        def context_replacer(m):
+            if m.group(2) is not None:
+                self._record(m.group(2), '[出生日期]', '出生日期')
+                return m.group(1) + '[出生日期]'
+            # "1985年8月15日出生" 这种日期在前、上下文在后的写法
+            self._record(m.group(3), '[出生日期]', '出生日期')
+            return '[出生日期]'
+        return _BIRTHDATE_CONTEXT.sub(context_replacer, text)
 
     # --------------------------------------------------------
     # 新增：人名 / 公司名 / 地址（规则层初步匹配）
@@ -610,8 +603,7 @@ class Desensitizer:
                     _, placeholder = self._resolver.resolve_person(name, role)
                     # 记录映射
                     canonical = self._resolver.normalize(name)
-                    self._replaced[canonical] = (placeholder, '人名')
-                    self._stats['人名'] = self._stats.get('人名', 0) + 1
+                    self._record(canonical, placeholder, '人名')
                     # 保留原文分隔符
                     raw = m.group(0)
                     after_role = raw[len(role):]
@@ -652,8 +644,7 @@ class Desensitizer:
                     best_pos = pos
                     role = r
             _, placeholder = self._resolver.resolve_company(name, role)
-            self._replaced[name] = (placeholder, '公司名')
-            self._stats['公司名'] = self._stats.get('公司名', 0) + 1
+            self._record(name, placeholder, '公司名')
             return placeholder
 
         text = re.sub(
@@ -701,8 +692,7 @@ class Desensitizer:
 
     def _record_addr(self, addr: str, prefix: str = '') -> str:
         """记录地址替换"""
-        self._replaced[addr.replace(' ', '')] = ('[地址]', '地址')
-        self._stats['地址'] = self._stats.get('地址', 0) + 1
+        self._record(addr.replace(' ', ''), '[地址]', '地址')
         return f'{prefix}：[地址]' if prefix else '[地址]'
 
     def _mask_amount(self, text: str) -> str:
@@ -737,23 +727,119 @@ class Desensitizer:
 
 
     def _get_all_rules(self):
-        """返回所有规则（用于scan）"""
-        return [
-            ('身份证号', r'\d{17}[\dXx]', self._mask_id_card),
-            ('手机号', r'1[3-9]\d{9}', self._mask_phone),
-            ('固定电话', r'0\d{2,3}[-\s]?\d{7,8}', self._mask_landline),
-            ('邮箱', r'[\w.+-]+@[\w-]+\.[\w.-]+', self._mask_email),
-            ('银行账号', r'\d{14,20}', self._mask_bank_card),
-            ('统一社会信用代码', r'[0-9A-Z]{18}', self._mask_credit_code),
-            ('案号', r'\(?\d{4}\)?[\u4e00-\u9fa5]{1,10}\(?\d{1,6}\)?\d{0,3}号?', self._mask_case_number),
-            ('车牌号', r'[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}', self._mask_license_plate),
-            ('日期', r'\d{4}年\d{1,2}月\d{1,2}日', self._mask_date),
-            ('人名', r'(原告|被告|法定代表人|委托诉讼代理人|审判员|书记员)[：:]\s*[\u4e00-\u9fa5]{2,3}', self._mask_person_name),
-            ('公司名', r'[\u4e00-\u9fa5]{3,30}(?:有限公司|公司|集团|事务所)', self._mask_company_name),
-            ('地址', r'[\u4e00-\u9fa5]{1,3}省[\u4e00-\u9fa5\s]{1,10}市[\u4e00-\u9fa5\s]{1,10}(?:区|县)[\u4e00-\u9fa5\d\s\-]{5,40}(?:号|室|层)', self._mask_address),
+        """返回所有规则（用于scan）— 与 mask 执行顺序和正则保持一致"""
+        rules = [
+            ('律师执业证号', r'((?:执业证号|执业许可证号|律师执业证号|律师执业证|执业证)\s*[：:]?\s*)([0-9A-Z]{17,18})', self._mask_bar_number),
+            ('身份证号', r'((?:身份证号|身份证号码|身份证|证件号码|证件号)\s*[：:]?\s*)(\d{17}[\dXx])', self._mask_id_card),
+            ('身份证号', r'(?<!\d)(\d{17}[\dXx])(?!\d)', self._mask_id_card),
+            ('邮箱', r'[A-Za-z0-9.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+', self._mask_email),
+            ('手机号', r'(?<!\d)(1[3-9]\d{9})(?!\d)', self._mask_phone),
+            ('固定电话', r'(?<!\d)(0\d{2,3}[-\s]?\d{7,8})(?!\d)', self._mask_landline),
+            ('服务电话', r'(?<!\d)([48]00[-\s]?\d{3}[-\s]?\d{4})(?!\d)', self._mask_landline),
+            ('微信号', r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)', self._mask_wechat),
+            ('QQ号', r'((?:QQ|Qq|qq)\s*[：:]?\s*)(\d{5,12})(?!\d)', self._mask_qq),
+            ('统一社会信用代码', r'((?:统一社会信用代码|社会信用代码|信用代码)\s*[：:]?\s*)([0-9A-Z]{18})', self._mask_credit_code),
+            ('银行账号', r'(?<!\d)(\d{14,20})(?!\d)', self._mask_bank_card),
+            ('统一社会信用代码', r'(?<![0-9A-Z])(9[0-9A-Z]{17})(?![0-9A-Z])', self._mask_credit_code_bare),
+            ('案号', r'\(?\d{4}\)?(?![年月日])[\u4e00-\u9fa5]{1,10}\d{0,6}[\u4e00-\u9fa5]{0,6}\d{1,6}号', self._mask_case_number),
+            ('车牌号', r'(?<![A-Za-z0-9])[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}(?![\dA-Za-z])', self._mask_license_plate),
+            ('出生日期', r'((?:出生日期|出生年月|生日|出生于|生于)\s*[：:]?\s*)(\d{4}年\d{1,2}月\d{1,2}日)|(\d{4}年\d{1,2}月\d{1,2}日)\s*(?:出生|生)', self._mask_birthdate),
+            ('人名', r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,，\s]*[\u4e00-\u9fa5]{2,4}(?=[，,。.\s（(的]|\u3001|$)', self._mask_person_name),
+            ('公司名', r'[\u4e00-\u9fa5（）\(\)]{4,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业)|[\u4e00-\u9fa5]{4,20}(?:律师事务所|会计师事务所|资产评估事务所)|(?<!\w)[\u4e00-\u9fa5]{3,6}公司(?![\u4e00-\u9fa5])', self._mask_company_name),
+            ('地址', r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5\s]{1,10}(?:市)[\u4e00-\u9fa5\s]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)）\s]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)）\s]{2,29}(?:号|室|层|栋|幢)(?:\d+)?', self._mask_address),
             ('金额', r'(?:¥)?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?(?:[万千亿])?(?:元|美元|欧元|英镑|港币)(?![.\d万千亿])', self._mask_amount),
-            ('微信号', r'[a-zA-Z][a-zA-Z0-9_]{5,19}', self._mask_wechat),
         ]
+        if self._mask_all_dates:
+            rules.append(('日期', r'(?<!\d)(\d{4}年\d{1,2}月\d{1,2}日)(?!\d)', self._mask_date))
+        return rules
+
+
+# ============================================================
+# SecureDesensitizer — 内存安全包装层
+# ============================================================
+
+class SecureDesensitizer(Desensitizer):
+    """安全增强版脱敏器 — 在标准脱敏基础上增加纵深防御措施。
+
+    与标准 Desensitizer 的区别：
+    - 脱敏完成后尽力清空传入文本对象的内存引用
+    - 触发垃圾回收以尽早释放中间字符串
+
+    局限性（Python 字符串不可变）：
+    - 无法真正擦除内存中的原始字符串（字符串不可变，旧对象可能仍被引用）
+    - 这是"尽力而为"的纵深防御，不是绝对的内存擦除
+    - 如需真正的内存安全，请在硬件安全模块 (HSM) 或机密计算环境中运行
+    """
+
+    def __init__(self, security_level: str = 'strict', mask_all_dates: bool = False):
+        super().__init__(mask_all_dates=mask_all_dates)
+        self._security_level = security_level
+        self._secure_mode = security_level in ('strict', 'high')
+        self._text_refs = []  # 跟踪传入的文本引用，便于后续清理
+
+    def mask(self, text: str) -> MaskResult:
+        """对文本执行规则层脱敏（安全增强版）"""
+        if self._secure_mode:
+            self._text_refs.append(text)
+
+        result = super().mask(text)
+
+        if self._secure_mode:
+            self._purge_text_refs()
+        return result
+
+    def _safe_replace(self, text: str, pattern: str, replacement: str,
+                      typ: str, original_group: int = 0,
+                      validate=None) -> str:
+        """安全替换（安全增强版）：替换完成后尝试清除原字符串引用"""
+        result = super()._safe_replace(
+            text, pattern, replacement, typ, original_group, validate=validate
+        )
+
+        if self._secure_mode:
+            try:
+                text = ''
+            except Exception:
+                pass
+
+        return result
+
+    def _safe_replace_wechat(self, original: str, prefix: str = '') -> str:
+        """记录微信号替换（安全增强版）"""
+        result = super()._safe_replace_wechat(original, prefix)
+        if self._secure_mode:
+            try:
+                original = ''
+            except Exception:
+                pass
+        return result
+
+    def _record_addr(self, addr: str, prefix: str = '') -> str:
+        """记录地址替换（安全增强版）"""
+        result = super()._record_addr(addr, prefix)
+        if self._secure_mode:
+            try:
+                addr = ''
+            except Exception:
+                pass
+        return result
+
+    def _purge_text_refs(self):
+        """清空所有跟踪的文本引用并触发垃圾回收。"""
+        import gc
+        for i in range(len(self._text_refs)):
+            try:
+                self._text_refs[i] = ''
+            except Exception:
+                pass
+        self._text_refs.clear()
+        gc.collect()
+
+    def flush(self):
+        """手动触发内存清理（如多次调用 mask 后集中清理）。"""
+        self._purge_text_refs()
+        import gc
+        gc.collect()
 
 
 # ============================================================
@@ -1169,6 +1255,8 @@ def main():
     mask_parser.add_argument('--security-level', default='strict', choices=['strict', 'high', 'standard'],
                              help='安全等级：strict/high（启用纵深防御）、standard（默认，无额外内存清理）')
     mask_parser.add_argument('--no-sanitize-filename', action='store_true', default=False, help='禁用输出文件名自动脱敏')
+    mask_parser.add_argument('--all-dates', action='store_true', default=False,
+                             help='把文中所有"年月日"日期也替换为 [日期]（默认只处理出生日期）')
 
     # scan 命令
     scan_parser = subparsers.add_parser('scan', help='扫描敏感信息（不替换）')
@@ -1178,6 +1266,8 @@ def main():
     # llm-prompt 命令
     llm_parser = subparsers.add_parser('llm-prompt', help='生成LLM脱敏提示词（规则层+LLM提示）')
     llm_parser.add_argument('-f', '--file', help='输入文件路径（默认从stdin读取）')
+    llm_parser.add_argument('--all-dates', action='store_true', default=False,
+                            help='把文中所有"年月日"日期也替换为 [日期]（默认只处理出生日期）')
 
     # decrypt 命令
     decrypt_parser = subparsers.add_parser('decrypt', help='解密加密的映射表文件')
@@ -1210,7 +1300,7 @@ def main():
     else:
         text = sys.stdin.read()
 
-    d = Desensitizer()
+    d = Desensitizer(mask_all_dates=getattr(args, 'all_dates', False))
 
     # 如果启用了内存安全增强，使用 SecureDesensitizer
     secure_mode = False
@@ -1221,7 +1311,8 @@ def main():
 
     if secure_mode:
         level = args.security_level if hasattr(args, 'security_level') else 'strict'
-        d = SecureDesensitizer(security_level=level)
+        d = SecureDesensitizer(security_level=level,
+                               mask_all_dates=getattr(args, 'all_dates', False))
         if sys.stderr.isatty():
             print(f'🔒 内存安全增强模式已启用 (security_level={level})', file=sys.stderr)
             print(f'   ⚠️  Python 字符串不可变，内存清理为"尽力而为"的纵深防御', file=sys.stderr)

@@ -24,6 +24,7 @@
 {"id": "addr_11", "note": "OCR 空格户籍地址（东阳市歇山镇圳干村，镇级+空格）", "text": "原告住浙江省 东 阳 市 歇 山 镇 圳 干 村  1-414     号，汉族。", "expect_masked": [{"type": "地址", "value": "住浙江省 东 阳 市 歇 山 镇 圳 干 村  1-414     号"}], "expect_kept": []}
 {"id": "proj_01", "note": "项目名称（怡丰城项目/小区/一标段）", "text": "案涉怡丰城项目复工，怡丰城小区物业沟通，怡丰城一标段开工。", "expect_masked": [{"type": "项目名称", "value": "怡丰城项目"}, {"type": "项目名称", "value": "怡丰城小区"}, {"type": "项目名称", "value": "怡丰城一标段"}], "expect_kept": []}
 {"id": "proj_02", "note": "泛化词组不是项目名称（本项目/工程）", "text": "本项目继续施工，工程进度正常，尾款80万元。", "expect_masked": [{"type": "金额", "value": "80万元"}], "expect_kept": ["本项目", "工程进度"]}
+{"id": "neg_05", "note": "地名/职务不是裸人名（余杭区/承包人/包人）", "text": "杭州市余杭区人民法院裁定，作为承包人施工，建设单位怡丰成公司资金链断裂。", "expect_masked": [{"type": "公司名", "value": "怡丰成公司"}], "expect_kept": ["余杭区人民法院", "承包人"]}
 {"id": "plate_01", "note": "新能源车牌", "text": "车辆浙AD12345停于车库", "expect_masked": [{"type": "车牌号", "value": "浙AD12345"}], "expect_kept": []}
 {"id": "birth_01", "note": "出生日期（上下文在前）", "text": "出生日期：1985年8月15日", "expect_masked": [{"type": "出生日期", "value": "1985年8月15日"}], "expect_kept": []}
 {"id": "birth_02", "note": "出生日期（上下文在后）", "text": "原告1985年8月15日出生", "expect_masked": [{"type": "出生日期", "value": "1985年8月15日"}], "expect_kept": []}

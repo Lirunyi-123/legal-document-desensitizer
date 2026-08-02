@@ -280,6 +280,17 @@ _BARE_NAME_BLACKLIST = set(
     '莫非 '
     '孔子 '
     '向导 '
+    '华临 华林 余杭 余政 包人 程款 司法 施工 支付 鉴定 建设 开发 工程 项目 '
+    '监理 设计 造价 结算 审计 劳务 材料 工资 奖金 税费 管理 合同 协议 借款 '
+    '贷款 欠款 还款 付款 收款 存款 转账 汇款 保险 担保 抵押 质押 评估 冻结 '
+    '查封 扣押 拘留 逮捕 审理 判决 裁定 调解 和解 撤诉 反诉 答辩 举证 质证 '
+    '陈述 辩称 请求 主张 认为 要求 表示 同意 拒绝 认可 承诺 保证 违约 侵权 '
+    '赔偿 补偿 损失 责任 义务 权利 利息 本金 违约金 罚息 复利 滞纳 中止 终结 '
+    '受理 立案 管辖 回避 保全 移送 指定 延期 缺席 宣判 送达 公告 勘验 变卖 '
+    '发包 分包 承包 转包 挂靠 垫资 停工 复工 竣工 验收 交付 移交 保修 维修 '
+    '整改 返工 窝工 误工 停工 窝工 索赔 签证 变更 追加 计量 计价 组价 拦标 '
+    '主动 余万元 余政储 纪要 许可证 包给 万元 政储 可证 华临公 华临建 包人 '
+    '会议纪要 施工许可 执业许可 经营许可 登记 备案 审批 核准 报批 立项 批复 '
     '集团 公司 有限 股份 银行 医院 学校 法院 酒店 饭店 宾馆 商场 超市 工厂 置业 '
     '律师 经理 主任 顾问 老师 教授 医生 护士 会计 董事长 总经理 总裁 总监 主管 '
     '书记 部长 处长 科长 所长 院长 校长 队长 组长 会长 主席 委员 代表 记者 '
@@ -306,6 +317,12 @@ _NAME_COMPANY_SUFFIXES = (
     '新区 开发区 高新区 科创 科技 置业'
 ).split()
 
+# 地名/角色职务尾缀：裸人名候选以这些结尾时视为地名或职务片段（"余杭区""承包人"）
+_NAME_PLACE_SUFFIXES = (
+    '区 市 县 镇 街道 社区 村 路 街 巷 弄 号 苑 里 坊 小区 组 队 部 人 所 处 段 期 '
+    '证 储 要 单 表 册 卡 函 复 件 批 文 书 卷 档 案'
+).split()
+
 # 角色词后捕获到的"名字"若含这些虚词/连接词，大概率是词组而非姓名
 # （如"原告起诉之日""原告与被告"），保留原文
 _ROLE_NAME_REJECT = set('之其及与和或对被把在于而但且所此那这等各每该向从以非是')
@@ -328,7 +345,13 @@ _ROLE_NAME_NOUNS = set(
      '手机 电话 微信 邮箱 账号 开户行 卡号 金额 利息 本金 诉讼费 保全费 鉴定费 '
      '执行费 公告费 送达 开庭 审理 判决 裁定 调解书 判决书 裁定书 执行 冻结 查封 '
      '扣押 评估 拍卖 变更 追加 撤诉 再审 复核 协商 调解 和解 结算 对账 领取 收取 '
-     '归还 返还 出具 签订 订立 签署 签字处 盖章处 捺印 到庭 出庭 反诉 答辩状').split())
+     '归还 返还 出具 签订 订立 签署 签字处 盖章处 捺印 到庭 出庭 反诉 答辩状 '
+     '施工 发包 分包 承包 转包 挂靠 垫资 停工 复工 竣工 验收 交付 移交 保修 '
+     '鉴定 勘验 评估 拍卖 变卖 保全 冻结 查封 扣押 执行 受理 立案 管辖 回避 '
+     '审理 宣判 送达 公告 撤诉 和解 调解 变更 追加 结算 审计 造价 监理 设计 '
+     '建设 开发 工程 劳务 材料 工资 奖金 税费 管理 合同 协议 借款 贷款 欠款 '
+     '还款 付款 收款 存款 转账 汇款 保险 担保 抵押 质押 承诺 保证 违约 侵权 '
+     '赔偿 补偿 损失 责任 义务 权利 利息 本金 违约金 罚息 复利 滞纳 中止 终结').split())
 
 # 角色词后候选名的常见前缀/后缀（法律文书高频词组，不是姓名）
 _ROLE_NAME_BAD_PREFIXES = (
@@ -1562,10 +1585,16 @@ class Desensitizer:
                     next1 = text[i + len(cand)] if i + len(cand) < n else ''
                     next2 = text[i + len(cand):i + len(cand) + 2]
                     count = text.count(cand)
-                    if not (count >= 2
-                            or before in _NAME_CONTEXT_BEFORE
-                            or after in _NAME_CONTEXT_AFTER):
-                        continue
+                    strong = (before in _NAME_CONTEXT_BEFORE
+                              or after in _NAME_CONTEXT_AFTER)
+                    if len(cand) == 2:
+                        # 两字名必须有强上下文（向/与/欠/借/付/称/诉…），
+                        # 仅凭高频会把"华临/余杭/包给/施工"等常见词误判为人名
+                        if not strong:
+                            continue
+                    else:
+                        if not (count >= 2 or strong):
+                            continue
                     given = cand[len(surname):]
                     # 公司/职务名片段（如"张律师""华信置业""盛集团"）不是人名
                     if cand.endswith(tuple(_NAME_COMPANY_SUFFIXES)):
@@ -1574,6 +1603,20 @@ class Desensitizer:
                         continue
                     if next1 and (cand + next1).endswith(
                             tuple(_NAME_COMPANY_SUFFIXES)):
+                        continue
+                    # OCR 空格容忍：候选后（含空格）拼出公司/机构尾缀（"华临公 司"）
+                    tail = cand + next1 + next2
+                    tail_ns = re.sub(r'[ \t]', '', tail)
+                    if any(tail_ns[:len(cand) + 2].endswith(s)
+                           for s in _NAME_COMPANY_SUFFIXES):
+                        continue
+                    # 地名/职务尾缀（"余杭区""承包人""代理人"）不是人名
+                    if cand.endswith(tuple(_NAME_PLACE_SUFFIXES)):
+                        continue
+                    # 后面紧跟"法院/路/街/号"等 → 是地名/机构而非人名
+                    after8 = text[i + len(cand):i + len(cand) + 8]
+                    if ('人民法院' in after8 or '法院' in after8
+                            or after8.startswith(('路', '街', '巷', '号'))):
                         continue
                     # jieba 分词校验
                     if not self._cand_valid_in_tokens(

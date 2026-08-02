@@ -328,6 +328,15 @@ class TestRealCaseFixes(unittest.TestCase):
         self.assertIn('本项目', r.text)
         self.assertIn('工程进度', r.text)
 
+    def test_bare_name_not_place_or_role(self):
+        # 地名（余杭区）与职务片段（承包人/包人）不是裸人名
+        r = self.d.mask('杭州市余杭区人民法院裁定，作为承包人施工，'
+                        '建设单位怡丰成公司资金链断裂。')
+        self.assertIn('余杭区', r.text)
+        self.assertIn('承包人', r.text)
+        self.assertNotIn('余杭区[当事人', r.text)
+        self.assertNotIn('承[当事人', r.text)
+
     def test_restore_person_no_delimiter(self):
         # 无分隔符人名不插空格，还原后与原文完全一致
         self._roundtrip('原告陈建国，被告李四。')

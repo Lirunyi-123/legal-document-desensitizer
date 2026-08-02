@@ -44,9 +44,10 @@ class TestRuleLayerFixes(unittest.TestCase):
 
     def test_per_value_count(self):
         result = self.d.mask('A 13800138000 B 13800138000 C 13912345678')
-        by_original = {m.original: m.count for m in result.mapping}
-        self.assertEqual(by_original.get('13800138000'), 2)
-        self.assertEqual(by_original.get('13912345678'), 1)
+        # v2.5：映射表按"每处替换一行"记录，同一原始值出现 N 次 → N 行
+        originals = [m.original for m in result.mapping]
+        self.assertEqual(originals.count('13800138000'), 2)
+        self.assertEqual(originals.count('13912345678'), 1)
         self.assertEqual(result.stats['总替换次数'], 3)
 
     def test_wechat_and_qq_recorded(self):
@@ -200,6 +201,90 @@ class TestRestore(unittest.TestCase):
         r = d.mask('原告：陈建国。尾款80万元。')
         restored = restore_text(r.text, parse_mapping_text(r.to_markdown()))
         self.assertEqual(restored, '原告：陈建国。尾款80万元。')
+
+    def test_restore_repeated_noncontiguous_amounts(self):
+        # 同一金额值多次出现且不相邻，映射须按"每处一行"配对
+        self._roundtrip('A付款408669212.49元，B付款63689993.28元，'
+                        'C付款408669212.49元，D付12万元。')
+
+    def test_restore_mixed_rules_order(self):
+        # 人名/公司/金额/地址混排，规则 pass 顺序与原文顺序不同时也能无损还原
+        self._roundtrip('原告金进跃与被告浙江华临建设集团有限公司（以下简称华临公司）'
+                        '签订合同，尾款408669212.49元，住浙江省杭州市西湖区文一西路1号。')
+
+    def test_restore_trailing_space_original(self):
+        # 金额带尾随空格（OCR 常见"349976351 元 ，"），映射表读写后仍逐字节还原
+        d = Desensitizer()
+        r = d.mask('总金额为 349976351 元 ，故需支付。')
+        restored = restore_text(r.text, parse_mapping_text(r.to_markdown()))
+        self.assertEqual(restored, '总金额为 349976351 元 ，故需支付。')
+
+    def test_restore_ocr_spaced_company(self):
+        self._roundtrip('被告：浙江华临建设集团有限公司（以下简称华 临公司）。'
+                        '华 临公司施工，方汇公司分包。')
+
+
+class TestRealCaseFixes(unittest.TestCase):
+    """2026-08 真实判决书实战暴露问题的回归测试。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def _roundtrip(self, text):
+        r = self.d.mask(text)
+        restored = restore_text(r.text, parse_mapping_text(r.to_markdown()))
+        self.assertEqual(restored, text)
+
+    def test_role_word_noun_not_name(self):
+        # 角色词后跟名词/动词词组，不得当人名
+        r = self.d.mask('原告提供担保，法定代表人处签名，法定代表人印章，'
+                        '被告私章，原告主张驳回')
+        self.assertIn('提供担保', r.text)
+        self.assertIn('处签名', r.text)
+        self.assertIn('印章', r.text)
+        self.assertIn('私章', r.text)
+        self.assertNotIn('[当事人甲', r.text)
+
+    def test_role_words_anwai_and_witness(self):
+        r = self.d.mask('案外人张先政向本院起诉，证人吴琳作证，'
+                        '物业工作人员吴琳陆续沟通。')
+        self.assertIn('[当事人丙（第三人）]', r.text)
+        self.assertEqual(r.text.count('[证人]'), 1)
+        self.assertNotIn('张先政', r.text)
+
+    def test_company_no_overcapture(self):
+        r = self.d.mask('原告金进跃与被告浙江华临建设集团有限公司'
+                        '(以下简称华 临公司)一案')
+        self.assertIn('原告[当事人甲（原告）]与被告[合同乙方]', r.text)
+        self.assertIn('(以下简称[合同乙方])', r.text)
+        self.assertNotIn('金进跃', r.text)
+        self.assertNotIn('华临', r.text)
+
+    def test_short_company_ocr_space(self):
+        r = self.d.mask('华 临公司施工，元勤公 司收款，方汇公司分包。')
+        self.assertNotIn('华 临公司', r.text)
+        self.assertNotIn('元勤公 司', r.text)
+        self.assertNotIn('方汇公司', r.text)
+
+    def test_company_does_not_eat_placeholder(self):
+        # 曾出现：简称规则把 "[第三方公司]" 里的内容再包一层括号
+        r = self.d.mask('并将原由案外人杭州方汇建筑工程有限公司'
+                        '(以下简称方汇公司)未施工完毕的二标段工程交由华临公司。')
+        self.assertNotIn('[[', r.text)
+        self.assertNotIn(']]', r.text)
+
+    def test_amount_space_and_big_number(self):
+        r = self.d.mask('累计支付349976351 元，另付3449427.2  元，'
+                        '算式392485911.675，尾款32000万 元整。')
+        self.assertEqual(r.text.count('[金额]'), 4)
+        self.assertNotIn('349976351', r.text)
+        self.assertNotIn('392485911.675', r.text)
+
+    def test_uppercase_amount_single_char_not_masked(self):
+        # "陆"（陆续）等单字大写数字不是金额
+        r = self.d.mask('王五陆续归还伍佰万元整，另付人民币壹拾贰万元。')
+        self.assertIn('陆续', r.text)
+        self.assertEqual(r.text.count('[金额]'), 2)
 
     def test_restore_person_no_delimiter(self):
         # 无分隔符人名不插空格，还原后与原文完全一致

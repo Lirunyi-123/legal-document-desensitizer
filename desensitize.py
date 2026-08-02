@@ -68,7 +68,8 @@ class MaskResult:
             "|------|--------|--------|------|---------|",
         ]
         for i, m in enumerate(sorted(self.mapping, key=lambda m: m.order), 1):
-            lines.append(f"| {i} | {m.original} | {m.replacement} | {m.type} | {m.count} |")
+            # 单元格不再填充空格，保证带首尾空格的原始值可逐字节还原
+            lines.append(f"|{i}|{m.original}|{m.replacement}|{m.type}|{m.count}|")
 
         lines.extend(["", "", "## 统计", ""])
         for k, v in sorted(self.stats.items()):
@@ -316,6 +317,42 @@ _ROLE_NAME_VERBS = set(
      '故意 过失 严重 依法 应当 可以 有权 义务 责任 权利 利益 损失 赔偿 补偿 '
      '违约金 逾期 延迟 保证 担保 借贷 还款 付款 收款').split())
 
+# 角色词后常见的"名词/词组"，不是姓名（实战误伤：原告提供担保、法定代表人处签名、
+# 法定代表人印章、被告私章、原告主张驳回 等）
+_ROLE_NAME_NOUNS = set(
+    ('提供担保 提供 担保 处签名 处签字 签名 签字 印章 私章 公章 合同章 项目章 '
+     '技术章 法定代表人印章 主张驳回 诉请 起诉状 答辩状 上诉状 证据 材料 款项 '
+     '费用 工资 社保 公积金 身份证 户口本 房产证 合同 协议 工程 项目 公司 企业 '
+     '单位 机构 部门 人员 员工 家属 亲友 代理 委托 权限 特别授权 一般授权 代理权限 '
+     '地址 住所 户籍 出生 民族 性别 年龄 职业 文化 婚姻 住址 现住 联系电话 联系方式 '
+     '手机 电话 微信 邮箱 账号 开户行 卡号 金额 利息 本金 诉讼费 保全费 鉴定费 '
+     '执行费 公告费 送达 开庭 审理 判决 裁定 调解书 判决书 裁定书 执行 冻结 查封 '
+     '扣押 评估 拍卖 变更 追加 撤诉 再审 复核 协商 调解 和解 结算 对账 领取 收取 '
+     '归还 返还 出具 签订 订立 签署 签字处 盖章处 捺印 到庭 出庭 反诉 答辩状').split())
+
+# 角色词后候选名的常见前缀/后缀（法律文书高频词组，不是姓名）
+_ROLE_NAME_BAD_PREFIXES = (
+    '提供 主张 支付 提交 委托 要求 请求 认为 辩称 陈述 承担 履行 偿还 交付 出庭 '
+    '到庭 协商 调解 起诉 上诉 答辩 质证 举证 执行 冻结 查封 扣押 拍卖 评估 变更 '
+    '追加 撤诉 申诉 再审 复核 签订 订立 出具 送达 开庭 审理 判决 裁定 驳回 诉请 '
+    '领取 收取 归还 返还 结算 对账 提出 作出 不予 认为 表示 拒绝 认可 同意 申请 '
+    '提供担保').split()
+
+_ROLE_NAME_BAD_SUFFIXES = (
+    '签名 签字 印章 私章 公章 合同章 项目章 技术章 起诉 上诉 答辩 陈述 辩称 主张 '
+    '要求 请求 认为 协商 调解 和解 起诉状 答辩状 上诉状 判决书 裁定书 调解书 '
+    '证据 材料 费用 工资 款项 金额 利息 违约金 赔偿金 工程款 劳务款 材料款 '
+    '诉讼费 保全费 鉴定费 执行费 受理费 公告费 期限 责任 义务 权利 损失').split()
+
+# 人名后允许被吞掉的"动词/虚词尾部"（"吴琳陆续""金进跃与""张先政作证"）
+_NAME_TAIL_WORDS = set(
+    ('陆续 作证 支付 偿还 提交 委托 要求 请求 主张 认为 表示 答应 拒绝 承认 起诉 '
+     '上诉 到庭 出庭 陈述 辩称 举证 质证 签署 结算 领取 收取 归还 返还 对账 出具 '
+     '签订 订立 开庭 审理 判决 裁定 驳回 协商 调解 申请 提出 作出 认可 同意 沟通 '
+     '参与 进行 担任 负责 提供 担保 履行 违约 侵权 保证 借贷 还款 付款 收款 交付 '
+     '与 和 及 之 为 的 在 把 被 于 是 而 且 或 从 向 给 等 以 就 将 并 也 还 又 再 '
+     '都 曾 均 已 未 不 称 诉 告 据 表 示 认 为 要求 请求 主张').split())
+
 # 中文分词器（jieba，可选依赖）：用于过滤"江省杭""付逾期"这类
 # 嵌在长词里的人名假候选；缺失时裸人名发现降级为种子传播
 _SEGMENTER = None
@@ -333,6 +370,83 @@ def _get_segmenter():
         except ImportError:
             _SEGMENTER = None
     return _SEGMENTER
+
+
+# ============================================================
+# 公司名模式（容忍 OCR 行内空格，但不跨换行；与 _get_all_rules 共用）
+# ============================================================
+
+_PLACEHOLDER_RE = re.compile(r'\[[^\]]+\]')
+_INLINE_SP = '[ \t]*'   # 行内空格（不含 \n，避免跨段落吞词）
+
+_ROLE_PATTERN = (
+    r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|案外人|证人|担保人|'
+    r'出借人|借款人|收款人|付款人|发包人|承包人|分包人|代建人|联系人|工作人员|'
+    r'物业人员|项目经理|财务人员|会计|出纳|委托诉讼代理人|委托代理人|法定代表人|'
+    r'法定代理人|负责人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)'
+    r'[：:，,， ]*([\u4e00-\u9fa5]{2,4})'
+    r'(?=[，,。. （(的与和向称诉等为之：:、被就陆续作证签署结算收取领取出具归还返还对账'
+    r'支付偿还提交委托要求请求主张认为表示拒绝承认答应起诉上诉申诉复核到庭出庭陈述'
+    r'辩称举证质证告]|\u3001|$)'
+)
+
+
+def _spaced_re(seq: str) -> str:
+    """把字面串转成容忍行内空格的正则片段。"""
+    return _INLINE_SP.join(re.escape(c) for c in seq)
+
+
+_COMPANY_FULL_PATTERN = re.compile(
+    r'((?:[\u4e00-\u9fa5（）\(\)]' + _INLINE_SP + r'){4,30}(?:'
+    + '|'.join(_spaced_re(s) for s in (
+        '有限公司', '股份有限公司', '有限责任公司', '集团公司', '合伙企业'))
+    + r'))'
+)
+_COMPANY_OFFICE_PATTERN = re.compile(
+    r'((?:[\u4e00-\u9fa5（）\(\)]' + _INLINE_SP + r'){4,20}(?:'
+    + '|'.join(_spaced_re(s) for s in (
+        '律师事务所', '会计师事务所', '资产评估事务所'))
+    + r'))'
+)
+_COMPANY_SHORT_PATTERN = re.compile(
+    # 前不能紧贴中文/字母（避免吞掉更长公司名中的片段）；
+    # 2~6 字简称 + 公司（"华临公司""方汇公司""元勤公司"等，含 OCR 空格）
+    r'(?<![\u4e00-\u9fa5A-Za-z0-9])((?:[\u4e00-\u9fa5]' + _INLINE_SP
+    + r'){2,6}公' + _INLINE_SP + r'司)'
+)
+
+# 公司全称前常被误吞的上下文词（"原告金进跃与被告浙江华临建设集团有限公司"）
+_COMPANY_LEAD_WORDS = (
+    '以下简称 下简称 简称 以下 '
+    '原告 被告 上诉人 被上诉人 第三人 案外人 申请人 被申请人 申请执行人 被执行人 '
+    '甲方 乙方 供方 需方 出租方 承租方 发包人 承包人 分包人 代建人 总包单位 总承包人 '
+    '委托 法定代表人 负责人 将原由 由原 原由 包括 并 由 将 为 与 和 及 的 在 对 把 被 '
+    '于 是 而 且 或 从 向 给 若 因 关于 以 等 之 其 该 此 各 每'
+).split()
+
+_COMPANY_FUNCTION_CHARS = set('与和及的由将为在原对把被于而是且或并从向给在若因关于以等之其该此各每')
+
+
+def _trim_company_span(span: str) -> tuple:
+    """修剪公司名匹配串前被误吞的上下文词，返回 (公司名, 保留前缀)。"""
+    name = span.lstrip(' \t')
+    while True:
+        progressed = False
+        for kw in _COMPANY_LEAD_WORDS:
+            if name.startswith(kw):
+                name = name[len(kw):].lstrip(' \t')
+                progressed = True
+                break
+        if progressed:
+            continue
+        if name and name[0] in _COMPANY_FUNCTION_CHARS:
+            name = name[1:].lstrip(' \t')
+            continue
+        break
+    if not name:
+        return '', span
+    prefix = span[:len(span) - len(name)]
+    return name, prefix
 
 
 # ============================================================
@@ -358,6 +472,7 @@ class EntityResolver:
         'lawyer': '委托代理人',
         'legal_rep': '法定代表人',
         'guarantor': '担保方',
+        'witness': '证人',
         'contract_a': '合同甲方',
         'contract_b': '合同乙方',
         'subcontractor': '分包方',
@@ -377,14 +492,14 @@ class EntityResolver:
     ROLE_KEYWORDS = {
         '原告': 'plaintiff', '上诉人': 'plaintiff', '申请执行人': 'plaintiff',
         '被告': 'defendant', '被上诉人': 'defendant', '被执行人': 'defendant',
-        '第三人': 'third_party',
+        '第三人': 'third_party', '案外人': 'third_party', '证人': 'witness',
         '审判员': 'judge', '审判长': 'judge', '代理审判员': 'judge',
         '书记员': 'clerk',
         '委托诉讼代理人': 'lawyer', '委托代理人': 'lawyer',
         '法定代表人': 'legal_rep', '负责人': 'legal_rep',
         '甲方': 'contract_a', '发包人': 'contract_a',
         '乙方': 'contract_b', '承包人': 'contract_b',
-        '担保方': 'guarantor',
+        '分包人': 'subcontractor', '担保人': 'guarantor', '担保方': 'guarantor',
     }
     
     def __init__(self):
@@ -574,29 +689,206 @@ class Desensitizer:
 
     def _finalize(self, text: str) -> MaskResult:
         """构建映射表与统计（mask / mask_with_ner 共用）。"""
-        # 修正映射顺序：按原文出现顺序重新编号（还原时按原文顺序配对）
-        self._assign_text_order(self._original_text)
-
-        # 构建映射表
-        mapping = []
-        for original, (replacement, typ) in self._replaced.items():
-            mapping.append(Mapping(
-                original=original,
-                replacement=replacement,
-                type=typ,
-                count=self._counts.get(original, 0),
-                order=self._order.get(original, 0)
-            ))
-
-        # 排序：按首次出现顺序（还原时按原文顺序配对）
-        mapping.sort(key=lambda m: m.order)
+        # 按"实际替换事件 + 最终文本位置"生成每处一行映射，保证 restore 无损配对
+        mapping = self._build_event_mapping()
+        if not mapping:
+            # 兜底：事件缺失时退回"扫描原文位置"或"唯一值 + 首次出现顺序"
+            seq = self._scan_occurrences(self._original_text)
+            for order, (value, placeholder) in enumerate(seq, 1):
+                entry = self._replaced.get(value)
+                if not entry:
+                    continue
+                mapping.append(Mapping(
+                    original=value,
+                    replacement=placeholder,
+                    type=entry[1],
+                    count=1,
+                    order=order,
+                ))
+        if not mapping:
+            self._assign_text_order(self._original_text)
+            for original, (replacement, typ) in self._replaced.items():
+                mapping.append(Mapping(
+                    original=original,
+                    replacement=replacement,
+                    type=typ,
+                    count=self._counts.get(original, 0),
+                    order=self._order.get(original, 0)
+                ))
+            mapping.sort(key=lambda m: m.order)
 
         # 统计
         stats = dict(self._stats)
-        stats['总脱敏项数'] = len(mapping)
+        stats['总脱敏项数'] = len(self._replaced)
         stats['总替换次数'] = sum(m.count for m in mapping)
 
         return MaskResult(text=text, mapping=mapping, stats=stats)
+
+    def _build_event_mapping(self) -> list:
+        """把替换事件按"最终文本位置"排序，生成每处一行的映射表。
+
+        事件记录的是替换发生"当时文本"的位置。用片段表（piece table）按
+        应用顺序回放全部替换，精确得到每个占位符在最终文本中的位置；
+        与启发式/上下文相关的替换也能精确配对还原。
+        """
+        events = self._events
+        if not events:
+            return []
+        n = len(events)
+        pieces = [[self._original_text, None]]   # [文本, 事件id 或 None]
+        for i in range(n):
+            p_i, orig, ph = events[i]
+            end_len = len(orig)
+            # 定位 p_i 所在片段
+            acc = 0
+            si = 0
+            while si < len(pieces):
+                L = len(pieces[si][0])
+                if acc + L > p_i:
+                    break
+                acc += L
+                si += 1
+            so = p_i - acc
+            if si >= len(pieces):
+                pieces.append(['', None])
+                so = 0
+            # 切分起始片段，使 si+1 从 p_i 开始
+            if so > 0:
+                t, e = pieces[si]
+                pieces[si] = [t[:so], e]
+                si += 1
+                pieces.insert(si, [t[so:], e])
+            # 吃掉 len(orig) 长度
+            need = end_len
+            while need > 0:
+                t, e = pieces[si]
+                L = len(t)
+                if L <= need:
+                    need -= L
+                    del pieces[si]
+                else:
+                    pieces[si] = [t[need:], e]
+                    need = 0
+            # 插入占位符片段
+            pieces.insert(si, [ph, i])
+
+        finals = [0] * n
+        pos = 0
+        for t, eid in pieces:
+            if eid is not None:
+                finals[eid] = pos
+            pos += len(t)
+
+        order = sorted(range(n), key=lambda i: (finals[i], i))
+        rows = []
+        for seq, i in enumerate(order, 1):
+            _, orig, ph = events[i]
+            entry = self._replaced.get(orig)
+            if not entry:
+                continue
+            rows.append(Mapping(original=orig, replacement=ph,
+                                type=entry[1], count=1, order=seq))
+        return rows
+
+    def _scan_occurrences(self, original_text: str) -> list:
+        """按原文位置扫描全部规则的命中，返回按原文顺序的 (原始值, 占位符) 序列。
+
+        规则引擎以"按规则顺序整篇分 pass"执行；最终文本中占位符的出现顺序与
+        原文位置一致。本扫描在原文上逐位置取"规则顺序中第一个命中"的规则，
+        与 mask 的实际替换结果对齐（值不在 _replaced 中说明该处未被替换，跳过）。
+        人名（角色词 + 裸名启发式 + 种子传播）不在统一正则里，单独按原文位置
+        扫描全部已记录的人名原始值，再与规则命中按位置合并。
+        """
+        rules = self._get_all_rules()
+        compiled = []
+        for rule in rules:
+            try:
+                pat = re.compile(rule['pattern'])
+            except re.error:
+                continue
+            compiled.append((pat, rule))
+
+        entries = []
+        # 1) 人名：扫描原文中所有已记录人名的出现位置（重叠取最长名）
+        person_values = {orig for orig, (rep, typ) in self._replaced.items()
+                         if typ == '人名'}
+        spans = []
+        for value in person_values:
+            start = 0
+            while True:
+                pos = original_text.find(value, start)
+                if pos == -1:
+                    break
+                spans.append((pos, pos + len(value), value))
+                start = pos + 1
+        spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+        kept = []
+        for s in spans:
+            if any(s[0] < k[1] and k[0] < s[1] for k in kept):
+                continue
+            kept.append(s)
+        for pos, end, value in kept:
+            entries.append((pos, value, self._replaced[value][0]))
+
+        # 2) 其余规则（人名规则已在上面单独处理，跳过避免重复）
+        compiled = [(pat, rule) for pat, rule in compiled
+                    if rule.get('value_fn') != 'person']
+        if not compiled:
+            entries.sort(key=lambda e: e[0])
+            return [(v, p) for _, v, p in entries]
+
+        pos = 0
+        n = len(original_text)
+        while pos < n:
+            best = None
+            best_start = n + 1
+            for pat, rule in compiled:
+                m = pat.search(original_text, pos)
+                if not m:
+                    continue
+                if m.start() < best_start:
+                    best_start = m.start()
+                    best = (m, rule)
+                    if m.start() == pos:
+                        break  # 已到最左位置，规则顺序中第一个命中即胜出
+            if best is None:
+                break
+            m, rule = best
+            value = self._extract_scan_value(m, rule)
+            if value and value in self._replaced:
+                entries.append((m.start(), value, self._replaced[value][0]))
+            pos = max(pos + 1, m.end() if m.end() > m.start() else m.start() + 1)
+        entries.sort(key=lambda e: e[0])
+        return [(v, p) for _, v, p in entries]
+
+    def _extract_scan_value(self, m, rule: dict) -> str:
+        """从扫描命中中提取与 mask 记录一致的原始值。"""
+        fn = rule.get('value_fn')
+        if fn == 'person':
+            name = m.group(2)
+            if name in self._replaced:
+                return name
+            # 与 mask 的"尾部动词回退"保持一致（"吴琳陆续"→"吴琳"）
+            for cut in (1, 2):
+                if len(name) > cut and name[:-cut] in self._replaced:
+                    return name[:-cut]
+            return name
+        if fn == 'company':
+            return _trim_company_span(m.group(0))[0]
+        if fn == 'address':
+            v2 = m.group(2) if m.lastindex and m.lastindex >= 2 else None
+            v1 = m.group(1) if m.lastindex and m.lastindex >= 1 else None
+            if v2 is not None:
+                return v2
+            if v1 is not None:
+                return v1
+            return m.group(0)
+        if fn == 'birthdate':
+            return m.group(2) if m.group(2) is not None else m.group(3)
+        vg = rule.get('value_group')
+        if vg is not None:
+            return m.group(vg)
+        return m.group(0)
 
     def _apply_ner_entities(self, text: str, ner_backend) -> str:
         """用本地 NER 识别规则层未覆盖的实体并替换为语义占位符。"""
@@ -619,6 +911,7 @@ class Desensitizer:
             placeholder, typ = self._resolve_ner_entity(e, EntityType, record=False)
             if not placeholder:
                 continue
+            self._record_event(e.start, e.text, placeholder)
             text = text[:e.start] + placeholder + text[e.end:]
         return text
 
@@ -703,8 +996,13 @@ class Desensitizer:
         self._order = {}
         self._counter = {}
         self._stats = {}
+        self._events = []   # (替换时当前文本位置, 原始值, 占位符) 按替换顺序
         self._court_counter = 0
         self._party_counter = 0
+
+    def _record_event(self, pos: int, original: str, replacement: str) -> None:
+        """记录一次实际替换及其在"当时文本"中的位置，用于生成精确还原序列。"""
+        self._events.append((pos, original, replacement))
 
     def _preprocess(self, text: str) -> str:
         """
@@ -733,9 +1031,15 @@ class Desensitizer:
         律师执业证号：带"执业证"上下文（含"执业许可证号"）的 17-18 位字母数字，
         必须优先于身份证号/信用代码匹配，避免律所执业许可证被误判为信用代码。
         """
+        shift = [0]
+
         def bar_replacer(m):
             self._record(m.group(2), '[律师执业证号]', '律师执业证号')
-            return m.group(1) + '[律师执业证号]'
+            out = m.group(1) + '[律师执业证号]'
+            self._record_event(m.start() + shift[0] + len(m.group(1)),
+                               m.group(2), '[律师执业证号]')
+            shift[0] += len(out) - len(m.group(0))
+            return out
         return _BAR_PATTERN.sub(bar_replacer, text)
 
     def _record(self, original: str, replacement: str, typ: str) -> None:
@@ -804,6 +1108,8 @@ class Desensitizer:
 
         validate: 可选校验函数，返回 False 时不替换（保留原文本）。
         """
+        shift = [0]   # pass 内已发生的长度位移（re.sub 的 m.start() 为原文坐标）
+
         def replacer(m):
             original = m.group(original_group) if original_group > 0 else m.group()
             if validate is not None and not validate(original):
@@ -812,8 +1118,13 @@ class Desensitizer:
                 # 同一原始值再次出现：沿用原占位符，计数照常累加
                 self._counts[original] = self._counts.get(original, 0) + 1
                 self._stats[typ] = self._stats.get(typ, 0) + 1
-                return self._replaced[original][0]
+                out = self._replaced[original][0]
+                self._record_event(m.start() + shift[0], original, out)
+                shift[0] += len(out) - len(m.group(0))
+                return out
             self._record(original, replacement, typ)
+            self._record_event(m.start() + shift[0], original, replacement)
+            shift[0] += len(replacement) - len(m.group(0))
             return replacement
 
         return re.sub(pattern, replacer, text)
@@ -825,9 +1136,15 @@ class Desensitizer:
         GB 11643 校验码合法或内嵌有效出生日期，其余由银行卡规则处理，
         避免 18 位银行账号/订单号被误判为身份证号。
         """
+        shift = [0]
+
         def context_replacer(m):
             self._record(m.group(2), '[身份证号]', '身份证号')
-            return m.group(1) + '[身份证号]'
+            out = m.group(1) + '[身份证号]'
+            self._record_event(m.start() + shift[0] + len(m.group(1)),
+                               m.group(2), '[身份证号]')
+            shift[0] += len(out) - len(m.group(0))
+            return out
         text = _ID_CONTEXT.sub(context_replacer, text)
         return self._safe_replace(
             text,
@@ -875,32 +1192,48 @@ class Desensitizer:
     def _mask_wechat(self, text: str) -> str:
         """微信号：匹配有前缀 或 独立出现的微信号模式"""
         # 微信号: xxx / 微信号xxx / 微信账号xxx（前缀，冒号可省略）
+        shift = [0]
         text = re.sub(
             r'((?:微信号|微信账号|微信)\s*[：:]?\s*)([a-zA-Z][a-zA-Z0-9_]{4,19})',
-            lambda m: self._safe_replace_wechat(m.group(2), m.group(1)),
+            lambda m: self._safe_replace_wechat(m.group(2), m.group(1),
+                                                m.start() + shift[0]
+                                                + len(m.group(1)), shift),
             text
         )
         # 独立微信号：字母开头 + 字母数字下划线，6-20位
         # 使用 [a-zA-Z0-9_] 而非 \w 避免匹配中文
         # 排除邮箱（含@）、URL、纯数字；前面紧贴中文时不算（避免误吞"粤B88888"这类车牌）
+        shift2 = [0]
         text = re.sub(
             r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',
-            lambda m: self._safe_replace_wechat(m.group(1)),
+            lambda m: self._safe_replace_wechat(m.group(1), '',
+                                                m.start() + shift2[0], shift2),
             text
         )
         return text
 
-    def _safe_replace_wechat(self, original: str, prefix: str = '') -> str:
+    def _safe_replace_wechat(self, original: str, prefix: str = '',
+                             pos: int = 0, shift: list = None) -> str:
         """记录微信号替换"""
         self._record(original, '[微信号]', '微信号')
+        self._record_event(pos, original, '[微信号]')
+        if shift is not None:
+            out = f'{prefix}[微信号]' if prefix else '[微信号]'
+            shift[0] += len(out) - len(prefix) - len(original)
         # 前缀已含原文分隔符（"微信号："或"微信号"），原样保留，还原时无损
         return f'{prefix}[微信号]' if prefix else '[微信号]'
 
     def _mask_qq(self, text: str) -> str:
         """QQ号：保留前缀并记录映射"""
+        shift = [0]
+
         def qq_replacer(m):
             self._record(m.group(2), '[QQ号]', 'QQ号')
-            return m.group(1) + '[QQ号]'
+            out = m.group(1) + '[QQ号]'
+            self._record_event(m.start() + shift[0] + len(m.group(1)),
+                               m.group(2), '[QQ号]')
+            shift[0] += len(out) - len(m.group(0))
+            return out
         return _QQ_PATTERN.sub(qq_replacer, text)
 
     def _mask_bank_card(self, text: str) -> str:
@@ -914,19 +1247,31 @@ class Desensitizer:
             '银行账号'
         )
         # 带"账号/卡号"上下文的 12-24 位数字：标签权威，无条件替换
+        self._account_shift = [0]
         return _ACCOUNT_CONTEXT.sub(self._account_replacer, text)
 
     def _account_replacer(self, m):
+        shift = getattr(self, '_account_shift', None) or [0]
         self._record(m.group(2), '[银行账号]', '银行账号')
-        return m.group(1) + '[银行账号]'
+        out = m.group(1) + '[银行账号]'
+        self._record_event(m.start() + shift[0] + len(m.group(1)),
+                           m.group(2), '[银行账号]')
+        shift[0] += len(out) - len(m.group(0))
+        return out
 
     def _mask_other_cert(self, text: str) -> str:
         """其他证件号码（护照、港澳通行证、驾驶证等）：带上下文标签识别。"""
         for pattern, label in _OTHER_CERT_PATTERNS:
+            shift = [0]
+
             def make_replacer(lbl):
                 def replacer(m):
                     self._record(m.group(2), f'[{lbl}]', lbl)
-                    return m.group(1) + f'[{lbl}]'
+                    out = m.group(1) + f'[{lbl}]'
+                    self._record_event(m.start() + shift[0] + len(m.group(1)),
+                                       m.group(2), f'[{lbl}]')
+                    shift[0] += len(out) - len(m.group(0))
+                    return out
                 return replacer
             text = re.sub(pattern, make_replacer(label), text)
         return text
@@ -942,9 +1287,15 @@ class Desensitizer:
 
     def _mask_credit_code(self, text: str) -> str:
         """统一社会信用代码：带"信用代码"上下文时按标签识别（18位字母数字）。"""
+        shift = [0]
+
         def context_replacer(m):
             self._record(m.group(2), '[统一社会信用代码]', '统一社会信用代码')
-            return m.group(1) + '[统一社会信用代码]'
+            out = m.group(1) + '[统一社会信用代码]'
+            self._record_event(m.start() + shift[0] + len(m.group(1)),
+                               m.group(2), '[统一社会信用代码]')
+            shift[0] += len(out) - len(m.group(0))
+            return out
         return _CREDIT_CONTEXT.sub(context_replacer, text)
 
     def _mask_credit_code_bare(self, text: str) -> str:
@@ -989,14 +1340,23 @@ class Desensitizer:
 
     def _mask_birthdate(self, text: str) -> str:
         """出生日期（默认模式）：仅脱敏带"出生/生日/生于"等上下文的日期"""
+        shift = [0]
+
         def context_replacer(m):
             if m.group(2) is not None:
                 self._record(m.group(2), '[出生日期]', '出生日期')
-                return m.group(1) + '[出生日期]'
+                out = m.group(1) + '[出生日期]'
+                self._record_event(m.start() + shift[0] + len(m.group(1)),
+                                   m.group(2), '[出生日期]')
+                shift[0] += len(out) - len(m.group(0))
+                return out
             # "1985年8月15日出生" 这种日期在前、上下文在后的写法
             self._record(m.group(3), '[出生日期]', '出生日期')
+            out = '[出生日期]' + m.group(0)[len(m.group(3)):]
+            self._record_event(m.start() + shift[0], m.group(3), '[出生日期]')
+            shift[0] += len(out) - len(m.group(0))
             # 保留"出生/生"等上下文词，还原时无损
-            return '[出生日期]' + m.group(0)[len(m.group(3)):]
+            return out
         return _BIRTHDATE_CONTEXT.sub(context_replacer, text)
 
     # --------------------------------------------------------
@@ -1009,43 +1369,101 @@ class Desensitizer:
         - 角色词后 2-4 字姓名（含4字复姓）
         - 同一人物全文档用统一占位符 [当事人甲（原告）]
         """
-        role_patterns = [
-            # 分隔符与前瞻只认空格，不认换行，避免"原告及其\n委托…"跨行吞词
-            r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,， ]*([\u4e00-\u9fa5]{2,4})(?=[，,。. （(的]|\u3001|$)',
-        ]
-        for pat in role_patterns:
-            def make_replacer(p):
-                def replacer(m):
-                    role = m.group(1)
-                    name = m.group(2)
-                    # 含虚词/连接词的"名字"（如"起诉之日""与被告"）不是姓名
-                    if any(ch in _ROLE_NAME_REJECT for ch in name):
-                        return m.group(0)
-                    # 常见动词/法律名词（如"被告承担""原告抚养"）不是姓名
-                    if name in _ROLE_NAME_VERBS:
-                        return m.group(0)
-                    # 通过EntityResolver进行归一化和角色绑定
-                    _, placeholder = self._resolver.resolve_person(name, role)
-                    # 记录映射
-                    canonical = self._resolver.normalize(name)
-                    self._record(canonical, placeholder, '人名')
-                    # 保留原文分隔符
-                    raw = m.group(0)
-                    after_role = raw[len(role):]
-                    delim = ''
-                    for ch in after_role:
-                        if ch in '：:，,　 ':
-                            delim += ch
-                        else:
-                            break
-                    if delim.strip():
-                        return f'{role}{delim}{placeholder}'
-                    else:
-                        # 原文无分隔符时不插入空格，保证还原保真
-                        return f'{role}{placeholder}'
-                return replacer
-            text = re.sub(pat, make_replacer(pat), text)
+        shift = [0]
+
+        def replacer(m):
+            role = m.group(1)
+            name = m.group(2)
+            name_start = m.end() - len(name)
+            tail = ''
+            if not self._is_plausible_role_name(name, text[name_start + len(name):]):
+                # 候选可能吞了尾部动词/虚词（"吴琳陆续""金进跃与"）：回退取更短的名字
+                ok = False
+                for cut in (1, 2):
+                    cand = name[:-cut]
+                    removed = name[len(cand):]
+                    if (len(cand) >= 2 and removed in _NAME_TAIL_WORDS
+                            and self._is_plausible_role_name(
+                                cand, text[name_start + len(cand):])):
+                        name = cand
+                        tail = removed
+                        ok = True
+                        break
+                if not ok:
+                    return m.group(0)
+            # 通过EntityResolver进行归一化和角色绑定
+            _, placeholder = self._resolver.resolve_person(name, role)
+            # 记录映射
+            canonical = self._resolver.normalize(name)
+            self._record(canonical, placeholder, '人名')
+            self._record_event(name_start + shift[0], canonical, placeholder)
+            # 保留原文分隔符
+            raw = m.group(0)
+            after_role = raw[len(role):]
+            delim = ''
+            for ch in after_role:
+                if ch in '：:，,　 ':
+                    delim += ch
+                else:
+                    break
+            if delim.strip():
+                out = f'{role}{delim}{placeholder}{tail}'
+            else:
+                # 原文无分隔符时不插入空格，保证还原保真
+                out = f'{role}{placeholder}{tail}'
+            shift[0] += len(out) - len(m.group(0))
+            return out
+
+        text = re.sub(_ROLE_PATTERN, replacer, text)
         return text
+
+    def _is_plausible_role_name(self, name: str, after: str) -> bool:
+        """角色词后候选是否像"姓名"（排除 提供担保/处签名/印章/私章 等词组）。"""
+        # 含虚词/连接词的"名字"（如"起诉之日""与被告"）不是姓名
+        if any(ch in _ROLE_NAME_REJECT for ch in name):
+            return False
+        # 常见动词/法律名词（如"被告承担""原告抚养"）
+        if name in _ROLE_NAME_VERBS or name in _ROLE_NAME_NOUNS:
+            return False
+        if name in _BARE_NAME_BLACKLIST:
+            return False
+        # 前/后缀常见词组（"提供担保""处签名""印章"）
+        if name.endswith(tuple(_ROLE_NAME_BAD_SUFFIXES)):
+            return False
+        if name.startswith(tuple(_ROLE_NAME_BAD_PREFIXES)):
+            return False
+        # 后面紧跟公司/机构后缀 → 是机构名的一部分（"案外人杭州方汇建筑工程有限公司"）
+        after8 = after[:8]
+        joined = name + after8[:4]
+        if any(s in joined for s in (
+                '有限公司', '公司', '集团', '事务所', '服务部', '商行',
+                '经营部', '商店', '银行', '法院', '学校', '医院')):
+            return False
+        # 姓名形态校验（jieba 可用时）：姓氏开头，或整词分词的非姓氏名
+        seg = _get_segmenter()
+        if seg is not None:
+            surname_ok = (name[0] in _SURNAMES
+                          or (len(name) >= 2 and name[:2] in _COMPOUND_SURNAMES))
+            if not surname_ok:
+                toks = seg(name)
+                if len(toks) != 1 or name[-1] in '章签印书状讼费款证照单表称':
+                    return False
+            elif len(name) > 2:
+                toks = seg(name)
+                ok = (len(toks) == 1
+                      or (len(toks) == 2 and ''.join(toks) == name
+                          and toks[1] not in _NAME_TAIL_WORDS))
+                if not ok and len(toks) == 2:
+                    # 复姓+名：欧阳+雪梅；单姓+双字名：张+先政
+                    if (name[:2] in _COMPOUND_SURNAMES and toks[0] == name[:2]):
+                        ok = True
+                    elif (toks[0] == name[0] and name[0] in _SURNAMES
+                          and len(toks[1]) == len(name) - 1
+                          and toks[1] not in _NAME_TAIL_WORDS):
+                        ok = True
+                if not ok:
+                    return False
+        return True
 
     def _find_name_candidates(self, text: str) -> set:
         """用姓氏 + 频率 + 上下文启发式发现"无角色词"的人名候选。
@@ -1214,17 +1632,13 @@ class Desensitizer:
             kept.append(s)
         kept.sort(key=lambda s: s[0])
 
-        # 正序记录（保证映射 order 按原文顺序）
-        for pos, end, name in kept:
-            if text[pos:end] != name:
-                continue
-            _, placeholder = self._resolver.resolve_person(name, '')
-            self._record(name, placeholder, '人名')
         # 逆序替换
         for pos, end, name in reversed(kept):
             if text[pos:end] != name:
                 continue
             _, placeholder = self._resolver.resolve_person(name, '')
+            self._record(name, placeholder, '人名')
+            self._record_event(pos, name, placeholder)
             text = text[:pos] + placeholder + text[end:]
         return text
 
@@ -1233,45 +1647,45 @@ class Desensitizer:
         公司/机构名称识别 + 实体归一化：
         - 全称/简称统一链接到同一实体
         - 不同公司按角色生成不同占位符 [合同甲方] [合同乙方] [第三方公司]
+        - 容忍 OCR 行内空格（"华 临公司"）；修剪误吞的上下文词
+          （"原告金进跃与被告浙江华临建设集团有限公司"→ 只替换公司名本身）
         """
-        original = text  # 保留原文用于上下文角色检测
-        
-        def co_replacer(m):
-            name = m.group(1)
-            # 检查上下文中的角色词
-            role = ''
-            start = m.start()
-            context_before = original[max(0, start-25):start]
-            # 找最近的角色关键词（不是第一个）
-            role = ''
-            best_pos = -1
-            for kw, r in self._resolver.ROLE_KEYWORDS.items():
-                pos = context_before.rfind(kw)
-                if pos > best_pos:
-                    best_pos = pos
-                    role = r
-            _, placeholder = self._resolver.resolve_company(name, role)
-            self._record(name, placeholder, '公司名')
-            return placeholder
+        for pat in (_COMPANY_FULL_PATTERN, _COMPANY_OFFICE_PATTERN,
+                    _COMPANY_SHORT_PATTERN):
+            original = text  # 用于上下文角色检测
+            shift = [0]
 
-        text = re.sub(
-            r'([\u4e00-\u9fa5（）\(\)]{4,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业))',
-            co_replacer,
-            text
-        )
-        text = re.sub(
-            r'([\u4e00-\u9fa5]{4,20}(?:律师事务所|会计师事务所|资产评估事务所))',
-            co_replacer,
-            text
-        )
-        text = re.sub(
-            # 前不能紧贴中文/字母（避免吞掉更长公司名中的片段）；
-            # 后不设约束（"华信置业公司应于..."这类句法必须命中，宁替勿漏）
-            r'(?<![\u4e00-\u9fa5A-Za-z0-9])([\u4e00-\u9fa5]{3,6})公司',
-            co_replacer,
-            text
-        )
-        return text
+            def co_replacer(m):
+                span = m.group(0)
+                # 匹配落在 [占位符] 内部时跳过（"[" 后未闭合），避免吞掉占位符内容
+                if (text.rfind('[', 0, m.start())
+                        > text.rfind(']', 0, m.start())):
+                    return span
+                name, prefix = _trim_company_span(span)
+                if not name:
+                    return span
+                # 检查上下文中的角色词
+                role = ''
+                start = m.start()
+                # 上下文 = [匹配串之前的文本] + [被修剪掉的前缀]，按阅读顺序拼接，
+                # rfind 取最近（最右）的角色词（如"原告…与被告公司"应绑定"被告"）
+                context_before = original[max(0, start - 25):start] + prefix
+                # 找最近的角色关键词（不是第一个）
+                best_pos = -1
+                for kw, r in self._resolver.ROLE_KEYWORDS.items():
+                    pos = context_before.rfind(kw)
+                    if pos > best_pos:
+                        best_pos = pos
+                        role = r
+                _, placeholder = self._resolver.resolve_company(name, role)
+                self._record(name, placeholder, '公司名')
+                out = prefix + placeholder
+                self._record_event(m.start() + shift[0] + len(prefix),
+                                   name, placeholder)
+                shift[0] += len(out) - len(m.group(0))
+                return out
+
+            text = re.sub(pat, co_replacer, text)
         return text
 
     def _mask_address(self, text: str) -> str:
@@ -1279,42 +1693,54 @@ class Desensitizer:
         地址信息，匹配地理层级结构：
         住所地/地址 + 内容，或 省/市/区/路/号 层级结构
         """
+        shift = [0]
+
+        def addr_replacer(m, addr, prefix):
+            out = self._record_addr(addr, prefix,
+                                    pos=m.start() + shift[0])
+            shift[0] += len(out) - len(m.group(0))
+            return out
+
         # 住所地/地址/位于 + 内容
         text = re.sub(
             r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(）\) ]{5,40}(?:号|室|层))',
             # 前缀用相对偏移（m.start(2)-m.start(0)），避免地址前半截残留在文本中
-            lambda m: self._record_addr(m.group(2), m.group(0)[:m.start(2) - m.start(0)]),
+            lambda m: addr_replacer(
+                m, m.group(2),
+                m.group(0)[:m.start(2) - m.start(0)]),
             text
         )
         # 独立的地理地址（省开头 + 详细到号/室）
         text = re.sub(
             r'([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层))',
-            lambda m: self._record_addr(m.group(1)),
+            lambda m: addr_replacer(m, m.group(1), ''),
             text
         )
         # 独立城市级地址（市/区开头 + 详细到路/街/号）
         text = re.sub(
             r'((?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?)',
-            lambda m: self._record_addr(m.group(1)),
+            lambda m: addr_replacer(m, m.group(1), ''),
             text
         )
         # 无省市区层级的地址：小区/花园/公寓/大厦/苑/里/村/镇/区 + 栋/单元/室/楼/号
         text = re.sub(
             r'([\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\-]{1,12}(?:号|栋|幢|单元|室|楼|座|层))',
-            lambda m: self._record_addr(m.group(1)),
+            lambda m: addr_replacer(m, m.group(1), ''),
             text
         )
         # 路/街/大道/巷 + 门牌号（无需"区"前缀，如"莫干山路100号"）
         text = re.sub(
             r'([\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\-]{1,12}(?:号|弄|栋|幢|单元|室|楼|座))',
-            lambda m: self._record_addr(m.group(1)),
+            lambda m: addr_replacer(m, m.group(1), ''),
             text
         )
         return text
 
-    def _record_addr(self, addr: str, prefix: str = '') -> str:
+    def _record_addr(self, addr: str, prefix: str = '', pos: int = 0) -> str:
         """记录地址替换"""
-        self._record(addr.replace(' ', ''), '[地址]', '地址')
+        # 记录原文（含行内空格），保证 restore 逐字节还原
+        self._record(addr, '[地址]', '地址')
+        self._record_event(pos + len(prefix), addr, '[地址]')
         return f'{prefix}[地址]' if prefix else '[地址]'
 
     def _mask_amount(self, text: str) -> str:
@@ -1325,17 +1751,21 @@ class Desensitizer:
         排除：普通数字、日期、股票数量（带"股"）、百分比（带%）
         """
         # 中文大写金额：零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整
-        # 必须含至少一个"大写数字/拾"，避免把普通数字后的"万元"单独吃掉
+        # 必须含"单位/量级/元"或连续大写数字，避免把"陆"（陆续）等单字误当金额
         text = self._safe_replace(
             text,
-            r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?[零壹贰叁肆伍陆柒捌玖拾][零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整亿]*(?:元|圆)?(?:整)?',
+            r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?'
+            r'[零壹贰叁肆伍陆柒捌玖拾](?:[零壹贰叁肆伍陆柒捌玖拾]|佰|仟|万|亿|元|圆|整)'
+            r'[零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整亿]*(?:元|圆)?(?:整)?',
             '[金额]',
             '金额'
         )
         # 带"元/美元/欧元"等单位的完整金额
         text = self._safe_replace(
             text,
-            r'[$¥]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?(?:[万千亿])?(?:元|美元|欧元|英镑|港币)(?![.\d万千亿])',
+            r'[$¥]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?' + _INLINE_SP +
+            r'(?:[万千亿])?' + _INLINE_SP +
+            r'(?:元|美元|欧元|英镑|港币)' + _INLINE_SP + r'整?(?![.\d万千亿])',
             '[金额]',
             '金额'
         )
@@ -1344,6 +1774,14 @@ class Desensitizer:
         text = self._safe_replace(
             text,
             r'(?<!\d)(\d+(?:\.\d+)?)[万千亿](?![.\d万千亿])(?!像素|股|人|户|平方米|平米|瓦|公里|粉丝|预算|年薪|月薪|彩礼)',
+            '[金额]',
+            '金额'
+        )
+        # 大额无单位数字（如结算算式中的 392485911.675）：7 位以上按金额处理
+        # 身份证/银行卡/信用代码/案号/手机号已在更早的规则中被替换
+        text = self._safe_replace(
+            text,
+            r'(?<!\d)\d{7,}(?:\.\d{1,3})?(?!\d)',
             '[金额]',
             '金额'
         )
@@ -1373,79 +1811,95 @@ class Desensitizer:
         rules = [
             {'type': '律师执业证号',
              'pattern': r'((?:执业证号|执业许可证号|律师执业证号|律师执业证|执业证)\s*[：:]?\s*)([0-9A-Z]{17,18})',
-             'handler': self._mask_bar_number, 'group': 2},
+             'handler': self._mask_bar_number, 'group': 2, 'value_group': 2},
             {'type': '身份证号',
              'pattern': r'((?:身份证号|身份证号码|身份证|证件号码|证件号)\s*[：:]?\s*)(\d{17}[\dXx])',
-             'handler': self._mask_id_card, 'group': 2, 'validate': id_confidence},
+             'handler': self._mask_id_card, 'group': 2, 'validate': id_confidence,
+             'value_group': 2},
             {'type': '身份证号',
              'pattern': r'(?<!\d)(\d{17}[\dXx])(?!\d)',
-             'handler': self._mask_id_card, 'group': 1, 'validate': id_confidence},
+             'handler': self._mask_id_card, 'group': 1, 'validate': id_confidence,
+             'value_group': 1},
             {'type': '邮箱',
              'pattern': r'[A-Za-z0-9.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+',
              'handler': self._mask_email},
             {'type': '手机号',
              'pattern': r'(?<!\d)(1[3-9]\d{9})(?!\d)',
-             'handler': self._mask_phone, 'group': 1},
+             'handler': self._mask_phone, 'group': 1, 'value_group': 1},
             {'type': '固定电话',
              'pattern': r'(?<!\d)(0\d{2,3}[-\s]?\d{7,8})(?!\d)',
-             'handler': self._mask_landline, 'group': 1},
+             'handler': self._mask_landline, 'group': 1, 'value_group': 1},
             {'type': '服务电话',
              'pattern': r'(?<!\d)([48]00[-\s]?\d{3}[-\s]?\d{4})(?!\d)',
-             'handler': self._mask_landline, 'group': 1},
+             'handler': self._mask_landline, 'group': 1, 'value_group': 1},
             {'type': '微信号',
              'pattern': r'((?:微信号|微信账号|微信)\s*[：:]?\s*)([a-zA-Z][a-zA-Z0-9_]{4,19})',
-             'handler': self._mask_wechat, 'group': 2},
+             'handler': self._mask_wechat, 'group': 2, 'value_group': 2},
             {'type': '微信号',
              'pattern': r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',
-             'handler': self._mask_wechat, 'group': 1},
+             'handler': self._mask_wechat, 'group': 1, 'value_group': 1},
             {'type': 'QQ号',
              'pattern': r'((?:QQ|Qq|qq)\s*[：:]?\s*)(\d{5,12})(?!\d)',
-             'handler': self._mask_qq, 'group': 2},
+             'handler': self._mask_qq, 'group': 2, 'value_group': 2},
             {'type': '组织机构代码',
              'pattern': r'(?<![0-9A-Z-])([0-9A-Z]{8}-[0-9A-Z])(?![0-9A-Z-])',
-             'handler': self._mask_org_code, 'group': 1},
+             'handler': self._mask_org_code, 'group': 1, 'value_group': 1},
             {'type': '统一社会信用代码',
              'pattern': r'((?:统一社会信用代码|社会信用代码|信用代码)\s*[：:]?\s*)([0-9A-Z]{18})',
-             'handler': self._mask_credit_code, 'group': 2, 'validate': credit_confidence},
+             'handler': self._mask_credit_code, 'group': 2, 'validate': credit_confidence,
+             'value_group': 2},
             {'type': '银行账号',
              'pattern': r'((?:银行账号|开户账号|账户号码|银行卡号|收款账号|付款账号|卡号)\s*[：:]?\s*)([0-9]{12,24})',
-             'handler': self._mask_bank_card, 'group': 2, 'validate': bank_confidence},
+             'handler': self._mask_bank_card, 'group': 2, 'validate': bank_confidence,
+             'value_group': 2},
             {'type': '银行账号',
              'pattern': r'(?<!\d)(\d{14,20})(?!\d)',
-             'handler': self._mask_bank_card, 'group': 1, 'validate': bank_confidence},
+             'handler': self._mask_bank_card, 'group': 1, 'validate': bank_confidence,
+             'value_group': 1},
             {'type': '统一社会信用代码',
              'pattern': r'(?<![0-9A-Z])(9[0-9A-Z]{17})(?![0-9A-Z])',
-             'handler': self._mask_credit_code_bare, 'group': 1, 'validate': credit_confidence},
+             'handler': self._mask_credit_code_bare, 'group': 1, 'validate': credit_confidence,
+             'value_group': 1},
             {'type': '案号',
              'pattern': r'[（(]?\d{4}[）)]?(?![年月日])[\u4e00-\u9fa5]{1,10}\d{0,6}[\u4e00-\u9fa5]{0,6}\d{1,6}号',
              'handler': self._mask_case_number},
             {'type': '车牌号',
              'pattern': r'(?<![A-Za-z0-9])[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}(?![\dA-Za-z])',
-             'handler': self._mask_license_plate},
+             'handler': self._mask_license_plate, 'value_group': 0},
             {'type': '出生日期',
              'pattern': r'((?:出生日期|出生年月|生日|出生于|生于)\s*[：:]?\s*)(\d{4}年\d{1,2}月\d{1,2}日)|(\d{4}年\d{1,2}月\d{1,2}日)\s*(?:出生|生)',
-             'handler': self._mask_birthdate},
+             'handler': self._mask_birthdate, 'value_fn': 'birthdate'},
             {'type': '人名',
-             'pattern': r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|委托诉讼代理人|委托代理人|法定代表人|法定代理人|负责人|联系人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)[：:，,， ]*[\u4e00-\u9fa5]{2,4}(?=[，,。. （(的]|\u3001|$)',
-             'handler': self._mask_person_name},
+             'pattern': _ROLE_PATTERN,
+             'handler': self._mask_person_name, 'value_fn': 'person'},
             {'type': '公司名',
-             'pattern': r'[\u4e00-\u9fa5（）\(\)]{4,30}(?:有限公司|股份有限公司|集团公司|有限责任公司|合伙企业)|[\u4e00-\u9fa5]{4,20}(?:律师事务所|会计师事务所|资产评估事务所)|(?<![\u4e00-\u9fa5A-Za-z0-9])[\u4e00-\u9fa5]{3,6}公司',
-             'handler': self._mask_company_name},
+             'pattern': _COMPANY_FULL_PATTERN.pattern + '|'
+                        + _COMPANY_OFFICE_PATTERN.pattern + '|'
+                        + _COMPANY_SHORT_PATTERN.pattern,
+             'handler': self._mask_company_name, 'value_fn': 'company'},
             {'type': '地址',
              'pattern': r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?|[\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\-]{1,12}(?:号|栋|幢|单元|室|楼|座|层)|[\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\-]{1,12}(?:号|弄|栋|幢|单元|室|楼|座)',
-             'handler': self._mask_address},
+             'handler': self._mask_address, 'value_fn': 'address'},
             {'type': '金额（中文大写）',
-             'pattern': r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?[零壹贰叁肆伍陆柒捌玖拾][零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整亿]*(?:元|圆)?(?:整)?',
+             'pattern': r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?'
+                        r'[零壹贰叁肆伍陆柒捌玖拾](?:[零壹贰叁肆伍陆柒捌玖拾]|佰|仟|万|亿|元|圆|整)'
+                        r'[零壹贰叁肆伍陆柒捌玖拾佰仟万亿元整亿]*(?:元|圆)?(?:整)?',
              'handler': self._mask_amount},
             {'type': '金额',
-             'pattern': r'[$¥]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?(?:[万千亿])?(?:元|美元|欧元|英镑|港币)(?![.\d万千亿])',
+             'pattern': r'[$¥]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?'
+                        + _INLINE_SP + r'(?:[万千亿])?' + _INLINE_SP
+                        + r'(?:元|美元|欧元|英镑|港币)' + _INLINE_SP
+                        + r'整?(?![.\d万千亿])',
              'handler': self._mask_amount},
             {'type': '金额（口语化）',
              'pattern': r'(?<!\d)(\d+(?:\.\d+)?)[万千亿](?![.\d万千亿])(?!像素|股|人|户|平方米|平米|瓦|公里|粉丝|预算|年薪|月薪|彩礼)',
              'handler': self._mask_amount},
+            {'type': '金额',
+             'pattern': r'(?<!\d)\d{7,}(?:\.\d{1,3})?(?!\d)',
+             'handler': self._mask_amount},
             {'type': '其他证件',
-             'pattern': r'(?:护照|护照号|港澳通行证|往来港澳通行证|港澳居民来往内地通行证|台湾居民来往大陆通行证|台胞证|驾驶证|驾驶证号|驾驶证号码|军官证|士兵证|警官证|工作证|营业执照|营业执照号|营业执照号码|税务登记证号|税务登记号)\s*[：:]?\s*[0-9A-Za-z]{4,20}',
-             'handler': self._mask_other_cert},
+             'pattern': r'((?:护照|护照号|港澳通行证|往来港澳通行证|港澳居民来往内地通行证|台湾居民来往大陆通行证|台胞证|驾驶证|驾驶证号|驾驶证号码|军官证|士兵证|警官证|工作证|营业执照|营业执照号|营业执照号码|税务登记证号|税务登记号)\s*[：:]?\s*)([0-9A-Za-z]{4,20})',
+             'handler': self._mask_other_cert, 'value_group': 2},
         ]
         if self._mask_all_dates:
             rules.append({'type': '日期',
@@ -1516,9 +1970,10 @@ class SecureDesensitizer(Desensitizer):
 
         return result
 
-    def _safe_replace_wechat(self, original: str, prefix: str = '') -> str:
+    def _safe_replace_wechat(self, original: str, prefix: str = '',
+                             pos: int = 0) -> str:
         """记录微信号替换（安全增强版）"""
-        result = super()._safe_replace_wechat(original, prefix)
+        result = super()._safe_replace_wechat(original, prefix, pos)
         if self._secure_mode:
             try:
                 original = ''
@@ -1526,9 +1981,9 @@ class SecureDesensitizer(Desensitizer):
                 pass
         return result
 
-    def _record_addr(self, addr: str, prefix: str = '') -> str:
+    def _record_addr(self, addr: str, prefix: str = '', pos: int = 0) -> str:
         """记录地址替换（安全增强版）"""
-        result = super()._record_addr(addr, prefix)
+        result = super()._record_addr(addr, prefix, pos)
         if self._secure_mode:
             try:
                 addr = ''
@@ -1948,19 +2403,21 @@ def parse_mapping_text(content: str) -> List[Mapping]:
         line = line.strip()
         if not line.startswith('|'):
             continue
-        cells = [c.strip() for c in line.strip('|').split('|')]
+        # 保留单元格原文（不 strip），带首尾空格的原始值才能逐字节还原
+        cells = line.strip('|').split('|')
         if len(cells) < 3:
             continue
-        if cells[0] in ('序号', '') or set(cells[0]) == {'-'}:
+        if cells[0].strip() in ('序号', '') or set(cells[0].strip()) == {'-'}:
             continue  # 表头或分隔线
         original = cells[1]
         replacement = cells[2]
         if not original or not replacement:
             continue
-        typ = cells[3] if len(cells) > 3 else ''
-        count = int(cells[4]) if len(cells) > 4 and cells[4].isdigit() else 1
+        typ = cells[3].strip() if len(cells) > 3 else ''
+        count = (int(cells[4].strip())
+                 if len(cells) > 4 and cells[4].strip().isdigit() else 1)
         # Markdown 序号列即首次出现顺序（第 i 行）
-        order = int(cells[0]) if cells[0].isdigit() else 0
+        order = int(cells[0]) if cells[0].strip().isdigit() else 0
         mappings.append(Mapping(original=original, replacement=replacement,
                                 type=typ, count=count, order=order))
     return mappings
@@ -1974,13 +2431,15 @@ def restore_text(masked_text: str, mappings: List[Mapping]) -> str:
        被短占位符（如 [当事人甲]）先替换掉一部分。
     2. 同一占位符多次出现（如多个 [金额]）时，按映射条目的
        "首次出现顺序"与原文出现顺序逐一配对，确保还原准确。
+    3. 映射条目自带 count（同一原始值连续出现 N 次）时，先按 count 展开
+       队列，保证"一行 = 一次出现"的配对语义。
     """
     # 按占位符分组，组内按首次出现顺序排队
     groups = {}
     for m in mappings:
         if not m.replacement or not m.original:
             continue
-        groups.setdefault(m.replacement, []).append(m)
+        groups.setdefault(m.replacement, []).extend([m] * max(1, m.count))
     for q in groups.values():
         q.sort(key=lambda m: m.order)
 

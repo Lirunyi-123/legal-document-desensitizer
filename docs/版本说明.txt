@@ -232,3 +232,12 @@ v2.8 — 三份训练语料实战修复（还原错位根因 / 姓名粘连吞�
 
 ### 7. 回归保障
 - 单测 65 → 74；红队语料 65 → 77（新增负样本），全部通过、误报 0。
+
+---
+
+# v2.8.1 推送方式
+
+## 本机推送到 GitHub 的标准方式（网络受限环境）
+- `git push` 直连 github.com:443 常被阻断；改用 `git-push-api.py` 通过 GitHub REST API 推送（curl 传输，api.github.com 可达）。
+- 用法：本地正常 `git commit` 后执行 `python3 git-push-api.py --sync-local`。
+- 特性：逐个重建本地领先提交；blob SHA 逐字节核对；`--sync-local` 用"消息换行 × 时区偏移"组合把远程提交对象还原到本地，本地 main 与远程 SHA 完全一致。

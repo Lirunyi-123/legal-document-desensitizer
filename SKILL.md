@@ -14,6 +14,27 @@ allowed-tools: read_file, write_file, grep, ls, glob
 - **LLM层**：AI识别规则覆盖不到的人名、公司名、地址、敏感案情等非结构化信息
 - **替换策略**：语义替换（张三 → [当事人甲]），保留语义关系，律师可读
 
+## 推送到 GitHub（本机网络受限时的标准方式）
+
+本机 `git push` 直连 github.com:443 常被网络阻断，**统一改用 GitHub REST API
+推送**（api.github.com 可通过 curl 访问）：
+
+```bash
+# 1. 本地正常提交
+git add -A && git commit -m "feat: xxx"
+
+# 2. 用 API 推送（推荐加 --sync-local：推送后本地 main 与远程 SHA 完全一致）
+python3 git-push-api.py --sync-local
+
+# 3. 预览不推送
+python3 git-push-api.py -n
+```
+
+`git-push-api.py` 会把本地领先的提交通过 GitHub Git API 逐个重建到远程，
+blob 与本地 `git hash-object` 逐字节核对，并在 `--sync-local` 时把远程提交
+对象重建回本地（消息换行 × 时区偏移组合还原 SHA），保证本地与远程历史完全一致。
+Token 自动读取 `~/.config/gh/hosts.yml`（gh CLI）。
+
 ## v2.5 实战修复（2026-08 真实判决书）
 
 根据对一份 42 页民事判决书（OCR 扫描版）的实战脱敏，修复/增强如下：

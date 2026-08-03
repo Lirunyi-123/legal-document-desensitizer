@@ -455,5 +455,84 @@ class TestBareNamesAndUnstructuredAddress(unittest.TestCase):
         self.assertEqual(restored, text)
 
 
+class TestV28RealCaseFixes(unittest.TestCase):
+    """2026-08 三份训练语料（舒城判决书/昌黎处罚决定书/南沙判决书）暴露问题的回归。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def _roundtrip(self, text):
+        r = self.d.mask(text)
+        restored = restore_text(r.text, parse_mapping_text(r.to_markdown()))
+        self.assertEqual(restored, text)
+
+    def test_17_digit_labeled_id_not_bank_card(self):
+        # 原文录入少一位的 17 位身份证（标签下）：整体替换，不残留 X、不当银行账号
+        r = self.d.mask('身份证号码3424251967112040X')
+        self.assertIn('[身份证号]', r.text)
+        self.assertNotIn('3424251967112040', r.text)
+        self.assertNotIn('[银行账号]', r.text)
+
+    def test_role_name_glue_tail_preserved(self):
+        # 角色词后粘连动词（诉/到/未有）不被吞，姓名本体替换
+        r = self.d.mask('原告彭静娴诉被告张旭到庭参加诉讼，被告张旭未有提供证据。')
+        self.assertIn('原告[当事人甲（原告）]诉被告[当事人乙（被告）]到庭', r.text)
+        self.assertIn('被告[当事人乙（被告）]未有提供证据', r.text)
+
+    def test_spaced_role_names_replaced(self):
+        # OCR 空格写法：审判员 倪 平 / 审 判 员 汪 瑜 / 书记员 杨梅红
+        r = self.d.mask('审判员 倪 平，审 判 员 汪 瑜，书记员 杨梅红')
+        self.assertIn('审判员 [法官]', r.text)
+        self.assertIn('审 判 员 [法官]', r.text)
+        self.assertIn('书记员 [书记员]', r.text)
+        self._roundtrip('审判员 倪 平，审 判 员 汪 瑜，书记员 杨梅红')
+
+    def test_context_words_not_names(self):
+        # 收到/无异议/签定/微信/该公司 均不是人名或公司名
+        r = self.d.mask('原告收到材料后表示无异议，原、被告签定合同。'
+                        '张政微信告知原告公司员工，系该公司员工，收到回执。')
+        for kept in ('收到', '无异议', '签定', '微信', '该公司'):
+            self.assertIn(kept, r.text)
+
+    def test_quantifier_not_role_name(self):
+        r = self.d.mask('请求法院依法支持原告全部诉讼请求。')
+        self.assertIn('全部诉讼请求', r.text)
+        self.assertNotIn('[当事人', r.text)
+
+    def test_merchant_and_fine_license(self):
+        r = self.d.mask('当事人：昌黎县嘉瑞丰煎肉店，罚没许可证号：07040008，'
+                        '住所（住址）：昌黎县四街铁塔东里片')
+        self.assertIn('[当事人单位]', r.text)
+        self.assertIn('[罚没许可证号]', r.text)
+        self.assertIn('[地址]', r.text)
+
+    def test_company_abbreviation_same_placeholder(self):
+        # 简称与全称统一占位符：宝冶公司/合生东宇公司 不应各占一个实体
+        r = self.d.mask('原告上海宝冶集团有限公司（以下简称宝冶公司）与被告'
+                        '广州合生东宇房地产有限公司（以下简称合生东宇公司）'
+                        '签订合同，合生东宇公司付款。')
+        self.assertNotIn('[公司_', r.text)
+        # 同一公司全称+简称只应占一个占位符
+        self.assertEqual(r.text.count('[合同甲方]'), 2)   # 全称+简称
+        self.assertEqual(r.text.count('[合同乙方]'), 3)   # 全称+简称×2
+        self._roundtrip('原告上海宝冶集团有限公司（以下简称宝冶公司）与被告'
+                        '广州合生东宇房地产有限公司（以下简称合生东宇公司）'
+                        '签订合同，合生东宇公司付款。')
+
+    def test_company_junk_span_trimmed(self):
+        r = self.d.mask('裁定查封、扣押或冻结被告广州合生东宇房地产有限公司名下财产。')
+        self.assertNotIn('[公司_', r.text)
+        self.assertIn('扣押或冻结', r.text)
+
+    def test_restore_mixed_dates_addresses_roundtrip(self):
+        # 出生日期+地址+身份证+人名+金额混排（还原错位回归）
+        text = ('原告：彭静娴，女，1979年10月20日出生，汉族，市民，'
+                '住安徽省合肥市蜀山区芙蓉路988号明珠湖畔15幢301室，'
+                '身份证号码342622197910207741。被告：张旭，男，1965年3月3日出生，'
+                '住安徽省舒城县干汊河镇新陶村新堰村民组28号，'
+                '身份证号码342425196503034015，应还借款35万元。')
+        self._roundtrip(text)
+
+
 if __name__ == '__main__':
     unittest.main()

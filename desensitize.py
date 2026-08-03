@@ -164,7 +164,10 @@ _BAR_PATTERN = re.compile(
 )
 _ID_CONTEXT = re.compile(
     r'((?:身份证号|身份证号码|身份证|证件号码|证件号)\s*[：:]?\s*)'
-    r'(\d{17}[\dXx])'
+    # 带标签的身份证：长度可能因原文字录/OCR 缺位而不足 18 位，
+    # 只要在"身份证号码"标签下且是 15~17 位数字（末位可带 X）即整体替换，
+    # 避免"3424251967112040X"这类 17 位残缺号码被兜底成银行账号并残留 X。
+    r'(\d{15,17}[\dXx]?)'
 )
 _CREDIT_CONTEXT = re.compile(
     r'((?:统一社会信用代码|社会信用代码|信用代码)\s*[：:]?\s*)'
@@ -187,6 +190,8 @@ _OTHER_CERT_PATTERNS = [
     (r'((?:军官证|士兵证|警官证|工作证)\s*[：:]?\s*)([0-9A-Za-z]{4,20})', '军官证'),
     (r'((?:营业执照|营业执照号|营业执照号码)\s*[：:]?\s*)([0-9A-Za-z]{8,20})', '营业执照号'),
     (r'((?:税务登记证号|税务登记号)\s*[：:]?\s*)([0-9A-Za-z]{8,20})', '税务登记号'),
+    # 罚没许可证号等 6~12 位许可编号：优先于金额规则，避免 8 位许可号被当金额
+    (r'((?:罚没许可证号|罚没许可证|罚没许可)\s*[：:]?\s*)([0-9]{6,12})', '罚没许可证号'),
 ]
 
 # 银行账号（带上下文，标签具有权威性，无条件替换）
@@ -209,6 +214,12 @@ _SURNAMES = set(
     '于蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江'
     '尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤欧成温乔包华柳苟庄齐'
     '鲁葛穆纪游屈古舒阮柯蓝盛司'
+    # v2.8 补充常见姓氏（倪平/聂某/金某/田某…），提升角色词后与裸人名召回
+    '倪聂牛洪焦金康赖郎冷凌娄骆梅蒙苗牟裴庞皮平祁强冉饶荣桑施石时束帅滕田童涂屠'
+    '危卫文闻翁邬巫伍奚席项萧辛邢颜晏燕易殷尤俞虞郁喻岳臧翟詹章仲诸祝卓宗祖左甄'
+    '谌敖边卞薄步仓岑柴常晁车池迟楚褚丛窦鄂樊房费伏傅盖甘耿关管桂国霍姬吉汲季冀'
+    '简江靳荆景鞠劳乐厉连廉蔺麦满米缪宁牛钮蒲濮戚曲瞿全芮沙佘双宿邰郜龚宦矫阚寇'
+    '慕逄亓秋沃习冼忻胥荀鄢阳仰尧伊衣阴雍游禹元恽昝展战仉支智竺衷'
 )
 
 # 常见复姓
@@ -302,7 +313,7 @@ _BARE_NAME_BLACKLIST = set(
     '徐徐 徐缓').split())
 
 # 强上下文：前接/后接这些字时，候选为名字的可能性显著提高
-_NAME_CONTEXT_BEFORE = set('向与和给对为被由把将叫欠借还付转签交送收出让起诉告称表示委托指定要求主张')
+_NAME_CONTEXT_BEFORE = set('向与和给对为被由把将叫欠借还付转签交送收出让起诉告称表示委托指定要求主张员')
 _NAME_CONTEXT_AFTER = set('欠借贷付还签称诉辩陈述出庭委托支付偿还提交主张认为要求表示答应拒绝承认起诉告到庭')
 _NUMERAL_CHARS = set('一二三四五六七八九十百千万零')
 _NAME_FUNCTION_WORDS = set(
@@ -321,7 +332,9 @@ _NAME_COMPANY_SUFFIXES = (
 # 地名/角色职务尾缀：裸人名候选以这些结尾时视为地名或职务片段（"余杭区""承包人"）
 _NAME_PLACE_SUFFIXES = (
     '区 市 县 镇 街道 社区 村 路 街 巷 弄 号 苑 里 坊 小区 组 队 部 人 所 处 段 期 '
-    '证 储 要 单 表 册 卡 函 复 件 批 文 书 卷 档 案'
+    '证 储 要 单 表 册 卡 函 复 件 批 文 书 卷 档 案 '
+    # v2.8：机构尾缀（"昌黎县市场监督管理局"的"管理局"不是人名）
+    '局 委 办 厅 署 站'
 ).split()
 
 # 角色词后捕获到的"名字"若含这些虚词/连接词，大概率是词组而非姓名
@@ -360,7 +373,9 @@ _ROLE_NAME_BAD_PREFIXES = (
     '到庭 协商 调解 起诉 上诉 答辩 质证 举证 执行 冻结 查封 扣押 拍卖 评估 变更 '
     '追加 撤诉 申诉 再审 复核 签订 订立 出具 送达 开庭 审理 判决 裁定 驳回 诉请 '
     '领取 收取 归还 返还 结算 对账 提出 作出 不予 认为 表示 拒绝 认可 同意 申请 '
-    '提供担保').split()
+    '提供担保 '
+    # v2.8：角色词后的量化/指代词（"原告全部诉讼请求"→ 不是姓名）
+    '全部 所有 一切 部分 其他 其余 有关 相关 上述 下列 各项 各类 各种').split()
 
 _ROLE_NAME_BAD_SUFFIXES = (
     '签名 签字 印章 私章 公章 合同章 项目章 技术章 起诉 上诉 答辩 陈述 辩称 主张 '
@@ -375,7 +390,18 @@ _NAME_TAIL_WORDS = set(
      '签订 订立 开庭 审理 判决 裁定 驳回 协商 调解 申请 提出 作出 认可 同意 沟通 '
      '参与 进行 担任 负责 提供 担保 履行 违约 侵权 保证 借贷 还款 付款 收款 交付 '
      '与 和 及 之 为 的 在 把 被 于 是 而 且 或 从 向 给 等 以 就 将 并 也 还 又 再 '
-     '都 曾 均 已 未 不 称 诉 告 据 表 示 认 为 要求 请求 主张').split())
+     '都 曾 均 已 未 不 称 诉 告 据 表 示 认 为 要求 请求 主张 '
+     # v2.8：单字动词/虚词尾部（"张旭到""张旭未有""彭静娴诉"等角色词后粘连）
+     '到 有 无 议 收 经 对 定 签 庭 出 请 求 主 张 认 为 担 负 责 提 供 履 行 保 证 '
+     '借 贷 还 款 付 款 收 款 交 付 原 被 申 复 核 答 应 拒 绝 承 认 起 上 辩 陈 质 '
+     '举 证 结 算 取 领 具 归 返 账 署 作 证 参 进 行 违 约 侵 权 申 请 提 出 作 出 适').split())
+
+# v2.8：角色词后姓名最后一个字是这些"动词/虚词"时，判定为吞了尾部粘连词
+# （"彭静娴诉""张旭到""张旭未有"），交由回退逻辑切短姓名并保留原文。
+_NAME_GLUE_CHARS = set(
+    '诉称告到庭付签还欠借贷与和及之的于是而且或从向给未有不曾均已无议收经对定出'
+    '请主张表认为担负责提供履行保证原被申复核答应拒绝承认起上诉辩陈质举证结算'
+    '取领具归返账署作参与进行违约侵权提交支付偿还委托求适')
 
 # 中文分词器（jieba，可选依赖）：用于过滤"江省杭""付逾期"这类
 # 嵌在长词里的人名假候选；缺失时裸人名发现降级为种子传播
@@ -403,21 +429,30 @@ def _get_segmenter():
 _PLACEHOLDER_RE = re.compile(r'\[[^\]]+\]')
 _INLINE_SP = '[ \t]*'   # 行内空格（不含 \n，避免跨段落吞词）
 
-_ROLE_PATTERN = (
-    r'(原告|被告|上诉人|被上诉人|第三人|申请执行人|被执行人|案外人|证人|担保人|'
-    r'出借人|借款人|收款人|付款人|发包人|承包人|分包人|代建人|联系人|工作人员|'
-    r'物业人员|项目经理|财务人员|会计|出纳|委托诉讼代理人|委托代理人|法定代表人|'
-    r'法定代理人|负责人|审判员|审判长|代理审判员|代理审判长|人民陪审员|书记员)'
-    r'[：:，,， ]*([\u4e00-\u9fa5]{2,4})'
-    r'(?=[，,。. （(的与和向称诉等为之：:、被就陆续作证签署结算收取领取出具归还返还对账'
-    r'支付偿还提交委托要求请求主张认为表示拒绝承认答应起诉上诉申诉复核到庭出庭陈述'
-    r'辩称举证质证告]|\u3001|$)'
-)
-
 
 def _spaced_re(seq: str) -> str:
     """把字面串转成容忍行内空格的正则片段。"""
     return _INLINE_SP.join(re.escape(c) for c in seq)
+
+
+# 角色词（含 OCR 行内空格写法："审 判 员"、"法 定代表人"）
+_ROLE_WORDS = (
+    '原告', '被告', '上诉人', '被上诉人', '第三人', '申请执行人', '被执行人',
+    '案外人', '证人', '担保人', '出借人', '借款人', '收款人', '付款人', '发包人',
+    '承包人', '分包人', '代建人', '联系人', '工作人员', '物业人员', '项目经理',
+    '财务人员', '会计', '出纳', '委托诉讼代理人', '委托代理人', '法定代表人',
+    '法定代理人', '负责人', '审判员', '审判长', '代理审判员', '代理审判长',
+    '人民陪审员', '书记员',
+)
+# 角色词后姓名：允许姓名内部带 OCR 空格（"汪 瑜"），容忍 2~4 个汉字
+_ROLE_NAME_RE = r'([\u4e00-\u9fa5](?:[ \t]*[\u4e00-\u9fa5]){1,3})'
+_ROLE_PATTERN = re.compile(
+    '((?:' + '|'.join(_spaced_re(w) for w in _ROLE_WORDS) + '))'
+    r'[：:，,， ]*' + _ROLE_NAME_RE +
+    r'(?=[，,。. （(的与和向称诉等为之：:、被就陆续作证签署结算收取领取出具归还返还对账'
+    r'支付偿还提交委托要求请求主张认为表示拒绝承认答应起诉上诉申诉复核到庭出庭陈述'
+    r'辩称举证质证告适]|\s|\u3001|$)'
+)
 
 
 _COMPANY_FULL_PATTERN = re.compile(
@@ -438,6 +473,12 @@ _COMPANY_SHORT_PATTERN = re.compile(
     r'((?:[\u4e00-\u9fa5]' + _INLINE_SP
     + r'){2,6}公' + _INLINE_SP + r'司)'
 )
+_COMPANY_MERCHANT_PATTERN = re.compile(
+    # v2.8：商户/经营主体名（行政处罚决定书常见："昌黎县嘉瑞丰煎肉店"）
+    r'((?:[\u4e00-\u9fa5]' + _INLINE_SP
+    + r'){2,12}(?:店|商行|商铺|超市|便利店|门市部|餐饮店|饭店|宾馆|餐厅|'
+    + r'小吃部|经营部|服务部|工作室|茶馆|酒吧|网吧))'
+)
 
 # 公司全称前常被误吞的上下文词（"原告金进跃与被告浙江华临建设集团有限公司"）
 _COMPANY_LEAD_WORDS = (
@@ -445,15 +486,50 @@ _COMPANY_LEAD_WORDS = (
     '原告 被告 上诉人 被上诉人 第三人 案外人 申请人 被申请人 申请执行人 被执行人 '
     '甲方 乙方 供方 需方 出租方 承租方 发包人 承包人 分包人 代建人 总包单位 总承包人 '
     '委托 法定代表人 负责人 将原由 由原 原由 包括 并 由 将 为 与 和 及 的 在 对 把 被 '
-    '于 是 而 且 或 从 向 给 若 因 关于 以 等 之 其 该 此 各 每'
+    '于 是 而 且 或 从 向 给 若 因 关于 以 等 之 其 该 此 各 每 '
+    # v2.8：实战误吞上下文（"张政微信告知原告公司""扣押或冻结被告…""均由被告…"）
+    '微信 告知 收到 通过 均由 扣押 冻结 查封 系该 本案 涉案 相关 包括 其中 以及 其下'
 ).split()
 
 _COMPANY_FUNCTION_CHARS = set('与和及的由将为在原对把被于而是且或并从向给在若因关于以等之其该此各每')
 
+# v2.8：修剪后仍含这些上下文词的公司名视为误匹配（"该公司/原告公司/微信告知…"）
+_COMPANY_JUNK_WORDS = (
+    '原告', '被告', '微信', '告知', '收到', '通过', '该公司', '本公司', '本局',
+    '相关', '本案', '涉案', '上述', '以及', '其中', '系该',
+)
+
 
 def _trim_company_span(span: str) -> tuple:
-    """修剪公司名匹配串前被误吞的上下文词，返回 (公司名, 保留前缀)。"""
+    """修剪公司名匹配串被误吞的上下文，返回 (公司名, 保留前缀)。
+
+    v2.8 增强：
+    1. "（以下简称宝冶公司）与被告广州合生东宇房地产有限公司"这类
+       全称+简称+连接词的粘连：按最右结构标记（与/括号）切分，只保留真正的公司名；
+    2. "微信告知原告公司""扣押或冻结被告…公司"等上下文词整串剥离。
+    """
     name = span.lstrip(' \t')
+    # 1) 右锚定切分：只在"与/括号/、/，"这些结构标记处切（不切"和/及"，
+    #    避免误伤"浙江和泰建设"这类名称内部含连接字的合法公司名）
+    cut = -1
+    for m in re.finditer(r'[与）)(（、，]', name):
+        cut = m.start()
+    if cut >= 0 and cut + 1 < len(name):
+        name = name[cut + 1:].lstrip(' \t')
+    # 2) 简称括号：以（或( 开头时，取括号内文本（"（以下简称宝冶公司）"→"宝冶公司"）
+    if name.startswith(('（', '(')):
+        close = name.find('）')
+        if close == -1:
+            close = name.find(')')
+        if close != -1:
+            inner = name[1:close]
+            for kw in ('以下简称', '下简称', '简称', '以下'):
+                if inner.startswith(kw):
+                    inner = inner[len(kw):].lstrip(' \t')
+                    break
+            if inner:
+                name = inner
+    # 3) 循环剥离前导上下文词与功能字
     while True:
         progressed = False
         for kw in _COMPANY_LEAD_WORDS:
@@ -467,10 +543,25 @@ def _trim_company_span(span: str) -> tuple:
             name = name[1:].lstrip(' \t')
             continue
         break
+    prefix = span[:len(span) - len(name)]
     if not name:
         return '', span
-    prefix = span[:len(span) - len(name)]
     return name, prefix
+
+
+def _is_junk_company(name: str) -> bool:
+    """修剪后的"公司名"若仍是纯上下文词（该公司/微信告知…），判定为误匹配。"""
+    if not name:
+        return True
+    # 纯泛化词："公司""事务所"等（无实义名称部分）
+    for suffix in ('有限公司', '股份有限公司', '有限责任公司', '集团公司',
+                   '合伙企业', '律师事务所', '会计师事务所', '事务所', '公司'):
+        if name == suffix:
+            return True
+    for kw in _COMPANY_JUNK_WORDS:
+        if kw in name:
+            return True
+    return False
 
 
 # ============================================================
@@ -533,6 +624,7 @@ class EntityResolver:
         'guarantor': '担保方',
         'subcontractor': '分包方',
         'third_party': '第三方公司',
+        'party': '当事人单位',
     }
     
     # 角色关键词 → 归一化角色名
@@ -547,6 +639,8 @@ class EntityResolver:
         '甲方': 'contract_a', '发包人': 'contract_a',
         '乙方': 'contract_b', '承包人': 'contract_b',
         '分包人': 'subcontractor', '担保人': 'guarantor', '担保方': 'guarantor',
+        # v2.8：行政处罚决定书等执法文书的"当事人/经营者"
+        '当事人': 'party', '经营者': 'party', '业主': 'party',
     }
     
     def __init__(self):
@@ -567,8 +661,9 @@ class EntityResolver:
     
     def normalize_company(self, name: str) -> str:
         """公司名归一化：去除常见后缀以匹配简称"""
+        name = re.sub(r'[ \t]', '', name)   # OCR 行内空格（"华 临公司"→"华临公司"）
         for suffix in ['有限公司', '股份有限公司', '有限责任公司', '集团公司', '合伙企业',
-                       '律师事务所', '会计师事务所', '事务所']:
+                       '律师事务所', '会计师事务所', '事务所', '公司']:
             if name.endswith(suffix):
                 return name[:-len(suffix)]
         return name
@@ -616,6 +711,18 @@ class EntityResolver:
                 if role and existing_id not in self._role_bindings:
                     self._role_bindings[existing_id] = role
                 return existing_id, self._make_placeholder(existing_id)
+
+        # v2.8：子串链接（"宝冶公司"→"上海宝冶集团"，"合生东宇公司"→
+        # "广州合生东宇房地产有限公司"），保证简称与全称使用同一占位符，
+        # 修复同一公司在不同位置出现 4 种占位符的角色绑定错乱
+        if len(canonical) >= 2:
+            for existing_canonical, existing_id in self._canonical_map.items():
+                ec = self.normalize_company(existing_canonical)
+                if len(ec) >= 2 and (canonical in ec or ec in canonical):
+                    self._canonical_map[name] = existing_id
+                    if role and existing_id not in self._role_bindings:
+                        self._role_bindings[existing_id] = role
+                    return existing_id, self._make_placeholder(existing_id)
         
         # 新实体
         self._company_counter += 1
@@ -731,9 +838,9 @@ class Desensitizer:
         text = self._mask_person_name(text)    # 人名（角色词上下文）
         text = self._mask_company_name(text)   # 公司名
         text = self._mask_project_name(text)   # 项目名称（公司名之后，避免吞掉公司简称）
-        text = self._mask_bare_person_names(text)  # 裸人名（姓氏启发式 + 角色名传播）
         text = self._mask_address(text)        # 地址
-        text = self._mask_amount(text)         # 金额（带单位的大额数字）
+        text = self._mask_amount(text)         # 金额（先于裸人名：避免"伍佰"被当人名）
+        text = self._mask_bare_person_names(text)  # 裸人名（姓氏启发式 + 角色名传播）
         return text
 
     def _finalize(self, text: str) -> MaskResult:
@@ -833,6 +940,10 @@ class Desensitizer:
         for seq, i in enumerate(order, 1):
             _, orig, ph = events[i]
             entry = self._replaced.get(orig)
+            if entry is None:
+                # OCR 空格姓名的事件原文是带空格的原始文本，映射键是去空格后的
+                # canonical（如 "汪 瑜" → "汪瑜"），归一化后回查
+                entry = self._replaced.get(self._resolver.normalize(orig))
             if not entry:
                 continue
             rows.append(Mapping(original=orig, replacement=ph,
@@ -1434,12 +1545,15 @@ class Desensitizer:
         shift = [0]
 
         def replacer(m):
-            role = m.group(1)
-            name = m.group(2)
-            name_start = m.end() - len(name)
+            role_raw = m.group(1)
+            role = re.sub(r'[ \t]', '', role_raw)   # "审 判 员"→"审判员"
+            raw_name = m.group(2)                   # 可能含 OCR 空格
+            name = re.sub(r'[ \t]', '', raw_name)   # 校验/归一化用
+            name_start = m.end() - len(raw_name)
             tail = ''
             if not self._is_plausible_role_name(name, text[name_start + len(name):]):
-                # 候选可能吞了尾部动词/虚词（"吴琳陆续""金进跃与"）：回退取更短的名字
+                # 候选可能吞了尾部动词/虚词（"彭静娴诉""张旭到""张旭未有"）：
+                # 回退取更短的名字，尾部原文保留在占位符之后
                 ok = False
                 for cut in (1, 2):
                     cand = name[:-cut]
@@ -1456,26 +1570,37 @@ class Desensitizer:
                         break
                 if not ok:
                     return m.group(0)
+                if ' ' in raw_name or '\t' in raw_name:
+                    # OCR 空格姓名的尾部粘连极罕见，保守放弃，避免切分错位
+                    return m.group(0)
             # 通过EntityResolver进行归一化和角色绑定
             _, placeholder = self._resolver.resolve_person(name, role)
             # 记录映射
             canonical = self._resolver.normalize(name)
             self._record(canonical, placeholder, '人名')
-            self._record_event(name_start + shift[0], canonical, placeholder)
+            # 事件记录"实际被占位符替换的原文"：
+            # - 普通姓名：canonical（无空格、不含尾部，尾部文字保留在占位符之后）
+            # - OCR 空格姓名：raw_name（含空格，占位符替换整个原始串）
+            # 若尾部切分后仍按 raw_name 记录，尾部会被回放重复处理（"王强与被"）。
+            if ' ' in raw_name or '\t' in raw_name:
+                event_orig = raw_name
+            else:
+                event_orig = canonical
+            self._record_event(name_start + shift[0], event_orig, placeholder)
             # 保留原文分隔符
             raw = m.group(0)
-            after_role = raw[len(role):]
+            after_role = raw[len(role_raw):]
             delim = ''
             for ch in after_role:
                 if ch in '：:，,　 ':
                     delim += ch
                 else:
                     break
-            if delim.strip():
-                out = f'{role}{delim}{placeholder}{tail}'
+            if delim:
+                out = f'{role_raw}{delim}{placeholder}{tail}'
             else:
                 # 原文无分隔符时不插入空格，保证还原保真
-                out = f'{role}{placeholder}{tail}'
+                out = f'{role_raw}{placeholder}{tail}'
             shift[0] += len(out) - len(m.group(0))
             return out
 
@@ -1484,6 +1609,9 @@ class Desensitizer:
 
     def _is_plausible_role_name(self, name: str, after: str) -> bool:
         """角色词后候选是否像"姓名"（排除 提供担保/处签名/印章/私章 等词组）。"""
+        name = re.sub(r'[ \t]', '', name)   # OCR 空格姓名先归一
+        if not name:
+            return False
         # 含虚词/连接词的"名字"（如"起诉之日""与被告"）不是姓名
         if any(ch in _ROLE_NAME_REJECT for ch in name):
             return False
@@ -1504,15 +1632,18 @@ class Desensitizer:
                 '有限公司', '公司', '集团', '事务所', '服务部', '商行',
                 '经营部', '商店', '银行', '法院', '学校', '医院')):
             return False
-        # 姓名形态校验（jieba 可用时）：姓氏开头，或整词分词的非姓氏名
+        # v2.8：3 字以上候选最后一个字是动词/虚词 → 吞了尾部粘连词
+        #（"彭静娴诉""张旭到""张旭未有"），交给 replacer 切短回退
+        if len(name) >= 3 and name[-1] in _NAME_GLUE_CHARS:
+            return False
+        # 姓名形态校验（jieba 可用时）：角色词后必须是"姓氏开头"的姓名，
+        # 不再接受"签定/收到/无异议"这类以非姓氏字开头的双字词
         seg = _get_segmenter()
         if seg is not None:
             surname_ok = (name[0] in _SURNAMES
                           or (len(name) >= 2 and name[:2] in _COMPOUND_SURNAMES))
             if not surname_ok:
-                toks = seg(name)
-                if len(toks) != 1 or name[-1] in '章签印书状讼费款证照单表称':
-                    return False
+                return False
             elif len(name) > 2:
                 toks = seg(name)
                 ok = (len(toks) == 1
@@ -1672,6 +1803,25 @@ class Desensitizer:
             if (token_at.get(start) == surname
                     and token_at.get(start + len(surname)) == given):
                 return True
+        # 4) v2.8 单姓+名被 jieba 切成两词："李"+"磊磊"、"张"+"先政"
+        if len(surname) == 1:
+            given = cand[len(surname):]
+            if (token_at.get(start) == surname
+                    and token_at.get(start + len(surname)) == given
+                    # 名是"本院/当日"这类指示/时间词 → 不是姓名
+                    and given[0] not in '本该此其当今日时前后上下今昨明去年月周天内中里处近常每各这那几诸余数多少全半初末期'
+                    and given not in ('本院', '当日', '本日', '当天', '当天', '今天',
+                                       '昨天', '明天', '今年', '去年', '明年', '本月',
+                                       '上月', '本周', '上周')):
+                return True
+            # 5) jieba 把"姓+名"切在名中间："曹先"+"银"（真实名"曹先银"）
+            if len(cand) == 3:
+                if (token_at.get(start) == cand[:2]
+                        and token_at.get(start + 2) == cand[2:]
+                        # 尾部是动词/虚词（"万元给""张旭到"）→ 不是姓名
+                        and cand[2] not in _NAME_CONTEXT_AFTER
+                        and cand[2] not in _NAME_GLUE_CHARS):
+                    return True
         return False
 
     def _mask_bare_person_names(self, text: str) -> str:
@@ -1736,7 +1886,7 @@ class Desensitizer:
           （"原告金进跃与被告浙江华临建设集团有限公司"→ 只替换公司名本身）
         """
         for pat in (_COMPANY_FULL_PATTERN, _COMPANY_OFFICE_PATTERN,
-                    _COMPANY_SHORT_PATTERN):
+                    _COMPANY_SHORT_PATTERN, _COMPANY_MERCHANT_PATTERN):
             original = text  # 用于上下文角色检测
             shift = [0]
 
@@ -1748,6 +1898,8 @@ class Desensitizer:
                     return span
                 name, prefix = _trim_company_span(span)
                 if not name:
+                    return span
+                if _is_junk_company(name):
                     return span
                 # 检查上下文中的角色词
                 role = ''
@@ -1817,46 +1969,64 @@ class Desensitizer:
         """
         地址信息，匹配地理层级结构：
         住所地/地址 + 内容，或 省/市/区/路/号 层级结构
+
+        v2.8：每个子模式使用独立 shift——此前 5 个子模式共用同一个 shift，
+        导致后几个子模式记录的事件位置被重复扣减，回放时误删
+        [出生日期] 等占位符，造成 restore 还原错位。
         """
-        shift = [0]
+        def make_replacer():
+            # 每个子模式独立 shift：m.start() 是"本子模式输入文本"坐标，
+            # 只累加本子模式内替换引起的长度差，绝不跨子模式复用
+            shift = [0]
 
-        def addr_replacer(m, addr, prefix):
-            out = self._record_addr(addr, prefix,
-                                    pos=m.start() + shift[0])
-            shift[0] += len(out) - len(m.group(0))
-            return out
+            def addr_replacer(m, addr, prefix):
+                out = self._record_addr(addr, prefix,
+                                        pos=m.start() + shift[0])
+                shift[0] += len(out) - len(m.group(0))
+                return out
+            return addr_replacer
 
-        # 住所地/地址/位于 + 内容
+        # 1) 前缀词 + 省级地址（含"住/现住/户籍地"等，容忍 省→市/县 直连）
+        _ADDR_PROV = (r'[\u4e00-\u9fa5]{1,3}(?:省|自治区)'
+                      r'[\u4e00-\u9fa5 ]{1,10}(?:市|县|区|镇)'
+                      r'[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)'
+                      r'[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)')
+        r1 = make_replacer()
         text = re.sub(
-            r'(住所地|住址|地址|位于)[：:]?\s*([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)[\u4e00-\u9fa5\d\-（\(）\) ]{5,40}(?:号|室|层))',
+            r'(户籍所在地|户籍地|户籍|住所地|住所|住址|居住地|居住|现住|家住|住|地址|位于)'
+            r'[：:]?\s*(' + _ADDR_PROV + ')',
             # 前缀用相对偏移（m.start(2)-m.start(0)），避免地址前半截残留在文本中
-            lambda m: addr_replacer(
-                m, m.group(2),
-                m.group(0)[:m.start(2) - m.start(0)]),
+            lambda m: r1(m, m.group(2),
+                         m.group(0)[:m.start(2) - m.start(0)]),
             text
         )
-        # 独立的地理地址（省开头 + 详细到号/室）
+        # 2) 独立省级地址（无前缀词；前接汉字时多为"住/居住"等已由规则1处理）
+        r2 = make_replacer()
         text = re.sub(
-            r'([\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层))',
-            lambda m: addr_replacer(m, m.group(1), ''),
+            r'(?<![\u4e00-\u9fa5])(' + _ADDR_PROV + ')',
+            lambda m: r2(m, m.group(1), ''),
             text
         )
-        # 独立城市级地址（市/区开头 + 详细到路/街/号）
+        # 3) 独立城市级地址（市/区开头 + 详细到路/街/号）
+        r3 = make_replacer()
         text = re.sub(
             r'((?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?)',
-            lambda m: addr_replacer(m, m.group(1), ''),
+            lambda m: r3(m, m.group(1), ''),
             text
         )
-        # 无省市区层级的地址：小区/花园/公寓/大厦/苑/里/村/镇/区 + 栋/单元/室/楼/号
+        # 4) 无省市区层级的地址：小区/花园/公寓/大厦/苑/里/村/镇/区/片 + 号/栋/室/片
+        #    （不含"庄/屯"：避免"帝景山庄一组团"被误当地址）
+        r4 = make_replacer()
         text = re.sub(
-            r'([\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|栋|幢|单元|室|楼|座|层))',
-            lambda m: addr_replacer(m, m.group(1), ''),
+            r'([\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区|片)[\u4e00-\u9fa5\d\- ]{0,12}(?:号|栋|幢|单元|室|楼|座|层|片|里))',
+            lambda m: r4(m, m.group(1), ''),
             text
         )
-        # 路/街/大道/巷 + 门牌号（无需"区"前缀，如"莫干山路100号"）
+        # 5) 路/街/大道/巷 + 门牌号（无需"区"前缀，如"莫干山路100号"）
+        r5 = make_replacer()
         text = re.sub(
             r'([\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|弄|栋|幢|单元|室|楼|座))',
-            lambda m: addr_replacer(m, m.group(1), ''),
+            lambda m: r5(m, m.group(1), ''),
             text
         )
         return text
@@ -2605,7 +2775,7 @@ def restore_text(masked_text: str, mappings: List[Mapping]) -> str:
 # ============================================================
 
 _CRITICAL_TYPES = ('身份证号', '手机号', '银行账号', '案号', '统一社会信用代码',
-                   '律师执业证号', '固定电话', '邮箱', '微信号', 'QQ号')
+                   '律师执业证号', '罚没许可证号', '固定电话', '邮箱', '微信号', 'QQ号')
 
 # 规则层覆盖不到、需律师/AI 判断的低优先级残留（语义层职责）
 _REMAINING_PATTERNS = (
@@ -2616,7 +2786,7 @@ _REMAINING_PATTERNS = (
         r'[：:，,， ]*([\u4e00-\u9fa5]{2,4})')),
     ('公司/机构简称残留', re.compile(
         r'(?<![\u4e00-\u9fa5A-Za-z0-9\]])[\u4e00-\u9fa5]{2,8}'
-        r'(?:公司|事务所|集团|商行|经营部|服务部|商店)')),
+        r'(?:公司|事务所|集团|商行|经营部|服务部|商店|店|商铺|超市|宾馆|饭店)')),
     ('地址残留', re.compile(
         r'[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,12}(?:市)'
         r'[\u4e00-\u9fa5 ]{1,12}(?:区|县|市|镇)[\u4e00-\u9fa5\d\- ]{3,30}(?:号|室|层)'

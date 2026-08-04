@@ -761,5 +761,96 @@ class TestV30PdfRedact(unittest.TestCase):
             redact_pdf(pdf, [('[不存在]', '完全不存在的内容xyz')])
 
 
+# ============================================================
+# v3.1 回归：微信号上下文增强（是/为/微信号码/OCR空格）+ 姓名动词尾误报防护
+# ============================================================
+class TestV31Wechat(unittest.TestCase):
+    """微信号脱敏：'微信号是/为/微信号码/我的微信是' 等法律文书常见写法。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_wechat_variants_masked(self):
+        cases = [
+            '微信号是lawyer_wang888',
+            '微信号为zhangsan001',
+            '微信号码是zhangsan',
+            '我的微信是abc_123456',
+            '微信账号为wxid_abcdefghijkl',
+            '微 信号：abc_123456',          # OCR 行内空格
+            '双方确认微信号为lawyer_wang888为联络方式',
+        ]
+        for t in cases:
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertTrue(any(m.type == '微信号' for m in r.mapping),
+                                f'未脱敏: {t} -> {r.text}')
+
+    def test_wechat_negatives_not_masked(self):
+        cases = [
+            '微信是常用的聊天工具',      # 后接中文，不是微信号
+            '微信为诉讼证据',
+            '使用ChatGPT处理合同',      # 裸英文词不误判
+            '微信号：张三丰',           # 中文昵称不是微信号
+            '微信支付了500元',
+        ]
+        for t in cases:
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertFalse(any(m.type == '微信号' for m in r.mapping),
+                                 f'误报: {t} -> {r.text}')
+
+    def test_wechat_restore_roundtrip(self):
+        src = '我的微信号码是zhangsan001，双方确认其微信号为lawyer_wang888。'
+        r = self.d.mask(src)
+        back = restore_text(r.text, r.mapping)
+        self.assertEqual(back, src)
+
+    def test_scan_matches_mask(self):
+        text = '微信号为zhangsan001'
+        scan = self.d.scan(text)
+        self.assertTrue(any(f['type'] == '微信号' for f in scan))
+        r = self.d.mask(text)
+        self.assertIn('[微信号]', r.text)
+
+
+class TestV31NameVerbTail(unittest.TestCase):
+    """姓名+高频动词尾 不再误吞（张三确认/双方确认/什么时候）。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_name_confirmation_not_swallowed(self):
+        r = self.d.mask('原告张三确认收到货款。')
+        self.assertIn('确认收到', r.text)
+        self.assertTrue(any(m.type == '人名' for m in r.mapping))
+
+    def test_shuangfang_kept(self):
+        for t in ('双方确认后签订合同', '经双方约定付款', '双方同意解除合同'):
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertNotIn('当事人', r.text, f'误报: {t} -> {r.text}')
+
+    def test_shihou_kept(self):
+        r = self.d.mask('货款什么时候到账')
+        self.assertNotIn('当事人', r.text)
+
+    def test_jieba_glue_still_masked(self):
+        # v3.0 修复的"名 token 带尾动词"粘连仍生效（真实人名不回归）
+        for t in ('荣墨军称：货款什么时候到账？', '齐艳称：好的'):
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertTrue(any(m.type == '人名' for m in r.mapping),
+                                f'漏脱敏: {t} -> {r.text}')
+
+    def test_tail_verbs_still_trimmed(self):
+        # v2.8 尾部动词回退不回归
+        for t, tail in (('被告张旭未有提供证据', '未有'),
+                        ('原告彭静娴诉被告', '诉')):
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertIn(tail, r.text)
+
+
 if __name__ == '__main__':
     unittest.main()

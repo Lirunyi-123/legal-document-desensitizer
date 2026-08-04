@@ -75,3 +75,10 @@
 {"id": "neg_09", "note": "微信/该公司/原告公司/收到 不是公司名（负样本）", "text": "张政微信告知原告公司员工，系该公司员工，收到回执。", "expect_masked": [], "expect_kept": ["微信", "该公司", "原告公司", "收到"]}
 {"id": "company_04", "note": "公司名粘连切分（扣押或冻结被告…公司）", "text": "裁定查封、扣押或冻结被告广州合生东宇房地产有限公司名下财产。", "expect_masked": [{"type": "公司名", "value": "广州合生东宇房地产有限公司"}], "expect_kept": ["扣押或冻结"]}
 {"id": "addr_12", "note": "无省市区层级地址（县+里/片，还原友好）", "text": "其住所地为昌黎县四街铁塔东里片，户籍在别处。", "expect_masked": [{"type": "地址", "value": "昌黎县四街铁塔东里片"}], "expect_kept": []}
+{"id": "wx_05", "note": "微信号是（分隔符\"是\"）", "text": "原告确认其微信号是lawyer_wang888，双方互加好友。", "expect_masked": [{"type": "微信号", "value": "lawyer_wang888"}], "expect_kept": ["双方"]}
+{"id": "wx_06", "note": "微信号为（分隔符\"为\"）", "text": "双方确认微信号为zhangsan001为联络方式。", "expect_masked": [{"type": "微信号", "value": "zhangsan001"}], "expect_kept": ["双方", "确认"]}
+{"id": "wx_07", "note": "微信号码是（词表变体）", "text": "我的微信号码是zhangsan，通过手机号可搜索。", "expect_masked": [{"type": "微信号", "value": "zhangsan"}], "expect_kept": []}
+{"id": "wx_08", "note": "我的微信是（裸\"微信\"+是）", "text": "我的微信是abc_123456，有需要可加。", "expect_masked": [{"type": "微信号", "value": "abc_123456"}], "expect_kept": []}
+{"id": "wx_09", "note": "OCR空格 微 信号", "text": "微 信号：wxid_abcdefghijkl，加好友需验证。", "expect_masked": [{"type": "微信号", "value": "wxid_abcdefghijkl"}], "expect_kept": []}
+{"id": "neg_10", "note": "微信是+中文 不是微信号（负样本）", "text": "微信是常用的聊天工具，不是诉讼证据。", "expect_masked": [], "expect_kept": ["微信"]}
+{"id": "neg_11", "note": "姓名+确认 不吞动词（负样本）", "text": "原告张三确认收到货款，双方确认无误。", "expect_masked": [{"type": "人名", "value": "张三"}], "expect_kept": ["确认", "双方"]}

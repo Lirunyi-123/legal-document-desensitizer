@@ -262,6 +262,7 @@ _BARE_NAME_BLACKLIST = set(
     '李代 李唐 李树 '
     '张罗 张望 张贴 张狂 张扬 张挂 张榜 张目 张嘴 张口 张冠 '
     '刘海 刘览 '
+    '时候 时侯 时辰 时间 时点 时刻 '
     '周围 周到 周密 周全 周日 周末 周年 周期 周折 周转 周游 周旋 周边 周济 '
     '孙子 孙女 孙山 '
     '马虎 马上 马路 马匹 马甲 马术 马戏 马达 马桶 '
@@ -334,6 +335,18 @@ _BARE_NAME_BLACKLIST = set(
 # 强上下文：前接/后接这些字时，候选为名字的可能性显著提高
 _NAME_CONTEXT_BEFORE = set('向与和给对为被由把将叫欠借还付转签交送收出让起诉告称表示委托指定要求主张员')
 _NAME_CONTEXT_AFTER = set('欠借贷付还签称诉辩陈述出庭委托支付偿还提交主张认为要求表示答应拒绝承认起诉告到庭')
+
+# v3.1：jieba 切出的"完整高频动词"黑名单——"名 token 带尾动词"放宽
+# 只该放行"姓+名+罕见动词"被 jieba 粘连的情况（"荣墨军称"→"荣墨"+"军称"）；
+# "张三确认"里"确认"是 jieba 正确切出的常用词，绝不是"名'确'+动词'认'"，
+# 若放行会把"张三确认"拆成"张三确"+"认"造成误报（同样防护"双方确认/约定/同意"）。
+_NAME_FOLLOW_BLOCK = {
+    '确认', '约定', '同意', '协商', '签字', '签收', '收到', '支付', '偿还',
+    '提交', '认为', '表示', '陈述', '辩称', '到庭', '出庭', '认可', '接收',
+    '主张', '要求', '拒绝', '承认', '答应', '出借', '借款', '还款', '催讨',
+    '回复', '答复', '回复', '说过', '指控', '起诉', '上诉', '申请', '请求',
+    '证实', '证明', '保证', '担保', '主张', '参加', '参与', '任职', '负责',
+}
 _NUMERAL_CHARS = set('一二三四五六七八九十百千万零')
 _NAME_FUNCTION_WORDS = set(
     ('不 的 是 了 在 有 和 与 及 或 但 且 而 就 都 也 还 又 再 才 只 很 更 最 过 着 呢 吗 吧 啊 '
@@ -452,6 +465,21 @@ _INLINE_SP = '[ \t]*'   # 行内空格（不含 \n，避免跨段落吞词）
 def _spaced_re(seq: str) -> str:
     """把字面串转成容忍行内空格的正则片段。"""
     return _INLINE_SP.join(re.escape(c) for c in seq)
+
+
+# ============================================================
+# 微信号上下文规则（mask 与 scan 共用同一份，保证行为一致）
+# ============================================================
+# v3.1：词表扩充"微信号码"，容忍 OCR 行内空格（"微 信号"），分隔符支持
+# "：: 为 是 ="（"微信号是xxx""微信为xxx""微信号码xxx"等法律文书常见写法）。
+# 号体仍为 5~20 位字母开头（[a-zA-Z][a-zA-Z0-9_]{4,19}），后接中文时
+# 因字母开头约束天然不匹配，不会误伤"微信是中文句子"。
+_WECHAT_CTX = (r'(?:' + _spaced_re('微信号码') + r'|'
+               + _spaced_re('微信') + r'(?:账号|号)?)')
+_WECHAT_PATTERN = (
+    r'(' + _WECHAT_CTX + r'\s*[：:为是=]?\s*)'
+    r'([a-zA-Z][a-zA-Z0-9_]{4,19})'
+)
 
 
 # 角色词（含 OCR 行内空格写法："审 判 员"、"法 定代表人"）
@@ -1404,10 +1432,11 @@ class Desensitizer:
 
     def _mask_wechat(self, text: str) -> str:
         """微信号：匹配有前缀 或 独立出现的微信号模式"""
-        # 微信号: xxx / 微信号xxx / 微信账号xxx（前缀，冒号可省略）
+        # v3.1：上下文规则支持"微信号码/微信号/微信账号/微信"（含 OCR 空格）
+        # 与分隔符"：: 为 是 ="（微信号是xxx / 微信为xxx / 微信号码xxx）
         shift = [0]
         text = re.sub(
-            r'((?:微信号|微信账号|微信)\s*[：:]?\s*)([a-zA-Z][a-zA-Z0-9_]{4,19})',
+            _WECHAT_PATTERN,
             lambda m: self._safe_replace_wechat(m.group(2), m.group(1),
                                                 m.start() + shift[0]
                                                 + len(m.group(1)), shift),
@@ -1608,19 +1637,34 @@ class Desensitizer:
                 # 候选可能吞了尾部动词/虚词（"彭静娴诉""张旭到""张旭未有"）：
                 # 回退取更短的名字，尾部原文保留在占位符之后
                 ok = False
-                for cut in (1, 2):
-                    cand = name[:-cut]
-                    removed = name[len(cand):]
+                # v3.1：优先"完整高频动词尾"整体回退——"张三确认"应切
+                # "张三"+"确认"，而不是先按单字切出"张三确"+"认"（"认"是
+                # 合法尾词导致"张三确"被误当名字）。block 词按长度降序匹配。
+                blocked = next(
+                    (w for w in sorted(_NAME_FOLLOW_BLOCK, key=len, reverse=True)
+                     if len(name) > len(w) and name.endswith(w)), None)
+                if blocked:
+                    cand = name[:-len(blocked)]
                     if (len(cand) >= 2
-                            and (removed in _NAME_TAIL_WORDS
-                                 or all(ch in _NAME_TAIL_WORDS
-                                        for ch in removed))
                             and self._is_plausible_role_name(
                                 cand, text[name_start + len(cand):])):
                         name = cand
-                        tail = removed
+                        tail = blocked
                         ok = True
-                        break
+                if not ok:
+                    for cut in (1, 2):
+                        cand = name[:-cut]
+                        removed = name[len(cand):]
+                        if (len(cand) >= 2
+                                and (removed in _NAME_TAIL_WORDS
+                                     or all(ch in _NAME_TAIL_WORDS
+                                            for ch in removed))
+                                and self._is_plausible_role_name(
+                                    cand, text[name_start + len(cand):])):
+                            name = cand
+                            tail = removed
+                            ok = True
+                            break
                 if not ok:
                     return m.group(0)
                 if ' ' in raw_name or '\t' in raw_name:
@@ -1859,6 +1903,8 @@ class Desensitizer:
         # 4) v2.8 单姓+名被 jieba 切成两词："李"+"磊磊"、"张"+"先政"
         # v3.0：名 token 可能带尾动词（"艳称"= 名"艳"+动词"称"），
         #       startswith + 剩余部分为动词 → 放行（修复"荣墨军称"类盲区）
+        # v3.1：但"确认/约定/同意"等高频词是 jieba 切出的完整动词，不是
+        #       "名+动词"粘连——"张三确认"绝不能拆成"张三确"+"认"（误报修复）
         if len(surname) == 1:
             given = cand[len(surname):]
             tok2 = token_at.get(start + len(surname))
@@ -1866,6 +1912,7 @@ class Desensitizer:
                     and tok2
                     and (tok2 == given
                          or (tok2.startswith(given)
+                             and tok2 not in _NAME_FOLLOW_BLOCK
                              and tok2[len(given):]
                              and all(c in _NAME_CONTEXT_AFTER
                                      for c in tok2[len(given):])))
@@ -1884,6 +1931,7 @@ class Desensitizer:
                         and tok2b
                         and (tok2b == cand[2:]
                              or (tok2b.startswith(cand[2:])
+                                 and tok2b not in _NAME_FOLLOW_BLOCK
                                  and tok2b[len(cand[2:]):]
                                  and all(c in _NAME_CONTEXT_AFTER
                                          for c in tok2b[len(cand[2:]):])))
@@ -2196,7 +2244,9 @@ class Desensitizer:
              'pattern': r'(?<!\d)([48]00[-\s]?\d{3}[-\s]?\d{4})(?!\d)',
              'handler': self._mask_landline, 'group': 1, 'value_group': 1},
             {'type': '微信号',
-             'pattern': r'((?:微信号|微信账号|微信)\s*[：:]?\s*)([a-zA-Z][a-zA-Z0-9_]{4,19})',
+             # v3.1：与 _mask_wechat 共用 _WECHAT_PATTERN（词表含"微信号码"、
+             # OCR 空格、分隔符"：: 为 是 ="）
+             'pattern': _WECHAT_PATTERN,
              'handler': self._mask_wechat, 'group': 2, 'value_group': 2},
             {'type': '微信号',
              'pattern': r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',

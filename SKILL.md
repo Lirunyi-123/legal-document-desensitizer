@@ -223,6 +223,31 @@ python3 desensitize.py mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.
   带分隔符（138-0013-8000）与 +86/86 前缀（+8613800138000）由微信号规则补充
   为 [微信号]，且不再被金额规则误标。单测 110、红队 89 条、误报 0。
 
+## v3.3 Excel（.xlsx / .xlsm）支持（银行流水 / 证据清单 / 对账单）
+
+- **单元格级脱敏**：每个参与脱敏的单元格展平为一行文本交给规则层（同一份文本
+  整体脱敏，EntityResolver 全文一致仍生效：公司全称/简称跨单元格统一占位符）。
+- **保留**：工作表结构、样式、列宽、合并单元格、公式（`=SUM(...)` 原样不动，
+  公式是结构不是内容）、日期时间与布尔单元格（不参与脱敏，保持原格式）。
+- **写回**：仅改动被脱敏的单元格；未改动单元格保持原值（数值/日期类型与格式
+  原样保留）。
+- **restore 逐单元格还原**：restore 以脱敏文件为基底时，按映射表恢复数值类型
+  （金额等 → int/float）；身份证/银行卡/手机号等号码类即使全数字也保持文本。
+- 依赖：`pip3 install openpyxl`（缺失时优雅退出并提示，不影响其他格式）。
+- 验证：`python3 -m unittest test_desensitize`（120 项，含 TestExcelSupport 10 用例）
+  + `python3 evaluate.py` 红队回归（105 项 MICRO/MACRO 全 1.0000、误报 0）
+  + CLI 端到端冒烟（银行流水 xlsx：mask → restore 往返逐单元格一致，含类型）。
+
+### 验证方法（v3.3 起）
+```bash
+python3 -m unittest test_desensitize     # 120 个单测（含 Excel 10 用例）
+python3 evaluate.py                      # 红队用例（105 项命中、误报 0）
+python3 selfcheck.py                     # 自检：文件/测试/评测/还原四项
+python3 desensitize.py mask -f 银行流水.xlsx --save-mapping 映射表.md
+python3 desensitize.py restore -f 银行流水_desensitized.xlsx -m 映射表.md -o 还原.xlsx
+# 还原后逐单元格与原文件比对，要求 0 差异（含类型）
+```
+
 ## 输入
 
 接受以下格式的文档内容（粘贴或文件路径）：
@@ -235,6 +260,9 @@ python3 desensitize.py mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.
 - `.docx` 输入 → `.docx` 输出（保留段落结构）
 - `.pdf` 输入 → 默认 `.txt` 输出；**v3.0 起可用 `--pdf-redact` 输出"真·涂黑"PDF**
   （保留版式，见下方 v3.0 章节第 3 点）
+- **`.xlsx` / `.xlsm` 输入 → 同格式输出（v3.3）**：单元格级脱敏（银行流水、证据清单、
+  对账单），保留工作表/样式/列宽/合并单元格/公式；公式、日期时间、布尔单元格保持原样
+  不参与脱敏；restore 按映射表逐单元格还原，金额等数值类恢复数值类型
 - 未指定输出路径时，自动在原文件同目录生成 `原文件名_desensitized.扩展名`
 
 使用示例：
@@ -243,12 +271,16 @@ python3 desensitize.py mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.
 python3 desensitize.py mask -f 合同.docx     # → 合同_desensitized.docx
 python3 desensitize.py mask -f 判决书.docx   # → 判决书_desensitized.docx
 python3 desensitize.py mask -f 聊天记录.txt  # → 聊天记录_desensitized.txt
+python3 desensitize.py mask -f 银行流水.xlsx # → 银行流水_desensitized.xlsx
 
 # 指定输出文件
 python3 desensitize.py mask -f 证据.pdf -o 脱敏后.txt
 
 # v3.0：PDF 真·涂黑脱敏（保留版式，输出涂黑+占位符的 PDF）
 python3 desensitize.py mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.pdf
+
+# v3.3：Excel 还原（逐单元格还原，金额恢复数值类型）
+python3 desensitize.py restore -f 银行流水_desensitized.xlsx -m 映射表.md -o 还原.xlsx
 ```
 
 ## 输出

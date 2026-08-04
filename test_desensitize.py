@@ -900,5 +900,249 @@ class TestV32WechatMobile(unittest.TestCase):
         self.assertEqual(restore_text(r.text, r.mapping), src)
 
 
+# ============================================================
+# v3.3 回归：Excel（.xlsx / .xlsm）支持 — 单元格展平 / 公式跳过 / 还原往返
+# ============================================================
+class TestExcelSupport(unittest.TestCase):
+    """Excel 支持：每个参与脱敏的单元格展平为一行，写回保留结构，restore 逐单元格还原。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def _make_wb(self, path):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest('openpyxl 未安装')
+        wb = Workbook()
+        ws = wb.active
+        ws.title = '流水'
+        ws['A1'] = '姓名'
+        ws['B1'] = '身份证号'
+        ws['C1'] = '手机号'
+        ws['D1'] = '金额'
+        ws['A2'] = '陈建国'
+        ws['B2'] = '110101198001011232'
+        ws['C2'] = '13800138000'
+        ws['D2'] = 392485911.675
+        ws['A3'] = '杭州鼎盛房地产开发有限公司'
+        ws['B3'] = '=SUM(D2:D2)'          # 公式，应保留
+        ws['C3'] = 'charlie@example.com'
+        ws.merge_cells('A4:B4')           # 合并区
+        ws['A4'] = '合并区'
+        ws2 = wb.create_sheet('备注')
+        ws2['A1'] = '张三\n李四'          # 单元格内换行
+        ws2['B1'] = True                  # 布尔，应保留
+        ws2['C1'] = 123                    # 普通整数
+        wb.save(path)
+        return wb
+
+    def _read_cells(self, path):
+        from openpyxl import load_workbook
+        wb = load_workbook(path, data_only=False)
+        try:
+            return {s.title: [[c.value for c in row] for row in s.iter_rows()]
+                    for s in wb.worksheets}
+        finally:
+            wb.close()
+
+    def test_flat_text_extracts_cells_in_order(self):
+        import tempfile, os
+        from desensitize import read_text_from_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '流水.xlsx')
+        self._make_wb(src)
+        text = read_text_from_file(src)
+        # 行序：sheet1 逐行逐列（跳过 None/公式），再 sheet2；换行单元格含 ␊ 标记
+        self.assertEqual(text.split('\n')[0], '姓名')
+        self.assertIn('陈建国', text)
+        self.assertIn('110101198001011232', text)
+        self.assertIn('392485911.675', text)
+        self.assertNotIn('=SUM(D2:D2)', text)   # 公式不参与
+        self.assertIn('张三\u240a李四', text)    # 单元格内换行 → ␊ 标记
+        self.assertIn('合并区', text)            # sheet1 内容
+        # 两个 sheet 内容都出现，且布尔/公式跳过
+        self.assertNotIn('True', text.split('\n'))
+
+    def test_mask_writes_back_cell_level(self):
+        import tempfile, os
+        from desensitize import read_text_from_file, write_desensitized_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '流水.xlsx')
+        self._make_wb(src)
+        text = read_text_from_file(src)
+        res = self.d.mask(text)
+        out = os.path.join(tmp, '流水_desensitized.xlsx')
+        write_desensitized_file(src, out, res.text)
+        cells = self._read_cells(out)
+        ws = cells['流水']
+        self.assertEqual(ws[1][1], '[身份证号]')   # B2
+        self.assertEqual(ws[1][2], '[手机号]')     # C2
+        self.assertEqual(ws[1][3], '[金额]')       # D2（float → [金额]）
+        self.assertEqual(ws[2][1], '=SUM(D2:D2)')  # 公式原样保留
+        self.assertEqual(cells['备注'][0][0], '张三\n李四')  # 换行还原
+        self.assertEqual(cells['备注'][0][1], True)          # 布尔保留
+        self.assertEqual(cells['备注'][0][2], 123)           # 整数保留
+
+    def test_formula_skipped_kept(self):
+        import tempfile, os
+        from desensitize import read_text_from_file, write_desensitized_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '公式.xlsx')
+        wb = self._make_wb(src)
+        text = read_text_from_file(src)
+        self.assertNotIn('=SUM', text)  # 读取时公式不进入文本
+        res = self.d.mask(text)
+        out = os.path.join(tmp, '公式_out.xlsx')
+        write_desensitized_file(src, out, res.text)
+        cells = self._read_cells(out)
+        self.assertEqual(cells['流水'][2][1], '=SUM(D2:D2)')
+
+    def test_restore_roundtrip_exact(self):
+        """mask → restore 后与原 xlsx 逐单元格一致（含 float 类型）。"""
+        import tempfile, os
+        from desensitize import read_text_from_file, write_desensitized_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '流水.xlsx')
+        wb = self._make_wb(src)
+        original = self._read_cells(src)
+        text = read_text_from_file(src)
+        res = self.d.mask(text)
+        restored = restore_text(res.text, res.mapping)
+        out = os.path.join(tmp, '还原.xlsx')
+        write_desensitized_file(src, out, restored)
+        got = self._read_cells(out)
+        for sheet in original:
+            for r, row in enumerate(original[sheet]):
+                for c, v in enumerate(row):
+                    if v is None:
+                        continue
+                    gv = got[sheet][r][c]
+                    self.assertEqual(gv, v, f'{sheet}!{r},{c}')
+                    self.assertIs(type(gv), type(v),
+                                  f'{sheet}!{r},{c} 类型不一致: {type(gv)} vs {type(v)}')
+
+    def test_cli_style_restore_from_masked_file(self):
+        """真实 CLI 流程：restore 以脱敏文件为基底（而非原始文件），
+        金额等数值类单元格恢复 int/float 类型，身份证/银行卡等号码类保持文本。"""
+        import tempfile, os
+        from desensitize import read_text_from_file, write_desensitized_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '流水.xlsx')
+        wb = self._make_wb(src)
+        text = read_text_from_file(src)
+        res = self.d.mask(text)
+        masked = os.path.join(tmp, '流水_desensitized.xlsx')
+        write_desensitized_file(src, masked, res.text)
+        # 以脱敏文件为基底还原（与 desensitize.py restore 命令一致）
+        masked_text = read_text_from_file(masked)
+        restored = restore_text(masked_text, res.mapping)
+        out = os.path.join(tmp, '还原.xlsx')
+        write_desensitized_file(masked, out, restored, mappings=res.mapping)
+        got = self._read_cells(out)
+        ws = got['流水']
+        # 金额 float → 恢复为 float
+        self.assertIsInstance(ws[1][3], float)
+        self.assertEqual(ws[1][3], 392485911.675)
+        # 身份证号（号码类）保持文本
+        self.assertIsInstance(ws[1][1], str)
+        self.assertEqual(ws[1][1], '110101198001011232')
+        # 公司名恢复为文本原文
+        self.assertEqual(ws[2][0], '杭州鼎盛房地产开发有限公司')
+        # 公式仍保留
+        self.assertEqual(ws[2][1], '=SUM(D2:D2)')
+
+    def test_multisheet_consistency(self):
+        """公司全称与简称跨单元格/跨 sheet 统一占位符（EntityResolver 全文一致）。"""
+        import tempfile, os
+        from desensitize import read_text_from_file, write_desensitized_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '多表.xlsx')
+        wb = self._make_wb(src)
+        ws = wb.active
+        ws['A5'] = '上海宝冶集团有限公司'
+        ws['B5'] = '宝冶公司'          # 简称 → 应链接到全称同一占位符
+        wb.save(src)
+        text = read_text_from_file(src)
+        res = self.d.mask(text)
+        out = os.path.join(tmp, '多表_out.xlsx')
+        write_desensitized_file(src, out, res.text)
+        cells = self._read_cells(out)
+        a5 = cells['流水'][4][0]
+        b5 = cells['流水'][4][1]
+        self.assertTrue(a5.startswith('[公司') and a5.endswith(']'), a5)
+        self.assertEqual(a5, b5, '全称与简称应统一占位符')
+
+    def test_missing_dependency_graceful(self):
+        """openpyxl 缺失时优雅退出（给安装指引），而非崩溃。"""
+        import tempfile, os
+        from desensitize import read_text_from_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, 'x.xlsx')
+        with open(src, 'wb') as f:
+            f.write(b'PK\x03\x04')  # 最小 xlsx 头
+        import builtins
+        real_import = builtins.__import__
+        def fake_import(name, *a, **kw):
+            if name == 'openpyxl':
+                raise ImportError('No module named openpyxl')
+            return real_import(name, *a, **kw)
+        builtins.__import__ = fake_import
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                read_text_from_file(src)
+            self.assertIn('openpyxl', str(cm.exception))
+        finally:
+            builtins.__import__ = real_import
+
+    def test_macros_keep_vba(self):
+        """.xlsm 加载 keep_vba=True，宏不丢。"""
+        import tempfile, os
+        from desensitize import read_text_from_file, write_desensitized_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '宏.xlsm')
+        wb = self._make_wb(src)
+        wb.save(src)
+        text = read_text_from_file(src)
+        res = self.d.mask(text)
+        out = os.path.join(tmp, '宏_out.xlsm')
+        write_desensitized_file(src, out, res.text)
+        self.assertTrue(os.path.exists(out))
+        self.assertTrue(os.path.getsize(out) > 0)
+
+    def test_empty_workbook_no_crash(self):
+        import tempfile, os
+        from openpyxl import Workbook
+        from desensitize import read_text_from_file, write_desensitized_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '空.xlsx')
+        wb = Workbook()
+        wb.save(src)
+        text = read_text_from_file(src)
+        self.assertEqual(text, '')
+        res = self.d.mask(text)
+        out = os.path.join(tmp, '空_out.xlsx')
+        write_desensitized_file(src, out, res.text)
+        cells = self._read_cells(out)
+        # 空表不崩溃，sheet 仍存在，所有单元格为 None
+        self.assertIn('Sheet', cells)
+        self.assertTrue(all(v is None for row in cells['Sheet'] for v in row))
+
+    def test_phone_and_email_cell(self):
+        import tempfile, os
+        from desensitize import read_text_from_file, write_desensitized_file
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '联系.xlsx')
+        wb = self._make_wb(src)
+        wb.active['D5'] = '微信号：lawyer_wang'
+        wb.save(src)
+        text = read_text_from_file(src)
+        res = self.d.mask(text)
+        out = os.path.join(tmp, '联系_out.xlsx')
+        write_desensitized_file(src, out, res.text)
+        cells = self._read_cells(out)
+        self.assertEqual(cells['流水'][4][3], '微信号：[微信号]')
+
+
 if __name__ == '__main__':
     unittest.main()

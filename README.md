@@ -22,6 +22,8 @@
 >
 > **v2.6 新特性**：两阶段工作流（规则层关键信息必清 → `mask --review` 审阅清单 → Agent 语义层，无需外部 API）
 > **v2.1 新特性**：EntityResolver 实体归一化 | SecureDesensitizer 内存安全模式 | 零信任 AES-256-GCM 加密映射表 | 文件名自动脱敏
+>
+> **v3.3 新特性**：Excel（.xlsx / .xlsm）支持 — 单元格级脱敏（银行流水、证据清单、对账单），保留工作表/样式/合并/公式，restore 逐单元格还原（金额恢复数值类型）
 
 ## 快速体验（30 秒）
 
@@ -35,7 +37,7 @@ printf '原告：陈建国，男，身份证号110101198001011232，手机138001
 
 ## 功能
 
-一键脱敏法律文书中的敏感信息，支持 **.txt / .docx / .pdf** 三种格式：
+一键脱敏法律文书中的敏感信息，支持 **.txt / .docx / .pdf / .xlsx** 四种格式：
 
 | 数据类型 | 处理方式 |
 |---------|---------|
@@ -46,12 +48,13 @@ printf '原告：陈建国，男，身份证号110101198001011232，手机138001
 
 ```bash
 # 安装依赖
-pip install -r requirements.txt   # jieba 必装；docx/pdf/加密为可选
+pip install -r requirements.txt   # jieba 必装；docx/pdf/xlsx/加密为可选
 
 # 脱敏文件
 python desensitize.py mask -f 合同.docx
 python desensitize.py mask -f 证据.pdf
 python desensitize.py mask -f 文档.txt
+python desensitize.py mask -f 银行流水.xlsx
 
 # 从管道输入
 cat 文档.txt | python desensitize.py mask
@@ -74,6 +77,7 @@ python desensitize.py decrypt -f 映射表.enc -p "your-password"
 
 # v2.2 一键还原（庭审、归档需要原文时）
 python desensitize.py restore -f 脱敏后.docx -m 映射表.enc -p "your-password" -o 还原.docx
+python desensitize.py restore -f 脱敏后.xlsx -m 映射表.md -o 还原.xlsx
 
 # v2.2 红队评测（77 个用例，entity-level per-tag P/R/F1 + support）
 python3 evaluate.py --report 评测报告.md

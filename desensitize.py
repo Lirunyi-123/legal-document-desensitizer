@@ -2663,7 +2663,54 @@ def sanitize_filename(filepath: str) -> str:
 
 
 # ============================================================
-# 文件读取（支持 .txt / .docx / .pdf）
+# Excel 支持（.xlsx / .xlsm）— 单元格展平与回填
+# ============================================================
+
+# 单元格内换行标记：展平时把 \n 替换为此标记（单行文本），写回时还原。
+_XLSX_NEWLINE_MARK = '\u240a'  # ␊ (SYMBOL FOR LINE FEED)，正常文档几乎不会出现
+
+def _xlsx_cell_text(v):
+    """把单元格值转为参与脱敏的文本；返回 None 表示该单元格跳过。
+
+    跳过规则（读取与写回共用，保证行序一一对应）：
+    - None（空单元格 / 合并区非左上角）
+    - 公式（str 以 '=' 开头）——公式是结构不是内容，误替换会毁掉计算
+    - 布尔 / 日期时间——保持原样与格式，不参与脱敏
+    数值：整数值转干净整数文本（12345678.0 → '12345678'），便于金额规则匹配。
+    """
+    import datetime as _dt
+    if v is None:
+        return None
+    if isinstance(v, str) and v.startswith('='):
+        return None
+    if isinstance(v, bool) or isinstance(v, (_dt.datetime, _dt.date, _dt.time)):
+        return None
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _iter_xlsx_lines(filepath: str):
+    """按 工作表顺序 → 行序 → 列序 产出参与脱敏的单元格文本行（与写回同一顺序）。"""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        sys.exit('❌ 需要安装 openpyxl: pip3 install openpyxl')
+    wb = load_workbook(filepath, data_only=False)
+    try:
+        for sheet in wb.worksheets:
+            for row in sheet.iter_rows():
+                for cell in row:
+                    s = _xlsx_cell_text(cell.value)
+                    if s is None:
+                        continue
+                    yield s.replace('\n', _XLSX_NEWLINE_MARK)
+    finally:
+        wb.close()
+
+
+# ============================================================
+# 文件读取（支持 .txt / .docx / .pdf / .xlsx）
 # ============================================================
 
 def read_text_from_file(filepath: str) -> str:
@@ -2705,6 +2752,10 @@ def read_text_from_file(filepath: str) -> str:
         doc.close()
         return '\n\n'.join(pages)
 
+    elif ext == '.xlsx' or ext == '.xlsm':
+        # Excel：每个参与脱敏的单元格为一行，行序与 write_desensitized_file 回填一致
+        return '\n'.join(_iter_xlsx_lines(filepath))
+
     else:
         # 当作纯文本尝试
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -2712,11 +2763,38 @@ def read_text_from_file(filepath: str) -> str:
 
 
 # ============================================================
-# 文件写入（保留原格式 .txt → .txt, .docx → .docx）
+# 文件写入（保留原格式 .txt → .txt, .docx → .docx, .xlsx → .xlsx）
 # ============================================================
 
-def write_desensitized_file(input_path: str, output_path: str, masked_text: str):
-    """将脱敏后的文本写出，尽量保留原文件格式"""
+# 纯数字但必须保持文本的类型（还原时不做数值类型恢复）：
+# 身份证/银行卡/手机号/证件号等号码类即使全数字也是文本。
+_TEXT_NUMERIC_AS_TEXT_TYPES = (
+    '身份证', '手机', '固定电话', '银行账号', '信用代码', '组织机构代码',
+    '执业证', '案号', '微信号', 'QQ', '地块', '车牌', '许可证',
+    '通行证', '护照', '驾驶证', '证件', '罚没',
+)
+
+def _coerce_restored_numeric(text: str, mapping_type: str):
+    """restore 场景：还原文本是纯数字且类型非号码/证件类 → 恢复为数值类型。
+
+    返回 int / float / None（None 表示保持文本）。
+    """
+    if mapping_type and any(k in mapping_type for k in _TEXT_NUMERIC_AS_TEXT_TYPES):
+        return None
+    if re.fullmatch(r'-?\d+', text):
+        return int(text)
+    if re.fullmatch(r'-?\d+\.\d+', text):
+        return float(text)
+    return None
+
+
+def write_desensitized_file(input_path: str, output_path: str, masked_text: str,
+                            mappings: Optional[List[Mapping]] = None):
+    """将脱敏后的文本写出，尽量保留原文件格式。
+
+    mappings：可选，restore 场景传入映射表，用于 xlsx 数值单元格类型恢复
+    （金额等数值类还原为 int/float；身份证/银行卡等号码类保持文本）。
+    """
     in_ext = os.path.splitext(input_path)[1].lower()
     out_ext = os.path.splitext(output_path)[1].lower()
 
@@ -2782,6 +2860,66 @@ def write_desensitized_file(input_path: str, output_path: str, masked_text: str)
 
         # 设置文件权限
         orig_doc.save(output_path)
+        try:
+            os.chmod(output_path, 0o600)  # 仅当前用户可读写
+        except Exception:
+            pass
+        return output_path
+
+    elif out_ext == '.xlsx' or out_ext == '.xlsm' or (out_ext == '' and in_ext in ('.xlsx', '.xlsm')):
+        # 输出为 Excel：基于原文件按行回填单元格，保留工作表/样式/合并/公式
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            sys.exit('❌ 需要安装 openpyxl: pip3 install openpyxl')
+
+        keep_vba = (in_ext == '.xlsm' or out_ext == '.xlsm')
+        orig_wb = load_workbook(input_path, data_only=False, keep_vba=keep_vba)
+        lines = masked_text.split('\n')
+        # restore 场景：replacement → Mapping 查表（用于数值类型恢复）
+        repl_map = {}
+        if mappings:
+            for m in mappings:
+                repl_map.setdefault(m.replacement, m)
+        try:
+            idx = 0
+            for sheet in orig_wb.worksheets:
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        s = _xlsx_cell_text(cell.value)
+                        if s is None:
+                            continue  # 与读取跳过规则一致，保持行序对齐
+                        if idx < len(lines):
+                            new_text = lines[idx]
+                            if new_text != s:
+                                # 仅当脱敏引擎实际改动过该单元格才回写；
+                                # 未改动保持原值（数值/日期类型与格式原样保留，
+                                # restore 后 float/int 可逐字节还原）
+                                cell.value = new_text.replace(_XLSX_NEWLINE_MARK, '\n')
+                                # restore 场景：按映射表恢复数值类型
+                                # （金额等 → int/float；身份证/银行卡等号码类保持文本）
+                                m = repl_map.get(s)
+                                if m is not None:
+                                    num = _coerce_restored_numeric(cell.value, m.type)
+                                    if num is not None:
+                                        cell.value = num
+                            idx += 1
+            orig_wb.save(output_path)
+        finally:
+            orig_wb.close()
+
+        # 清理工作簿核心元数据
+        try:
+            props = orig_wb.properties
+            props.creator = ''
+            props.lastModifiedBy = ''
+            props.category = ''
+            props.description = ''
+            props.keywords = ''
+            props.title = ''
+            props.subject = ''
+        except Exception:
+            pass
         try:
             os.chmod(output_path, 0o600)  # 仅当前用户可读写
         except Exception:
@@ -3612,7 +3750,7 @@ def main():
 
         restored = restore_text(masked_text, mappings)
         if args.output:
-            write_desensitized_file(args.file, args.output, restored)
+            write_desensitized_file(args.file, args.output, restored, mappings=mappings)
             print(f'✅ 已还原 {len(mappings)} 个映射条目，保存至: {args.output}')
         else:
             print(restored)

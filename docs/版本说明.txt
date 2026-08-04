@@ -1,3 +1,59 @@
+# 法律文书脱敏工具 v3.3 版本说明
+
+## 版本号
+v3.3 — Excel（.xlsx / .xlsm）支持：银行流水、证据清单、对账单单元格级脱敏
+
+## 背景
+律师处理证据材料时高频遇到 Excel 格式（银行流水、对账单、证据清单、往来明细），
+原工具仅支持 .txt / .docx / .pdf。本次新增 .xlsx / .xlsm 完整支持：
+mask / scan / restore / full / semantic 五个子命令全部自动获得 Excel 能力
+（它们都走 read_text_from_file + write_desensitized_file 两个公共入口）。
+
+## 方案（复用 docx 的"行序映射"架构）
+- 读取：按 工作表顺序 → 行序 → 列序 把每个参与脱敏的单元格展平为一行文本；
+  单元格内换行用 ␊（U+240A）标记占位，写回时还原，保证一行 ↔ 一单元格。
+- 跳过规则（读取与写回共用 _xlsx_cell_text，行序严格一一对应）：
+  - None（空单元格 / 合并区非左上角）
+  - 公式（str 以 '=' 开头）——公式是结构不是内容，误替换会毁掉计算
+  - 日期时间、布尔单元格——保持原样与格式，不参与脱敏
+  - 数值（int/float）：整数值转干净整数文本（880000.0 → '880000'），
+    便于金额规则匹配
+- 写回：仅当脱敏引擎实际改动过该单元格才回写；未改动保持原值
+  （数值/日期类型与格式原样保留）。keep_vba=True 支持 .xlsm 宏不丢。
+  保存后 chmod 0o600（仅当前用户可读写）。
+- 还原（restore）：restore 以**脱敏文件**为基底时（CLI 真实用法），
+  按映射表恢复数值类型——_coerce_restored_numeric 把金额等数值类还原为
+  int/float；身份证/银行卡/手机号/证件号等号码类（_TEXT_NUMERIC_AS_TEXT_TYPES
+  黑名单）即使全数字也保持文本，避免账号被转成数值/科学计数法。
+
+## 修复的过程问题
+- CLI 端到端首次验证发现：restore 以脱敏文件为基底时金额 float 还原成 str
+  （类型丢失）。修复：write_desensitized_file 新增 mappings 参数，
+  restore 命令传入，按映射表类型恢复数值。函数级冒烟（基底=原文件）本就
+  通过，但 CLI 真实用法（基底=脱敏文件）需此修复。
+
+## 回归
+- 单测 110 → 120（新增 TestExcelSupport 10 个：展平顺序/写回单元格级/公式保留/
+  往返还原含类型/CLI 风格 restore 类型恢复/多表统一占位符/依赖缺失优雅退出/
+  宏保留/空表不崩溃/微信号单元格）
+- 红队语料 89 条：105 项命中（MICRO/MACRO 全 1.0000）、误报 0，规则层无回归
+- CLI 端到端冒烟（银行流水.xlsx）：mask 正确脱敏 [身份证号]/[手机号]/[金额]/
+  [公司_1]/[地址]/[邮箱]，公式 =SUM 保留、合并区保留、单元格内换行还原；
+  restore 往返逐单元格一致（金额恢复 float 392485911.675、账号保持 str）
+
+## 使用
+```bash
+pip3 install openpyxl
+python3 desensitize.py mask -f 银行流水.xlsx --save-mapping 映射表.md
+python3 desensitize.py restore -f 银行流水_desensitized.xlsx -m 映射表.md -o 还原.xlsx
+```
+
+## 已知边界（v1）
+- 老式 .xls（Excel 97-2003）不支持，请另存为 .xlsx 再处理
+- 批注/超链接文本不处理（openpyxl 写回会丢失批注作者/时间戳等元信息）
+- 公式单元格不脱敏（二期可考虑字符串常量）
+
+---
 # 法律文书脱敏工具 v3.2 版本说明
 
 ## 版本号

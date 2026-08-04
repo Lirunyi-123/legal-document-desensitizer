@@ -78,12 +78,16 @@ def unit_tests():
 def redteam_eval():
     p = run([sys.executable, 'evaluate.py'])
     fail_m = re.search(r'失败: (\d+)', p.stdout)
-    recall_m = re.search(r'召回率 (\d+\.?\d*)%', p.stdout)
-    if not fail_m or not recall_m:
+    hit_m = re.search(r'正样本\(expect_masked\): (\d+) 项，命中 (\d+) 项', p.stdout)
+    kept_m = re.search(r'误替换 (\d+) 项', p.stdout)
+    if not fail_m or not hit_m:
         return (False, f'无法解析评测输出：\n{p.stdout[-500:]}')
-    failures, recall = int(fail_m.group(1)), float(recall_m.group(1))
-    return (failures == 0 and recall == 100.0,
-            f'{failures} 失败，结构化召回率 {recall:.1f}%')
+    failures = int(fail_m.group(1))
+    total, hit = int(hit_m.group(1)), int(hit_m.group(2))
+    kept_fail = int(kept_m.group(1)) if kept_m else -1
+    recall = hit / total if total else 1.0
+    ok = failures == 0 and kept_fail == 0
+    return (ok, f'{failures} 失败，召回率 {recall:.1%}，误替换 {kept_fail}')
 
 
 def restore_roundtrip():
@@ -175,8 +179,8 @@ def main():
     for name, fn in [
         ('必要文件齐全', required_files),
         ('模块导入', imports_ok),
-        ('单元测试(54项)', unit_tests),
-        ('红队评测(51用例)', redteam_eval),
+        ('单元测试', unit_tests),
+        ('红队评测', redteam_eval),
         ('mask→restore 往返', restore_roundtrip),
         ('本地LLM二轮脱敏', lambda: llm_layer(args)),
         ('可选依赖', optional_deps),

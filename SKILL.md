@@ -155,6 +155,63 @@ python3 desensitize.py restore -f 判决书_desensitized.docx -m 映射表.md -o
 - 红队语料 65 → **77**（新增 12 条，含负样本），全量通过、误报 0。
 - 三份训练语料 `mask --review`：关键信息 0 残留、还原往返逐字节一致。
 
+## v3.0 内化 rizzo-pii 五大优点（合成语料 + validated + PDF 涂黑 + 还原漂移 + 评测口径）
+
+参照开源项目 [Rizzo-AI-Academy/rizzo-pii](https://github.com/Rizzo-AI-Academy/rizzo-pii.git)
+（意大利语 PII 脱敏，LLM 写模板 + 代码注入校验值的合成语料管线），把五个优点内化到本工具：
+
+### 1. 合成语料管线 `synthetic/`（最大亮点：LLM 写模板、代码注入校验值）
+- **原则**：LLM 只写法律文书的 prose（民事判决书/行政处罚决定书/合同/调解书/聊天记录…），
+  且只能使用白名单占位符 `{当事人甲}` `{身份证}` `{银行账号}`…；真正的号码由
+  `generate_synthetic_pii.py` 用**代码**生成数学上合法的值（身份证 GB 11643-1999、
+  信用代码 GB 32100-2015、银行卡 Luhn），BIO 标注天然精确、LLM 永不产出真实 PII。
+- `synthetic/llm_template_bank.py`：让 LLM（OpenAI 兼容，本地 Ollama 或云端）写模板，
+  带 **QA 门控**（find_stray_names）：占位符外若夹带"原告王某某"式姓名 → 整条丢弃。
+  不接 LLM 也能用（内置 11 个模板兜底）。
+- `python3 synthetic/generate_synthetic_pii.py -n 300` → `测试/合成语料.jsonl`
+  （自动填好 expect_masked/expect_kept，直接喂 evaluate.py）；`--bio` 同时输出
+  BIO 训练语料。实测 300 条合成语料规则层召回率 99.76%、precision 1.0、误报 0。
+- 合成语料驱动修复了 4 个规则层**真实盲区**：角色词"被告人/被申请人/当事人/经营者"
+  缺失、"25日在安徽省…"地址吞日期、jieba 把"荣墨军称"切成"荣墨"+"军称"、
+  3/4 字人名形态。
+
+### 2. 校验码 strict/lenient 双档 + validated 标记（映射表"验证"列）
+- 统一检测器表语义：`strict=True`（形状泛，校验不过即丢弃：无标签身份证）、
+  `strict=False`（形状特异/标签权威，校验不过也脱敏，宁替勿漏：裸银行卡、信用代码）。
+- 每条映射带 `validated` 算法验证标记，映射表 Markdown 新增**"验证"列**：
+  `✓`=校验码通过（GB11643/GB32100/Luhn），`—`=仅格式/标签命中。
+  律师一眼看出"哪条是算法验证过的"。`scan` 输出也带 validated/strict。
+
+### 3. PDF 真·涂黑脱敏（保留版式，带 residual 零残留校验）`pdf_redact.py`
+- `mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.pdf`（或 -o 指定 .pdf 自动启用）。
+  字符级精确匹配（每字符 bbox）、容忍 OCR 空格/换行（"汪 瑜"、"审 判 员"）、
+  数字/字母值带词边界；长值先涂 + 已涂矩形跳过，防止"张三"破坏"张三丰"。
+- 连带清理元数据/XMP、批注、表单字段、书签、内嵌附件。
+- **安全语义**：输出后 residual 校验（原文仍可读 → 拒绝交付）；整份 PDF 零命中
+  （扫描件文字在图片里）→ 报错，绝不交付"假脱敏"PDF；过短值跳过并警告。
+
+### 4. 还原容忍 markdown 漂移（`restore_text`）
+- 占位符按键长倒序 + 正则 `\**\[?\s*占位符\s*\]?\**`：AI 回复把
+  `[当事人甲（原告）]` 改成 `**当事人甲（原告）**`、丢括号、加多余空格都能无损还原。
+- 先精确（带括号）后宽松两遍防"语义 inner 词撞上下文前缀"（"总金额[金额]"不误吞）；
+  精确/漂移混用时按原文顺序配对，空格不丢失。
+
+### 5. 评测口径升级：entity-level per-tag P/R/F1 + support（`evaluate.py`）
+- 正样本=expect_masked（命中=TP、漏=FN）；**负样本=expect_kept（误替换=FP）**。
+- 分类型 precision/recall/F1 + support，外加 MICRO（总体）与 MACRO（类型平均）——
+  规则层最怕误伤，precision/F1 才是"改保守了还是改漏了"的量化指标。
+- 每次改规则后：`python3 evaluate.py`（原语料）+ `python3 evaluate.py -c 测试/合成语料.jsonl`
+  （合成语料）双基线对比。
+
+### 验证方法（v3.0 起）
+```bash
+python3 -m unittest test_desensitize     # 94 个单测（v2.8 74 + v3.0 20）
+python3 evaluate.py                      # 77 条红队用例（100% 召回、误报 0）
+python3 synthetic/generate_synthetic_pii.py -n 120
+python3 evaluate.py -c 测试/合成语料.jsonl   # 合成语料基线（99%+ 召回、误报 0）
+python3 desensitize.py mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.pdf
+```
+
 ## 输入
 
 接受以下格式的文档内容（粘贴或文件路径）：
@@ -165,7 +222,8 @@ python3 desensitize.py restore -f 判决书_desensitized.docx -m 映射表.md -o
 **输入格式保留规则**：
 - `.txt` 输入 → `.txt` 输出
 - `.docx` 输入 → `.docx` 输出（保留段落结构）
-- `.pdf` 输入 → `.txt` 输出（PDF格式保留较复杂，当前输出为纯文本）
+- `.pdf` 输入 → 默认 `.txt` 输出；**v3.0 起可用 `--pdf-redact` 输出"真·涂黑"PDF**
+  （保留版式，见下方 v3.0 章节第 3 点）
 - 未指定输出路径时，自动在原文件同目录生成 `原文件名_desensitized.扩展名`
 
 使用示例：
@@ -177,6 +235,9 @@ python3 desensitize.py mask -f 聊天记录.txt  # → 聊天记录_desensitized
 
 # 指定输出文件
 python3 desensitize.py mask -f 证据.pdf -o 脱敏后.txt
+
+# v3.0：PDF 真·涂黑脱敏（保留版式，输出涂黑+占位符的 PDF）
+python3 desensitize.py mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.pdf
 ```
 
 ## 输出
@@ -331,6 +392,15 @@ python3 desensitize.py mask -f 证据.pdf -o 脱敏后.txt
 - **银行卡号**：Luhn 算法
 - `scan` 输出 `confidence` 字段：校验码通过=1.0，仅格式相似=0.5~0.6
 
+**v3.0 补充：strict/lenient 双档 + validated 标记**
+- 统一检测器表语义：`strict=True` = 形状太泛，校验不过即丢弃（无标签身份证）；
+  `strict=False` = 形状特异/标签权威，校验不过也脱敏，宁替勿漏（带标签身份证、
+  银行卡、信用代码裸号）——只影响**标注**，不改变既有替换行为
+- 每条映射带 `validated` 算法验证标记，映射表 Markdown 新增**"验证"列**：
+  `✓` = 校验码算法通过（GB11643/GB32100/Luhn），`—` = 仅格式/标签命中。
+  律师一眼看出"哪条是算法验证过的、哪条只是格式命中"
+- `scan` 输出同步带 `validated` / `strict` 字段
+
 ## v2.2 一键还原 restore
 
 律师庭审、归档、复核时需要原文时，用映射表把脱敏文本无损还原：
@@ -347,15 +417,31 @@ python3 desensitize.py restore -f 起诉状_desensitized.docx -m 映射表.enc -
 还原与原文逐字节一致（已覆盖：多个同类型占位符、上下文日期"1980年1月1日出生"、
 无分隔符人名"原告陈建国"、地址前缀等边界）。
 
+**v3.0 补充：容忍 markdown 漂移（AI 回复改格式也能无损还原）**
+- 占位符按键长倒序 + 正则 `\**\[?\s*占位符\s*\]?\**`：AI 把 `[当事人甲（原告）]`
+  改成 `**当事人甲（原告）**`、丢掉方括号、加多余空格，restore 都能无损还原
+- 先精确（带括号）后宽松两遍，防"语义 inner 词撞上下文前缀"（"总金额[金额]"不误吞）；
+  精确/漂移混用时按原文顺序配对，首尾空格保留
+
 ## v2.2 红队评测 evaluate（量化可信度）
 
 ```bash
-python3 evaluate.py                          # 43 个用例，分类型召回率
+python3 evaluate.py                          # 77 个用例，per-tag P/R/F1 + support
+python3 evaluate.py -c 测试/合成语料.jsonl    # v3.0：合成语料基线（数百条，自动标注期望）
 python3 evaluate.py --report 评测报告.md      # 输出 Markdown 报告
 ```
 
-语料库：`测试/红队语料库.jsonl`（19 类结构化数据 + 负样本，可自行增删）。
+语料库：`测试/红队语料库.jsonl`（19 类结构化数据 + 负样本，可自行增删）；
+v3.0 起可用 `python3 synthetic/generate_synthetic_pii.py -n 300` 生成
+`测试/合成语料.jsonl`（合法校验值 + 自动填期望），把语料扩到数百条。
 每次修改规则后运行一次，作为质量回归基线。
+
+**v3.0 补充：评测口径升级为 entity-level per-tag P/R/F1 + support**
+- 正样本 = `expect_masked`（命中=TP、漏=FN）；**负样本 = `expect_kept`（误替换=FP）**
+- 分类型 precision / recall / F1 + support（样本数），外加 MICRO（总体）
+  与 MACRO（类型平均）汇总——规则层最怕误伤，precision/F1 才是
+  "改保守了还是改漏了"的量化指标；每次改规则跑双基线对比
+- 实测基线：红队 77 条 100% 召回、误报 0；合成语料 300 条召回 99.76%、precision 1.0
 
 ## v2.2 本地 NER 层（可选）
 

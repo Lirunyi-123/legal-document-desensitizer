@@ -75,8 +75,15 @@ python desensitize.py decrypt -f 映射表.enc -p "your-password"
 # v2.2 一键还原（庭审、归档需要原文时）
 python desensitize.py restore -f 脱敏后.docx -m 映射表.enc -p "your-password" -o 还原.docx
 
-# v2.2 红队评测（43 个用例，输出分类型召回率）
+# v2.2 红队评测（77 个用例，entity-level per-tag P/R/F1 + support）
 python3 evaluate.py --report 评测报告.md
+
+# v3.0 合成语料管线（LLM 写模板 + 代码注入合法校验值，自动填期望）
+python3 synthetic/generate_synthetic_pii.py -n 300        # → 测试/合成语料.jsonl
+python3 evaluate.py -c 测试/合成语料.jsonl                # 合成语料基线（数百条）
+
+# v3.0 PDF 真·涂黑脱敏（保留版式；residual 零残留校验）
+python desensitize.py mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.pdf
 
 # v2.2 本地 NER 层（可选：spaCy / HuggingFace / 本地 Ollama）
 python desensitize.py mask -f 合同.docx --ner-backend spacy --ner-model zh_core_web_trf
@@ -106,6 +113,30 @@ spaCy（zh_core_web_trf）| HuggingFace（bert 系中文 NER）| 本地 Ollama�
 
 ### LLM层（5类）
 自然人姓名、公司/机构名称、地址信息、金额、敏感案情细节（通过 `llm-prompt` 生成提示词）
+
+## v3.0 内化 rizzo-pii 五大优点（2026-08）
+
+参照开源项目 [Rizzo-AI-Academy/rizzo-pii](https://github.com/Rizzo-AI-Academy/rizzo-pii.git)
+（LLM 写模板 + 代码注入校验值的合成语料管线），五个优点全部内化：
+
+1. **合成语料管线 `synthetic/`**：LLM（OpenAI 兼容，本地/云端）写中文法律文书模板，
+   只允许白名单占位符 `{当事人甲}` `{身份证}`…；`generate_synthetic_pii.py` 用代码
+   注入数学上合法的号码（身份证 GB 11643、信用代码 GB 32100、银行卡 Luhn），
+   自动填 `expect_masked/expect_kept` 输出红队语料（`--bio` 可输出 BIO 训练语料）。
+   QA 门控 `find_stray_names` 丢弃占位符外夹带姓名的模板。
+2. **校验码 strict/lenient 双档 + validated 标记**：映射表新增"验证"列
+   `✓`（校验码通过）/`—`（仅格式命中），律师一眼看出哪条是算法验证过的。
+3. **PDF 真·涂黑脱敏 `pdf_redact.py`**：`mask -f x.pdf --pdf-redact -o x_redacted.pdf`，
+   字符级匹配 + OCR 空格容忍 + 值长优先防误涂；清元数据/批注/表单/书签/附件；
+   residual 零残留校验，零命中（扫描件）拒绝交付。
+4. **还原容忍 markdown 漂移**：AI 把 `[当事人甲（原告）]` 改成 `**当事人甲（原告）**`、
+   丢括号、加空格，restore 都能无损还原（精确/漂移混用按原文顺序配对）。
+5. **评测口径升级**：entity-level per-tag **P/R/F1 + support**（MICRO/MACRO），
+   `expect_kept` 作负样本计 FP。
+
+基线：94 个单测全过；红队 77 条 100% 召回误报 0；合成语料 300 条召回 99.76%、
+precision 1.0；三份真实训练语料还原往返逐字节一致。详见 `SKILL.md` v3.0 章节与
+`docs/版本说明.txt`。
 
 ## v2.3 完整脱敏流水线 full
 
@@ -221,16 +252,22 @@ python desensitize.py restore -f 起诉状_desensitized.docx -m 映射表.enc -o
 往返还原与原文逐字节一致（含"1980年1月1日出生"这类上下文、无分隔符人名等边界）。
 
 ### 红队评测 evaluate
-`测试/红队语料库.jsonl` 内置 43 个用例（19 类结构化数据 + 负样本），量化规则层表现：
+`测试/红队语料库.jsonl` 内置 77 个用例（19 类结构化数据 + 负样本），量化规则层表现；
+v3.0 起 `python3 synthetic/generate_synthetic_pii.py -n 300` 可生成数百条
+`测试/合成语料.jsonl`（身份证/信用代码/银行卡等号码构造上合法，期望自动标注）：
 
 ```bash
 python3 evaluate.py                          # 控制台报告
+python3 evaluate.py -c 测试/合成语料.jsonl    # 合成语料基线
 python3 evaluate.py --report 评测报告.md      # Markdown 报告
 python3 evaluate.py --json 结果.json          # JSON 结果
 ```
 
-当前基线（v2.2）：**43/43 用例通过，结构化召回率 100%，保留项误报 0，泄露 0**。
-语料库可自行增删用例，作为脱敏质量回归基线——每次改动规则后跑一遍即可量化"有没有变差"。
+当前基线（v3.0）：红队 **77/77 用例通过，100% 召回，误报 0，泄露 0**；
+合成语料 300 条**召回 99.76%、precision 1.0、误报 0**。
+评测口径为 entity-level per-tag **precision / recall / F1 + support**（外加 MICRO/MACRO），
+`expect_kept` 作负样本计 FP——规则层最怕误伤，precision/F1 才是"改保守了还是改漏了"
+的量化指标。语料库可自行增删用例，作为脱敏质量回归基线。
 
 ### 本地 NER 接入
 ```bash

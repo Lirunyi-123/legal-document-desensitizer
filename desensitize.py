@@ -40,10 +40,12 @@ class Mapping:
     type: str           # 类型：身份证号、手机号、人名、公司名、地址、案号...
     count: int = 1      # 出现次数
     order: int = 0      # 首次出现顺序（用于还原时按原文顺序配对）
+    validated: bool = False  # 算法验证标记：校验码（GB11643/GB32100/Luhn）通过=True
 
     def to_dict(self):
         return {'original': self.original, 'replacement': self.replacement,
-                'type': self.type, 'count': self.count, 'order': self.order}
+                'type': self.type, 'count': self.count, 'order': self.order,
+                'validated': self.validated}
 
 
 @dataclass
@@ -65,12 +67,14 @@ class MaskResult:
         lines = [
             "# 脱敏映射表",
             "",
-            "| 序号 | 原始值 | 替换值 | 类型 | 出现次数 |",
-            "|------|--------|--------|------|---------|",
+            "| 序号 | 原始值 | 替换值 | 类型 | 出现次数 | 验证 |",
+            "|------|--------|--------|------|---------|------|",
         ]
         for i, m in enumerate(sorted(self.mapping, key=lambda m: m.order), 1):
             # 单元格不再填充空格，保证带首尾空格的原始值可逐字节还原
-            lines.append(f"|{i}|{m.original}|{m.replacement}|{m.type}|{m.count}|")
+            # v3.0：validated=True → "✓"（校验码算法验证通过），否则 "—"（仅格式/标签命中）
+            mark = '✓' if m.validated else '—'
+            lines.append(f"|{i}|{m.original}|{m.replacement}|{m.type}|{m.count}|{mark}|")
 
         lines.extend(["", "", "## 统计", ""])
         for k, v in sorted(self.stats.items()):
@@ -155,6 +159,21 @@ def _luhn_check(value: str) -> bool:
                 n -= 9
         total += n
     return total % 10 == 0
+
+
+def _auto_validated(typ: str, value: str) -> bool:
+    """算法验证标记（v3.0，内化自 rizzo-pii 的 validated 语义）：
+    只有带校验码的号码类型才有"算法验证通过"一说——校验码（GB 11643 身份证、
+    GB 32100 信用代码、Luhn 银行卡）验证通过 → True；其余类型（人名/公司/地址/
+    金额/案号等）无校验码，恒为 False（"—"）。
+    """
+    if typ == '身份证号':
+        return _is_valid_id_checksum(value)
+    if typ == '统一社会信用代码':
+        return _is_valid_credit_code(value)
+    if typ == '银行账号':
+        return _luhn_check(value)
+    return False
 
 
 # 带上下文的规则：前缀组保留原文，目标值进入映射表
@@ -437,13 +456,40 @@ def _spaced_re(seq: str) -> str:
 
 # 角色词（含 OCR 行内空格写法："审 判 员"、"法 定代表人"）
 _ROLE_WORDS = (
-    '原告', '被告', '上诉人', '被上诉人', '第三人', '申请执行人', '被执行人',
+    '原告', '被告人', '被告', '被申请人', '申请人', '上诉人', '被上诉人', '第三人', '申请执行人', '被执行人',
     '案外人', '证人', '担保人', '出借人', '借款人', '收款人', '付款人', '发包人',
     '承包人', '分包人', '代建人', '联系人', '工作人员', '物业人员', '项目经理',
     '财务人员', '会计', '出纳', '委托诉讼代理人', '委托代理人', '法定代表人',
-    '法定代理人', '负责人', '审判员', '审判长', '代理审判员', '代理审判长',
+    '法定代理人', '负责人', '当事人', '经营者', '审判员', '审判长', '代理审判员', '代理审判长',
     '人民陪审员', '书记员',
 )
+
+# ============================================================
+# 地址子模式（mask 的 _mask_address 与 scan 的 _get_all_rules 共用同一份，
+# 保证"扫描报告 = 脱敏行为"完全一致——SKILL.md 明确要求两者正则一致）
+# ============================================================
+# v3.0：省/市/小区/路街前缀排除日期尾字（"日月年号"），修复"25日在安徽省…"
+#       地址规则吞"日"、破坏前文普通日期的真实缺陷
+_ADDR_PROV = (r'(?:(?![日月年号])[\u4e00-\u9fa5]){1,3}(?:省|自治区)'
+              r'[\u4e00-\u9fa5 ]{1,10}(?:市|县|区|镇)'
+              r'[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)'
+              r'[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)')
+_ADDR_PREFIX = r'(户籍所在地|户籍地|户籍|住所地|住所|住址|居住地|居住|现住|家住|住|地址|位于)'
+# 5 个子模式（与 _mask_address 的执行顺序逐条对应）
+_ADDR_PATTERNS = [
+    # 1) 前缀词 + 省级地址（group(1)=前缀词, group(2)=地址）
+    _ADDR_PREFIX + r'[：:]?\s*(' + _ADDR_PROV + ')',
+    # 2) 独立省级地址（前非汉字）
+    r'(?<![\u4e00-\u9fa5])(' + _ADDR_PROV + ')',
+    # 3) 独立城市级地址（市/区开头 + 详细到路/街/号）
+    r'((?:(?![日月年号])[\u4e00-\u9fa5]){2,8}(?:市|区|县|镇)[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?)',
+    # 4) 无省市区层级：小区/花园/…/片 + 号/栋/室/片
+    r'((?:(?![日月年号])[\u4e00-\u9fa5]){2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区|片)[\u4e00-\u9fa5\d\- ]{0,12}(?:号|栋|幢|单元|室|楼|座|层|片|里))',
+    # 5) 路/街/大道/巷 + 门牌号
+    r'((?:(?![日月年号])[\u4e00-\u9fa5]){2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|弄|栋|幢|单元|室|楼|座))',
+]
+_ADDR_JOINED = '|'.join(_ADDR_PATTERNS)
+
 # 角色词后姓名：允许姓名内部带 OCR 空格（"汪 瑜"），容忍 2~4 个汉字
 _ROLE_NAME_RE = r'([\u4e00-\u9fa5](?:[ \t]*[\u4e00-\u9fa5]){1,3})'
 _ROLE_PATTERN = re.compile(
@@ -878,6 +924,10 @@ class Desensitizer:
         stats['总脱敏项数'] = len(self._replaced)
         stats['总替换次数'] = sum(m.count for m in mapping)
 
+        # v3.0：每条映射打上 validated 算法验证标记（校验码通过 ✓ / 仅格式命中 —）
+        for m in mapping:
+            m.validated = _auto_validated(m.type, m.original)
+
         return MaskResult(text=text, mapping=mapping, stats=stats)
 
     def _build_event_mapping(self) -> list:
@@ -1134,6 +1184,9 @@ class Desensitizer:
                     'start': match.start(),
                     'end': match.end(),
                     'confidence': confidence,
+                    # v3.0：validated=算法校验码通过；strict=形状泛、校验不过即丢弃
+                    'validated': _auto_validated(rule_name, value),
+                    'strict': bool(rule.get('strict')),
                 })
         # 重叠去重：同一区间/交叉区间保留置信度最高者（如身份证 vs 银行卡）
         findings.sort(key=lambda f: (f['start'], -f['confidence'], -f['end']))
@@ -1804,20 +1857,36 @@ class Desensitizer:
                     and token_at.get(start + len(surname)) == given):
                 return True
         # 4) v2.8 单姓+名被 jieba 切成两词："李"+"磊磊"、"张"+"先政"
+        # v3.0：名 token 可能带尾动词（"艳称"= 名"艳"+动词"称"），
+        #       startswith + 剩余部分为动词 → 放行（修复"荣墨军称"类盲区）
         if len(surname) == 1:
             given = cand[len(surname):]
+            tok2 = token_at.get(start + len(surname))
             if (token_at.get(start) == surname
-                    and token_at.get(start + len(surname)) == given
+                    and tok2
+                    and (tok2 == given
+                         or (tok2.startswith(given)
+                             and tok2[len(given):]
+                             and all(c in _NAME_CONTEXT_AFTER
+                                     for c in tok2[len(given):])))
                     # 名是"本院/当日"这类指示/时间词 → 不是姓名
                     and given[0] not in '本该此其当今日时前后上下今昨明去年月周天内中里处近常每各这那几诸余数多少全半初末期'
                     and given not in ('本院', '当日', '本日', '当天', '当天', '今天',
                                        '昨天', '明天', '今年', '去年', '明年', '本月',
                                        '上月', '本周', '上周')):
                 return True
-            # 5) jieba 把"姓+名"切在名中间："曹先"+"银"（真实名"曹先银"）
+            # 5) jieba 把"姓+名"切在名中间："曹先"+"银"（真实名"曹先银"）；
+            #    v3.0 同样容忍名 token 带尾动词（"祖远"+"平称"→"祖远平"+"称"）
             if len(cand) == 3:
-                if (token_at.get(start) == cand[:2]
-                        and token_at.get(start + 2) == cand[2:]
+                tok1 = token_at.get(start)
+                tok2b = token_at.get(start + 2)
+                if (tok1 == cand[:2]
+                        and tok2b
+                        and (tok2b == cand[2:]
+                             or (tok2b.startswith(cand[2:])
+                                 and tok2b[len(cand[2:]):]
+                                 and all(c in _NAME_CONTEXT_AFTER
+                                         for c in tok2b[len(cand[2:]):])))
                         # 尾部是动词/虚词（"万元给""张旭到"）→ 不是姓名
                         and cand[2] not in _NAME_CONTEXT_AFTER
                         and cand[2] not in _NAME_GLUE_CHARS):
@@ -1987,14 +2056,9 @@ class Desensitizer:
             return addr_replacer
 
         # 1) 前缀词 + 省级地址（含"住/现住/户籍地"等，容忍 省→市/县 直连）
-        _ADDR_PROV = (r'[\u4e00-\u9fa5]{1,3}(?:省|自治区)'
-                      r'[\u4e00-\u9fa5 ]{1,10}(?:市|县|区|镇)'
-                      r'[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)'
-                      r'[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)')
         r1 = make_replacer()
         text = re.sub(
-            r'(户籍所在地|户籍地|户籍|住所地|住所|住址|居住地|居住|现住|家住|住|地址|位于)'
-            r'[：:]?\s*(' + _ADDR_PROV + ')',
+            _ADDR_PATTERNS[0],
             # 前缀用相对偏移（m.start(2)-m.start(0)），避免地址前半截残留在文本中
             lambda m: r1(m, m.group(2),
                          m.group(0)[:m.start(2) - m.start(0)]),
@@ -2003,14 +2067,14 @@ class Desensitizer:
         # 2) 独立省级地址（无前缀词；前接汉字时多为"住/居住"等已由规则1处理）
         r2 = make_replacer()
         text = re.sub(
-            r'(?<![\u4e00-\u9fa5])(' + _ADDR_PROV + ')',
+            _ADDR_PATTERNS[1],
             lambda m: r2(m, m.group(1), ''),
             text
         )
         # 3) 独立城市级地址（市/区开头 + 详细到路/街/号）
         r3 = make_replacer()
         text = re.sub(
-            r'((?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?)',
+            _ADDR_PATTERNS[2],
             lambda m: r3(m, m.group(1), ''),
             text
         )
@@ -2018,14 +2082,14 @@ class Desensitizer:
         #    （不含"庄/屯"：避免"帝景山庄一组团"被误当地址）
         r4 = make_replacer()
         text = re.sub(
-            r'([\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区|片)[\u4e00-\u9fa5\d\- ]{0,12}(?:号|栋|幢|单元|室|楼|座|层|片|里))',
+            _ADDR_PATTERNS[3],
             lambda m: r4(m, m.group(1), ''),
             text
         )
         # 5) 路/街/大道/巷 + 门牌号（无需"区"前缀，如"莫干山路100号"）
         r5 = make_replacer()
         text = re.sub(
-            r'([\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|弄|栋|幢|单元|室|楼|座))',
+            _ADDR_PATTERNS[4],
             lambda m: r5(m, m.group(1), ''),
             text
         )
@@ -2108,13 +2172,17 @@ class Desensitizer:
              'pattern': r'((?:执业证号|执业许可证号|律师执业证号|律师执业证|执业证)\s*[：:]?\s*)([0-9A-Z]{17,18})',
              'handler': self._mask_bar_number, 'group': 2, 'value_group': 2},
             {'type': '身份证号',
-             'pattern': r'((?:身份证号|身份证号码|身份证|证件号码|证件号)\s*[：:]?\s*)(\d{17}[\dXx])',
+             'pattern': r'((?:身份证号|身份证号码|身份证|证件号码|证件号)\s*[：:]?\s*)(\d{15,17}[\dXx]?)',
              'handler': self._mask_id_card, 'group': 2, 'validate': id_confidence,
-             'value_group': 2},
+             'value_group': 2,
+             # v3.0 strict/lenient：带上下文标签权威，无条件脱敏（lenient），校验码通过才 ✓
+             'strict': False},
             {'type': '身份证号',
              'pattern': r'(?<!\d)(\d{17}[\dXx])(?!\d)',
              'handler': self._mask_id_card, 'group': 1, 'validate': id_confidence,
-             'value_group': 1},
+             'value_group': 1,
+             # v3.0：无标签形状仍特异但须过出生日期/校验码门槛（strict=True）
+             'strict': True},
             {'type': '邮箱',
              'pattern': r'[A-Za-z0-9.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+',
              'handler': self._mask_email},
@@ -2142,19 +2210,22 @@ class Desensitizer:
             {'type': '统一社会信用代码',
              'pattern': r'((?:统一社会信用代码|社会信用代码|信用代码)\s*[：:]?\s*)([0-9A-Z]{18})',
              'handler': self._mask_credit_code, 'group': 2, 'validate': credit_confidence,
-             'value_group': 2},
+             'value_group': 2, 'strict': False},
             {'type': '银行账号',
              'pattern': r'((?:银行账号|开户账号|账户号码|银行卡号|收款账号|付款账号|卡号)\s*[：:]?\s*)([0-9]{12,24})',
              'handler': self._mask_bank_card, 'group': 2, 'validate': bank_confidence,
-             'value_group': 2},
+             'value_group': 2, 'strict': False},
             {'type': '银行账号',
              'pattern': r'(?<!\d)(\d{14,20})(?!\d)',
              'handler': self._mask_bank_card, 'group': 1, 'validate': bank_confidence,
-             'value_group': 1},
+             'value_group': 1,
+             # v3.0：裸号形状泛（14~20 位数字），但宁替勿漏（lenient）：
+             # Luhn 不通过也脱敏，仅 validated 标记为未验证（—）
+             'strict': False},
             {'type': '统一社会信用代码',
              'pattern': r'(?<![0-9A-Z])(9[0-9A-Z]{17})(?![0-9A-Z])',
              'handler': self._mask_credit_code_bare, 'group': 1, 'validate': credit_confidence,
-             'value_group': 1},
+             'value_group': 1, 'strict': False},
             {'type': '案号',
              'pattern': r'[（(]?[ \t]*\d{4}[ \t]*[）)]?[ \t]*(?![年月日])'
                         r'[\u4e00-\u9fa5]{1,10}[ \t]*\d{0,6}[ \t]*'
@@ -2178,7 +2249,9 @@ class Desensitizer:
              'pattern': _PROJECT_PATTERN.pattern,
              'handler': self._mask_project_name},
             {'type': '地址',
-             'pattern': r'(住所地|住址|地址|位于)[：:]?\s*[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|[\u4e00-\u9fa5]{1,3}(?:省|自治区)[\u4e00-\u9fa5 ]{1,10}(?:市)[\u4e00-\u9fa5 ]{1,10}(?:区|县|市|镇)[\u4e00-\u9fa5\d\-（\(\)） ]{5,40}(?:号|室|层)|(?:[\u4e00-\u9fa5]{2,8}(?:市|区|县|镇))[\u4e00-\u9fa5]*(?:路|街|大道|巷)[\u4e00-\u9fa5\d\-（\(\)） ]{2,29}(?:号|室|层|栋|幢)(?:\d+)?|[\u4e00-\u9fa5]{2,12}(?:小区|花园|家园|公寓|大厦|新村|苑|里|坊|巷|弄|胡同|街道|社区|村|镇|区)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|栋|幢|单元|室|楼|座|层)|[\u4e00-\u9fa5]{2,12}(?:路|街|大道|巷|弄|胡同)[\u4e00-\u9fa5\d\- ]{1,12}(?:号|弄|栋|幢|单元|室|楼|座)',
+             # v3.0：与 _mask_address 共用同一份子模式（_ADDR_JOINED），
+             # 扫描报告与脱敏行为完全一致
+             'pattern': _ADDR_JOINED,
              'handler': self._mask_address, 'value_fn': 'address'},
             {'type': '金额（中文大写）',
              'pattern': r'(?<![\d零壹贰叁肆伍陆柒捌玖拾])(?:人民币|美金|港币)?'
@@ -2694,6 +2767,7 @@ def parse_mapping_text(content: str) -> List[Mapping]:
                 type=item.get('type', ''),
                 count=int(item.get('count', 1) or 1),
                 order=int(item.get('order', 0) or 0),
+                validated=bool(item.get('validated', False)),
             ))
         return mappings
 
@@ -2716,11 +2790,33 @@ def parse_mapping_text(content: str) -> List[Mapping]:
         typ = cells[3].strip() if len(cells) > 3 else ''
         count = (int(cells[4].strip())
                  if len(cells) > 4 and cells[4].strip().isdigit() else 1)
+        # v3.0：第 6 列"验证"（✓=校验码通过；旧映射表无此列 → validated=False）
+        validated = (len(cells) > 5 and cells[5].strip() == '✓')
         # Markdown 序号列即首次出现顺序（第 i 行）
         order = int(cells[0]) if cells[0].strip().isdigit() else 0
         mappings.append(Mapping(original=original, replacement=replacement,
-                                type=typ, count=count, order=order))
+                                type=typ, count=count, order=order,
+                                validated=validated))
     return mappings
+
+
+def _placeholder_regex(placeholder: str) -> re.Pattern:
+    """占位符的容忍正则（v3.0，内化自 rizzo-pii 的 restore 技巧）。
+
+    返回 (精确形式, 宽松形式) 两个正则：
+    - 精确 `\\**\\[\\s*占位符\\s*\\]\\**`：必须有完整方括号（可带 markdown
+      加粗）。先跑这一遍——语义占位符（如 [身份证号]）的 inner 词本身会出现在
+      上下文里（"身份证号[身份证号]"、"总金额[金额]"），无括号形式会误吞前缀。
+    - 宽松 `\\**\\[?\\s*占位符\\s*\\]?\\**`：容忍 LLM/AI 回复的格式漂移
+      （丢括号、加粗、多余空格）。精确遍完成后才启用，此时已无"前缀词撞车"
+      风险。
+    占位符按键长倒序处理（调用方保证），避免 `[当事人甲]` 先吞掉
+    `[当事人甲（原告）]` 的一部分。
+    """
+    inner = placeholder.strip('[]')
+    exact = re.compile(r'\**\[\s*' + re.escape(inner) + r'\s*\]\**')
+    loose = re.compile(r'\**\[?\s*' + re.escape(inner) + r'\s*\]?\**')
+    return exact, loose
 
 
 def restore_text(masked_text: str, mappings: List[Mapping]) -> str:
@@ -2733,6 +2829,8 @@ def restore_text(masked_text: str, mappings: List[Mapping]) -> str:
        "首次出现顺序"与原文出现顺序逐一配对，确保还原准确。
     3. 映射条目自带 count（同一原始值连续出现 N 次）时，先按 count 展开
        队列，保证"一行 = 一次出现"的配对语义。
+    4. v3.0：先精确还原（带方括号），再宽松还原（容忍加粗/缺括号/多余空格，
+       AI 回复把 `[当事人甲（原告）]` 改成 `**当事人甲（原告）**` 等也能还原）。
     """
     # 按占位符分组，组内按首次出现顺序排队
     groups = {}
@@ -2743,30 +2841,66 @@ def restore_text(masked_text: str, mappings: List[Mapping]) -> str:
     for q in groups.values():
         q.sort(key=lambda m: m.order)
 
-    # 长占位符优先替换
-    for placeholder, queue in sorted(groups.items(),
-                                     key=lambda kv: len(kv[0]), reverse=True):
-        if len(queue) == 1:
-            masked_text = masked_text.replace(placeholder, queue[0].original)
-            continue
-        # 同一占位符多次出现：按顺序逐一配对
+    def collect(masked_text, rx_exact, rx_loose):
+        """收集精确+宽松全部候选，按文本位置排序；重叠时精确优先。
+
+        宽松候选的采信规则（防"裸 inner 词撞上下文"，如"总金额[金额]"、
+        "书记员 [书记员]"中的前缀词）：
+        - 含 `[`/`]`/`*`（半括号或 markdown 加粗 = AI 漂移的明确信号）→ 采信；
+        - 纯裸词 → 仅当全文没有任何精确候选时采信（AI 把占位符全部写成裸词）；
+          只要存在一个精确候选，裸词一律视为正文普通词，不还原。
+        必须一次性合并：若先替换精确再替换宽松，会打乱"占位符出现顺序 =
+        映射 order 顺序"的配对语义（文本第二处的精确形式会先消耗队列第一项）。
+        """
+        exacts = [(m.start(), m.end(), m.group(0))
+                  for m in rx_exact.finditer(masked_text)]
+        loose = []
+        for m in rx_loose.finditer(masked_text):
+            if any(not (m.end() <= s or m.start() >= e)
+                   for s, e, _ in exacts):
+                continue          # 与精确匹配重叠：宽松候选作废
+            seg = m.group(0)
+            if '[' in seg or ']' in seg:
+                # 括号（含半括号）漂移：AI 丢/改了一个括号
+                loose.append((m.start(), m.end(), seg))
+            elif seg.startswith('**') and seg.endswith('**'):
+                # 完整 markdown 加粗包裹（成对 `**`）。只吞一侧的 `**`
+                # （如"金额**巨大**"中"金额**"）不是合法漂移形态，不采信
+                loose.append((m.start(), m.end(), seg))
+            elif not exacts:
+                # 全文无精确候选且为纯裸词（无括号/星号）：AI 可能把
+                # 占位符全写成了裸词，采信（seg 去空白后即 inner 本身）。
+                # 含单侧 `*`（"金额**"）不是合法漂移形态，不采信
+                if seg.strip() and '*' not in seg:
+                    loose.append((m.start(), m.end(), seg))
+        return sorted(exacts + loose)
+
+    def apply(masked_text, cands, queue):
+        """按候选出现顺序逐一配对替换；返回 (新文本, 剩余未配对的队列项)。"""
         queue_idx = 0
         out = []
         pos = 0
-        while True:
-            found = masked_text.find(placeholder, pos)
-            if found == -1:
-                out.append(masked_text[pos:])
-                break
-            out.append(masked_text[pos:found])
+        for start, end, matched in cands:
+            out.append(masked_text[pos:start])
             if queue_idx < len(queue):
-                out.append(queue[queue_idx].original)
+                # 保留匹配串首尾空白（宽松匹配可能把" 合同乙方 "的空格吞进 span）
+                lead = matched[:len(matched) - len(matched.lstrip())]
+                trail = matched[len(matched.rstrip()):]
+                out.append(lead + queue[queue_idx].original + trail)
                 queue_idx += 1
             else:
                 # 映射表条目不足（理论上不应发生），保留占位符并警告由调用方处理
-                out.append(placeholder)
-            pos = found + len(placeholder)
-        masked_text = ''.join(out)
+                out.append(matched)
+            pos = end
+        out.append(masked_text[pos:])
+        return ''.join(out), queue[queue_idx:]
+
+    # 长占位符优先替换
+    for placeholder, queue in sorted(groups.items(),
+                                     key=lambda kv: len(kv[0]), reverse=True):
+        rx_exact, rx_loose = _placeholder_regex(placeholder)
+        cands = collect(masked_text, rx_exact, rx_loose)
+        masked_text, _ = apply(masked_text, cands, queue)
     return masked_text
 
 
@@ -3075,6 +3209,10 @@ def main():
                              help='NER 模型名（如 zh_core_web_trf / qwen2.5，按后端默认取）')
     mask_parser.add_argument('--ner-endpoint', default=None,
                              help='LLM 后端端点（默认 http://localhost:11434/api/generate）')
+    mask_parser.add_argument('--pdf-redact', action='store_true', default=False,
+                             help='v3.0：PDF 输入时输出"真·涂黑"PDF（保留版式，字符级精确匹配'
+                                  '+词边界+OCR空格容忍，清元数据/批注/表单/书签/附件，'
+                                  'residual 零残留校验）；-o 指定 .pdf 扩展名时自动启用')
 
     # scan 命令
     scan_parser = subparsers.add_parser('scan', help='扫描敏感信息（不替换）')
@@ -3246,8 +3384,51 @@ def main():
                 output_path = f'{base}_desensitized{ext if ext else ".txt"}'
 
         if output_path:
-            write_desensitized_file(args.file, output_path, result.text)
-            print(f'✅ 脱敏后文件已保存: {output_path}')
+            # v3.0：PDF 真·涂黑脱敏（--pdf-redact 或 -o 指定 .pdf 时自动启用）
+            in_is_pdf = (hasattr(args, 'file') and args.file
+                         and os.path.splitext(args.file)[1].lower() == '.pdf')
+            out_ext = os.path.splitext(output_path)[1].lower()
+            # 仅显式启用：--pdf-redact，或用户显式 -o 指定 .pdf 扩展名。
+            # 不改变既有默认行为（.pdf 输入 → .txt 输出）。
+            user_gave_output = bool(getattr(args, 'output', None))
+            want_pdf_redact = (in_is_pdf and user_gave_output
+                               and out_ext == '.pdf') or bool(
+                getattr(args, 'pdf_redact', False) and in_is_pdf)
+            if want_pdf_redact:
+                try:
+                    from pdf_redact import PdfError, redact_pdf
+                except ImportError:
+                    sys.exit('❌ 需要安装 PyMuPDF: pip3 install PyMuPDF')
+                if out_ext != '.pdf':
+                    # --pdf-redact 未指定 -o：自动输出 _redacted.pdf
+                    output_path = os.path.splitext(output_path)[0] + '.pdf'
+                with open(args.file, 'rb') as f:
+                    pdf_bytes = f.read()
+                pairs = [(m.replacement, m.original) for m in result.mapping]
+                try:
+                    out_pdf, report = redact_pdf(pdf_bytes, pairs)
+                except PdfError as e:
+                    sys.exit(f'❌ PDF 涂黑失败：{e}')
+                with open(output_path, 'wb') as f:
+                    f.write(out_pdf)
+                print(f'✅ 涂黑脱敏 PDF 已保存: {output_path}'
+                      f'（{report["occurrences"]} 处涂黑，'
+                      f'批注 {report["annots"]}/表单 {report["widgets"]}/'
+                      f'书签 {report["toc"]}/附件 {report["embedded"]} 清理）')
+                if report['skipped']:
+                    print(f'⚠️  跳过 {len(report["skipped"])} 个过短值'
+                          f'（<2 个汉字/字母数字，全文搜索会误涂），仍留在原样：'
+                          f'{sorted(set(report["skipped"]))[:8]}')
+                if report['not_found']:
+                    print(f'⚠️  以下占位符在 PDF 文本层未找到任何出现'
+                          f'（可能在图片/扫描层）：{sorted(set(report["not_found"]))[:8]}')
+                print('✅ residual 零残留校验通过（输出中已读不到任何原文）')
+            else:
+                if out_ext == '.pdf' and not in_is_pdf:
+                    print('⚠️  -o 指定了 .pdf 但输入不是 PDF：将以纯文本写入 .pdf'
+                          '（PDF 真·涂黑仅对 PDF 输入生效，请用 --pdf-redact + PDF 输入）')
+                write_desensitized_file(args.file, output_path, result.text)
+                print(f'✅ 脱敏后文件已保存: {output_path}')
         else:
             # 输出到 stdout
             if args.mapping:

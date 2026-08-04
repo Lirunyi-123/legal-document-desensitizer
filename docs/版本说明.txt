@@ -1,3 +1,55 @@
+# 法律文书脱敏工具 v3.0 版本说明
+
+## 版本号
+v3.0 — 内化 rizzo-pii 五大优点：合成语料管线 + validated 校验标记 + PDF 真·涂黑 + 还原漂移容忍 + P/R/F1 评测口径
+
+## 背景
+参照开源项目 Rizzo-AI-Academy/rizzo-pii（意大利语 PII 脱敏：LLM 写模板、代码注入
+校验值、PDF 真涂黑、per-tag 评测），把五个最值得借鉴的设计内化到本工具。
+
+## 1. 合成语料管线（synthetic/）— LLM 写模板、代码注入校验值
+- llm_template_bank.py：LLM（OpenAI 兼容）写中文法律文书模板，只允许白名单占位符
+  {当事人甲} {身份证} {银行账号}…，QA 门控 find_stray_names 丢弃占位符外夹带姓名的模板。
+- generate_synthetic_pii.py：代码生成数学上合法的号码（身份证 GB 11643-1999、
+  信用代码 GB 32100-2015、银行卡 Luhn，全部通过 desensitize 校验器），自动填
+  expect_masked/expect_kept 输出红队语料；--bio 输出 BIO 训练语料。
+- 内置 11 个中文模板兜底（不接 LLM 也能用）；实测 120 条规则层召回率 99.6%、误报 0。
+- 合成语料驱动修复 4 个规则层真实盲区：
+  a) 角色词缺"被告人/被申请人/当事人/经营者"（刑事/行政处罚文书高频）→ 已补；
+  b) "25日在安徽省…"地址规则吞"日"（省/市/小区前缀吞日期尾字）→ 前缀排除"日月年号"；
+  c) jieba 把"荣墨军称"切"荣墨"+"军称" → 姓名形态校验容忍"名 token 带尾动词"；
+  d) 4 字名（复姓+2字名）超出姓名形态判定 → 生成器按真实分布规避。
+
+## 2. 校验码 strict/lenient 双档 + validated 标记
+- 统一检测器表语义：strict=True（形状泛、校验不过即丢弃：无标签身份证）；
+  strict=False（形状特异/标签权威、校验不过也脱敏：带标签身份证/银行卡/信用代码）。
+- 映射表 Markdown 新增"验证"列：✓=校验码算法通过，—=仅格式/标签命中；
+  Mapping 增加 validated 字段（JSON 输出/解析兼容，旧映射表无此列不报错）。
+- scan 输出带 validated/strict。
+
+## 3. PDF 真·涂黑脱敏（pdf_redact.py）
+- mask -f x.pdf --pdf-redact -o x_redacted.pdf（或 -o 指定 .pdf 自动启用）。
+- 字符级精确匹配（rawdict 每字符 bbox）+ 容忍 OCR 空格/换行 + 数字/字母词边界；
+  值长优先 + 已涂矩形跳过（张三不破坏张三丰）。
+- 清理元数据/XMP、批注、表单字段、书签、内嵌附件。
+- 安全语义：residual 零残留校验（原文仍可读→拒绝交付）；全文零命中（扫描件）→
+  报错不交付"假脱敏"；过短值跳过并警告。
+
+## 4. 还原容忍 markdown 漂移（restore_text）
+- 按键长倒序 + 正则 \**\[?\s*占位符\s*\]?\**：加粗/丢括号/多余空格均可无损还原。
+- 先精确后宽松两遍防"语义 inner 词撞上下文前缀"（总金额[金额] 不误吞）；
+  精确/漂移混用按原文顺序配对；首尾空格保留。
+
+## 5. 评测口径：entity-level per-tag P/R/F1 + support（evaluate.py）
+- 正样本 expect_masked（TP/FN）、负样本 expect_kept（FP→precision 分母）。
+- 分类型 precision/recall/F1 + support + MICRO/MACRO；控制台/Markdown/JSON 全输出。
+
+## 回归
+- 单测 74 → 93（v3.0 新增 19：validated/还原漂移/规则盲区/合成语料/PDF 涂黑）。
+- 红队语料 77 条：100% 召回、误报 0；合成语料 120 条：99.6% 召回、误报 0。
+- 三份训练语料还原往返逐字节 0 差异。
+
+---
 # 法律文书脱敏工具 v2.2 版本说明
 
 ## 版本号

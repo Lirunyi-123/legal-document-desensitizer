@@ -534,5 +534,232 @@ class TestV28RealCaseFixes(unittest.TestCase):
         self._roundtrip(text)
 
 
+# ============================================================
+# v3.0 回归：validated 标记 / markdown 漂移还原 / 规则增强 / 合成语料 / PDF 涂黑
+# ============================================================
+class TestV30ValidatedMark(unittest.TestCase):
+    """内化自 rizzo-pii：校验码 validated 标记（✓ / —）扫进映射表。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_id_checksum_validated(self):
+        r = self.d.mask('身份证号110101198001011232')  # 红队语料校验码合法
+        for m in r.mapping:
+            if m.type == '身份证号':
+                self.assertTrue(m.validated, '校验码合法的身份证应 validated=True')
+
+    def test_bank_card_unvalidated(self):
+        # 红队语料 bank_02：Luhn 不合法但按"宁替勿漏"仍脱敏 → validated=False
+        r = self.d.mask('尾款支付至6222020200012345678账户')
+        for m in r.mapping:
+            if m.type == '银行账号':
+                self.assertFalse(m.validated)
+
+    def test_mapping_markdown_validation_column(self):
+        r = self.d.mask('身份证号110101198001011232，尾款支付至6222020200012345678账户')
+        md = r.to_markdown()
+        self.assertIn('| 序号 | 原始值 | 替换值 | 类型 | 出现次数 | 验证 |', md)
+        self.assertIn('✓', md)   # 身份证校验码通过
+        self.assertIn('—', md)   # 银行卡仅格式命中
+
+    def test_mapping_json_roundtrip_keeps_validated(self):
+        r = self.d.mask('身份证号110101198001011232')
+        ms = parse_mapping_text(r.to_json())
+        self.assertTrue(any(m.validated for m in ms if m.type == '身份证号'))
+
+    def test_parse_old_markdown_without_validation_column(self):
+        # 旧版映射表（无"验证"列）仍可解析，validated 默认 False
+        old = '# 脱敏映射表\n| 序号 | 原始值 | 替换值 | 类型 | 出现次数 |\n' \
+              '|------|--------|--------|------|---------|\n|1|张三|[当事人甲]|人名|1|'
+        ms = parse_mapping_text(old)
+        self.assertEqual(len(ms), 1)
+        self.assertFalse(ms[0].validated)
+
+
+class TestV30RestoreDrift(unittest.TestCase):
+    """内化自 rizzo-pii：还原容忍 markdown 漂移（加粗/缺括号/多余空格）。"""
+
+    def _m(self, original, replacement, order=1, typ='人名'):
+        from desensitize import Mapping
+        return Mapping(original=original, replacement=replacement,
+                       type=typ, count=1, order=order)
+
+    def test_bold_placeholder(self):
+        ms = [self._m('陈建国', '[当事人甲（原告）]')]
+        self.assertEqual(restore_text('原告**当事人甲（原告）**诉称', ms),
+                         '原告陈建国诉称')
+
+    def test_missing_brackets(self):
+        ms = [self._m('杭州鼎盛房地产开发有限公司', '[合同乙方]')]
+        # 宽松匹配不得吞掉占位符周围空格（" 合同乙方 " 还原后空格保留）
+        self.assertEqual(restore_text('被告 合同乙方 违约', ms),
+                         '被告 杭州鼎盛房地产开发有限公司 违约')
+
+    def test_mixed_exact_and_drift_order(self):
+        # 精确与漂移混用，仍按原文顺序配对（修复"先精确后宽松"的顺序错乱）
+        ms = [self._m('张三', '[当事人甲]', order=1),
+              self._m('李四', '[当事人甲]', order=2)]
+        self.assertEqual(restore_text('**当事人甲**借给[当事人甲] 5 万元', ms),
+                         '张三借给李四 5 万元')
+
+    def test_context_prefix_not_swallowed(self):
+        # 语义占位符 inner 词与上下文前缀撞车（"总金额[金额]"）不得误吞
+        ms = [self._m('349976351 元 ', '[金额]', typ='金额')]
+        self.assertEqual(restore_text('总金额为 [金额]，故需支付。', ms),
+                         '总金额为 349976351 元 ，故需支付。')
+
+    def test_exact_roundtrip_unaffected(self):
+        d = Desensitizer()
+        src = '原告陈建国诉被告杭州鼎盛房地产开发有限公司，身份证号110101198001011232'
+        r = d.mask(src)
+        self.assertEqual(restore_text(r.text, r.mapping), src)
+
+    def test_body_word_bold_not_swallowed(self):
+        # 正文普通词"金额"后跟 markdown 加粗开始标记（**巨大**）：
+        # 宽松匹配只吞一侧 `**` 不是合法漂移形态 → 不得误还原
+        ms = [self._m('500万元', '[金额]', typ='金额')]
+        self.assertEqual(restore_text('赔偿金额**巨大**，另需支付[金额]。', ms),
+                         '赔偿金额**巨大**，另需支付500万元。')
+
+
+class TestV30RuleEnhancements(unittest.TestCase):
+    """v3.0 合成语料驱动发现的规则层真实盲区修复。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_role_word_被告人(self):
+        r = self.d.mask('被告人陶丽，男，2017年2月20日出生。')
+        self.assertIn('[被告人]', r.text) if '[被告人]' in r.text else \
+            self.assertTrue(any(m.type == '人名' for m in r.mapping))
+
+    def test_role_word_当事人(self):
+        r = self.d.mask('当事人：俞明，身份证号410102198905257746。')
+        self.assertTrue(any(m.type == '人名' for m in r.mapping))
+
+    def test_scan_short_id_with_label(self):
+        # scan 与 mask 一致：带标签的 15-17 位残缺身份证也要出现在扫描结果
+        text = '身份证号码3424251967112040X'
+        scan = self.d.scan(text)
+        ids = [f['value'] for f in scan if f['type'] == '身份证号']
+        self.assertIn('3424251967112040X', ids)
+        r = self.d.mask(text)
+        self.assertIn('[身份证号]', r.text)
+
+    def test_address_does_not_swallow_date(self):
+        # "25日在安徽省…"→ 地址规则不得吞"日"（日期保留）
+        r = self.d.mask('于2022年4月12日在辽宁省青岛市玄武区凤起路7号从事经营。')
+        self.assertIn('2022年4月12日', r.text)
+        self.assertTrue(any(m.type == '地址' for m in r.mapping))
+
+    def test_bare_name_with_verb_tokenized_together(self):
+        # jieba 把"荣墨军称"切成"荣墨"+"军称" → 仍应识别"荣墨军"
+        r = self.d.mask('荣墨军称：货款什么时候到账？')
+        self.assertTrue(any(m.type == '人名' for m in r.mapping))
+
+
+class TestV30Synthetic(unittest.TestCase):
+    """内化自 rizzo-pii：LLM 写模板 + 代码注入合法校验值的合成语料管线。"""
+
+    def test_generators_produce_valid_checksums(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent / 'synthetic'))
+        import random
+        import generate_synthetic_pii as g
+        rng = random.Random(7)
+        for _ in range(50):
+            self.assertTrue(_is_valid_id_checksum(g.gen_id_card(rng)),
+                            '身份证 GB11643 校验失败')
+            self.assertTrue(_is_valid_credit_code(g.gen_credit_code(rng)),
+                            '信用代码 GB32100 校验失败')
+            self.assertTrue(_luhn_check(g.gen_bank_card(rng)),
+                            '银行卡 Luhn 校验失败')
+
+    def test_qa_gate_rejects_inline_names(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent / 'synthetic'))
+        import llm_template_bank as lb
+        bad = '原告王某某诉张某民间借贷纠纷一案。原告身份证号{身份证}。'
+        self.assertTrue(lb.find_stray_names(bad), '应检出占位符外漏写的人名')
+        good = '原告{当事人甲}诉被告{当事人乙}民间借贷纠纷一案，案号{案号}。'
+        self.assertFalse(lb.find_stray_names(good), '纯槽位模板应通过 QA 门控')
+
+    def test_fill_template_auto_annotates_expectations(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent / 'synthetic'))
+        import random
+        import generate_synthetic_pii as g
+        rng = random.Random(1)
+        text, entities, kept = g.fill_template(g.TEMPLATES[0], rng)
+        self.assertTrue(any(label == '身份证号' for _, label, _, _ in entities))
+        self.assertTrue(any(label == '人名' for _, label, _, _ in entities))
+        # 注入值必须真的出现在文本里（标注与文本一致）
+        for value, label, s, e in entities:
+            self.assertEqual(text[s:e], value)
+
+
+class TestV30PdfRedact(unittest.TestCase):
+    """内化自 rizzo-pii：PDF 真·涂黑脱敏（保留版式 + residual 零残留）。"""
+
+    def _make_pdf(self, path):
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest('PyMuPDF 未安装')
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((60, 80), '原告陈建国，身份证号110101198001011232。',
+                         fontname='china-s', fontsize=10)
+        page.insert_text((60, 104), '张三丰与张三均到庭。', fontname='china-s', fontsize=10)
+        doc.set_metadata({'title': '陈建国案', 'author': '陈建国'})
+        doc.set_toc([[1, '陈建国案', 1]])
+        doc.embfile_add('n.txt', '陈建国'.encode(), filename='n.txt')
+        doc.save(path)
+        doc.close()
+
+    def test_redact_and_residual(self):
+        import tempfile, os
+        from pdf_redact import redact_pdf, PdfError
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, 'src.pdf')
+        self._make_pdf(src)
+        with open(src, 'rb') as f:
+            pdf = f.read()
+        pairs = [('[身份证号]', '110101198001011232'),
+                 ('[当事人甲（原告）]', '陈建国'),
+                 ('[当事人乙]', '张三'),
+                 # 张三丰与张三是两个独立人名：值长优先涂张三丰，张三不破坏其矩形
+                 ('[当事人丙]', '张三丰')]
+        out, report = redact_pdf(pdf, pairs)
+        self.assertEqual(report['residual'], [])
+        import fitz
+        with fitz.open(stream=out, filetype='pdf') as doc:
+            t = doc[0].get_text()
+            self.assertNotIn('陈建国', t)
+            self.assertNotIn('110101198001011232', t)
+            self.assertNotIn('张三丰', t)   # 张三丰 被涂（值长优先）
+            self.assertNotIn('丰', t)       # 不被"张三"半涂成残留"丰"
+            self.assertNotIn('张三', t)     # 张三 独立人名被涂
+            self.assertFalse(any(doc.metadata.get(k) for k in
+                                 ('title', 'author', 'subject', 'keywords')),
+                             '元数据（标题/作者等）应被清空')
+            self.assertEqual(list(doc.embfile_names()), [])
+
+    def test_zero_hit_rejected(self):
+        import tempfile, os
+        from pdf_redact import redact_pdf, PdfError
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, 'src.pdf')
+        self._make_pdf(src)
+        with open(src, 'rb') as f:
+            pdf = f.read()
+        with self.assertRaises(PdfError):
+            redact_pdf(pdf, [('[不存在]', '完全不存在的内容xyz')])
+
+
 if __name__ == '__main__':
     unittest.main()

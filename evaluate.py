@@ -22,10 +22,12 @@
       "llm_only": ["人名", "人名"]                                      # LLM层才覆盖（不参与召回率）
     }
 
-评分口径：
-    - 命中 = 期望值进入映射表（或被替换为占位符，即原文不再出现）
-    - 分类型召回率 = 命中数 / 期望数（仅统计 expect_masked）
-    - 误报 = expect_kept 中应保留却被替换的条目
+评分口径（v3.0：entity-level per-tag P/R/F1 + support，内化自 rizzo-pii）：
+    - 正样本 = expect_masked：命中（进入映射表或原文消失且无片段残留）= TP，漏 = FN
+    - 负样本 = expect_kept：应保留却被替换 = FP（precision 的分母）
+    - 分类型 precision / recall / F1 + support（样本数），外加 MICRO（总体）
+      与 MACRO（类型平均）汇总——规则层最怕误伤，precision/F1 才是
+      "改保守了还是改漏了"的量化指标
     - llm_only 条目单独列出，说明这些是"规则层不承诺、需 LLM 层处理"的项
 """
 
@@ -187,8 +189,9 @@ def main():
             'llm_only': case.get('llm_only', []),
         })
 
-    # 汇总统计
-    type_stats = defaultdict(lambda: {'expected': 0, 'hit': 0})
+    # 汇总统计（v3.0：entity-level per-tag P/R/F1 + support）
+    # 正样本 = expect_masked（命中=TP，漏=FN）；负样本 = expect_kept（被替换=FP）
+    type_metrics = defaultdict(lambda: {'support': 0, 'tp': 0, 'fp': 0, 'fn': 0})
     kept_total = kept_fail = 0
     absent_total = absent_fail = 0
     llm_only_total = 0
@@ -196,17 +199,23 @@ def main():
     failed_cases = []
     for r in results:
         for c in r['checks']:
+            t = c['type']
             if c['kind'] in ('masked', 'llm'):
-                type_stats[c['type']]['expected'] += 1
+                type_metrics[t]['support'] += 1
                 if c['ok']:
-                    type_stats[c['type']]['hit'] += 1
+                    type_metrics[t]['tp'] += 1
+                else:
+                    type_metrics[t]['fn'] += 1
                 if c['kind'] == 'llm':
                     llm_only_total += 1
                     if c['ok']:
                         llm_hit_total += 1
             elif c['kind'] == 'kept':
                 kept_total += 1
-                kept_fail += 0 if c['ok'] else 1
+                if c['ok']:
+                    continue
+                kept_fail += 1
+                type_metrics[t]['fp'] += 1          # 负样本误替换 → 该类型 FP
             elif c['kind'] == 'absent':
                 absent_total += 1
                 absent_fail += 0 if c['ok'] else 1
@@ -215,33 +224,47 @@ def main():
         if r['failures']:
             failed_cases.append(r)
 
-    expected_total = sum(s['expected'] for s in type_stats.values())
-    hit_total = sum(s['hit'] for s in type_stats.values())
-    recall = (hit_total / expected_total) if expected_total else 1.0
+    def prf(tp, fp, fn):
+        p = tp / (tp + fp) if tp + fp else 0.0
+        r = tp / (tp + fn) if tp + fn else 0.0
+        f = 2 * p * r / (p + r) if p + r else 0.0
+        return p, r, f
+
+    tags = sorted(type_metrics, key=lambda t: -type_metrics[t]['support'])
+    TP = sum(v['tp'] for v in type_metrics.values())
+    FP = sum(v['fp'] for v in type_metrics.values())
+    FN = sum(v['fn'] for v in type_metrics.values())
+    P, R, F = prf(TP, FP, FN)
+    per_tag = {t: prf(v['tp'], v['fp'], v['fn']) for t, v in type_metrics.items()}
+    macro_f = (sum(v[2] for v in per_tag.values()) / len(per_tag)
+               if per_tag else 0.0)
 
     # 控制台报告
-    print('=' * 62)
+    print('=' * 72)
     print('法律文书脱敏规则层 — 红队评测报告')
-    print('=' * 62)
+    print('=' * 72)
     print(f'用例总数: {len(results)}   通过: {len(results) - len(failed_cases)}   失败: {len(failed_cases)}')
     print(f'评测模式: {"规则层+LLM层" if llm_mode else "仅规则层"}')
-    print(f'结构化期望: {expected_total} 项，命中 {hit_total} 项，召回率 {recall:.1%}')
-    print(f'保留项检查: {kept_total} 项，误报 {kept_fail} 项')
+    print(f'正样本(expect_masked): {TP + FN} 项，命中 {TP} 项')
+    print(f'负样本(expect_kept):   {kept_total} 项，误替换 {kept_fail} 项')
     if absent_total:
         print(f'泄露检查: {absent_total} 项，发现泄露 {absent_fail} 项')
     if llm_only_total:
         if llm_mode:
-            print(f'LLM 层覆盖项（已计入召回率）: {llm_hit_total}/{llm_only_total}')
+            print(f'LLM 层覆盖项（已计入）: {llm_hit_total}/{llm_only_total}')
         else:
-            print(f'LLM 层待覆盖项（不计入召回率）: {llm_only_total} 项')
+            print(f'LLM 层待覆盖项（不计入）: {llm_only_total} 项')
     print()
-    print('按类型召回率：')
-    print(f'  {"类型":<16}{"期望":>5}{"命中":>5}{"召回率":>9}')
-    for typ in sorted(type_stats):
-        s = type_stats[typ]
-        r = s['hit'] / s['expected'] if s['expected'] else 1.0
-        mark = '✅' if r >= 0.95 else ('⚠️' if r >= 0.8 else '❌')
-        print(f'  {mark} {typ:<15}{s["expected"]:>5}{s["hit"]:>5}{r:>9.1%}')
+    print('按类型指标（entity-level）：')
+    print(f'  {"类型":<16}{"support":>8}{"precision":>11}{"recall":>9}{"F1":>9}')
+    for t in tags:
+        p, r, f = per_tag[t]
+        v = type_metrics[t]
+        mark = '✅' if f >= 0.95 else ('⚠️' if f >= 0.8 else '❌')
+        print(f'  {mark} {t:<15}{v["support"]:>8}{p:>11.4f}{r:>9.4f}{f:>9.4f}')
+    print('  ' + '-' * 53)
+    print(f'  {"MICRO (overall)":<16}{TP + FN:>8}{P:>11.4f}{R:>9.4f}{F:>9.4f}')
+    print(f'  {"MACRO (类型平均)":<16}{"":>8}{"":>11}{"":>9}{macro_f:>9.4f}')
 
     if failed_cases:
         print()
@@ -274,23 +297,31 @@ def main():
             '|------|------|',
             f'| 用例总数 | {len(results)} |',
             f'| 通过用例 | {len(results) - len(failed_cases)} |',
-            f'| 结构化期望项 | {expected_total} |',
-            f'| 召回率（整体） | {recall:.1%} |',
-            f'| 保留项误报 | {kept_fail}/{kept_total} |',
+            f'| 正样本（expect_masked） | {TP + FN} |',
+            f'| 命中（TP） | {TP} |',
+            f'| 负样本（expect_kept） | {kept_total} |',
+            f'| 误替换（FP） | {kept_fail} |',
+            f'| precision（micro） | {P:.4f} |',
+            f'| recall（micro） | {R:.4f} |',
+            f'| F1（micro） | {F:.4f} |',
+            f'| F1（macro，类型平均） | {macro_f:.4f} |',
         ]
         if absent_total:
             lines.append(f'| 泄露检查 | {absent_fail}/{absent_total} 项泄露 |')
         lines += [
             '',
-            '## 分类型召回率',
+            '## 按类型指标（entity-level，P/R/F1 + support）',
             '',
-            '| 类型 | 期望 | 命中 | 召回率 |',
-            '|------|------|------|--------|',
+            '| 类型 | support | precision | recall | F1 |',
+            '|------|--------:|----------:|-------:|----:|',
         ]
-        for typ in sorted(type_stats):
-            s = type_stats[typ]
-            r = s['hit'] / s['expected'] if s['expected'] else 1.0
-            lines.append(f'| {typ} | {s["expected"]} | {s["hit"]} | {r:.1%} |')
+        for t in tags:
+            p, r, f = per_tag[t]
+            lines.append(f'| {t} | {type_metrics[t]["support"]} | {p:.4f} | {r:.4f} | {f:.4f} |')
+        lines += [
+            f'| **MICRO (overall)** | **{TP + FN}** | **{P:.4f}** | **{R:.4f}** | **{F:.4f}** |',
+            f'| **MACRO (类型平均)** | | | | **{macro_f:.4f}** |',
+        ]
         if failed_cases:
             lines += ['', '## 失败用例', '']
             for r in failed_cases:
@@ -314,17 +345,26 @@ def main():
             'summary': {
                 'cases': len(results),
                 'passed': len(results) - len(failed_cases),
-                'expected': expected_total,
-                'hit': hit_total,
-                'recall': recall,
+                'tp': TP,
+                'fp': FP,
+                'fn': FN,
+                'micro': {'precision': P, 'recall': R, 'f1': F, 'support': TP + FN},
+                'macro_f1': macro_f,
                 'kept_total': kept_total,
                 'kept_fail': kept_fail,
                 'absent_total': absent_total,
-            'absent_fail': absent_fail,
-            'llm_only_total': llm_only_total,
-            'llm_hit_total': llm_hit_total,
-        },
-            'by_type': {t: dict(s) for t, s in type_stats.items()},
+                'absent_fail': absent_fail,
+                'llm_only_total': llm_only_total,
+                'llm_hit_total': llm_hit_total,
+            },
+            'by_type': {t: {'support': type_metrics[t]['support'],
+                            'precision': per_tag[t][0],
+                            'recall': per_tag[t][1],
+                            'f1': per_tag[t][2],
+                            'tp': type_metrics[t]['tp'],
+                            'fp': type_metrics[t]['fp'],
+                            'fn': type_metrics[t]['fn']}
+                        for t in tags},
             'failed_cases': [{'id': r['id'], 'note': r['note'],
                               'failures': r['failures']} for r in failed_cases],
         }

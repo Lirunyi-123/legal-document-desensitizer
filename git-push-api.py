@@ -333,14 +333,16 @@ def main():
         for path in paths:
             blob = git("rev-parse", f"{sha}:{path}")
             local_blob_sha = blob.stdout.strip()
-            raw = git("show", f"{sha}:{path}", check=False)
+            # 二进制文件（.docx/.png 等）：必须以 bytes 模式读取，
+            # 否则 subprocess 文本模式解码二进制内容直接 UnicodeDecodeError
+            raw = git("show", f"{sha}:{path}", check=False, input_bytes=b"")
             if raw.returncode != 0:
                 continue  # 子模块等非常规条目
-            payload = {"content": raw.stdout, "encoding": "utf-8"}
             try:
-                payload["content"].encode("utf-8")
-            except UnicodeEncodeError:
-                payload = {"content": base64.b64encode(raw.stdout.encode()).decode(),
+                payload = {"content": raw.stdout.decode("utf-8"),
+                           "encoding": "utf-8"}
+            except UnicodeDecodeError:
+                payload = {"content": base64.b64encode(raw.stdout).decode(),
                            "encoding": "base64"}
             created = api("POST", f"{API}/repos/{repo}/git/blobs", token, payload)
             if created["sha"] != local_blob_sha:

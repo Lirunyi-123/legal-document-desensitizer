@@ -82,3 +82,8 @@
 {"id": "wx_09", "note": "OCR空格 微 信号", "text": "微 信号：wxid_abcdefghijkl，加好友需验证。", "expect_masked": [{"type": "微信号", "value": "wxid_abcdefghijkl"}], "expect_kept": []}
 {"id": "neg_10", "note": "微信是+中文 不是微信号（负样本）", "text": "微信是常用的聊天工具，不是诉讼证据。", "expect_masked": [], "expect_kept": ["微信"]}
 {"id": "neg_11", "note": "姓名+确认 不吞动词（负样本）", "text": "原告张三确认收到货款，双方确认无误。", "expect_masked": [{"type": "人名", "value": "张三"}], "expect_kept": ["确认", "双方"]}
+{"id": "wx_10", "note": "手机号式微信号（纯11位，手机号规则兜底）", "text": "微信号：13800138000，手机同号。", "expect_masked": [{"type": "手机号", "value": "13800138000"}], "expect_kept": []}
+{"id": "wx_11", "note": "手机号式微信号（带分隔符 138-0013-8000）", "text": "原告微信号为138-0013-8000，可加好友。", "expect_masked": [{"type": "微信号", "value": "138-0013-8000"}], "expect_kept": []}
+{"id": "wx_12", "note": "手机号式微信号（+86 前缀，不再被金额错标）", "text": "被告微信号是+8613800138000。", "expect_masked": [{"type": "微信号", "value": "+8613800138000"}], "expect_kept": []}
+{"id": "wx_13", "note": "手机号式微信号（86 前缀无+）", "text": "其微信账号为8613800138000。", "expect_masked": [{"type": "微信号", "value": "8613800138000"}], "expect_kept": []}
+{"id": "neg_12", "note": "微信号后银行卡号 不是微信号（负样本）", "text": "微信号：6222020200012345678，系银行卡。", "expect_masked": [{"type": "银行账号", "value": "6222020200012345678"}], "expect_kept": []}

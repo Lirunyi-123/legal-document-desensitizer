@@ -852,5 +852,53 @@ class TestV31NameVerbTail(unittest.TestCase):
                 self.assertIn(tail, r.text)
 
 
+# ============================================================
+# v3.2 回归：手机号式微信号（纯手机号由手机号规则兜底；带分隔符/86前缀
+#           由微信号规则补充，且不被金额规则错标）
+# ============================================================
+class TestV32WechatMobile(unittest.TestCase):
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_pure_mobile_covered_by_phone_rule(self):
+        # 纯 11 位：手机号规则（先执行）兜底，无需微信号规则
+        r = self.d.mask('微信号：13800138000')
+        self.assertTrue(any(m.type == '手机号' for m in r.mapping))
+        self.assertIn('[手机号]', r.text)
+
+    def test_separated_mobile_masked_as_wechat(self):
+        for t, v in (('微信号：138-0013-8000', '138-0013-8000'),
+                     ('微信号：138 0013 8000', '138 0013 8000')):
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertTrue(any(m.type == '微信号' and m.original == v
+                                    for m in r.mapping),
+                                f'{t} -> {r.text}')
+
+    def test_86_prefix_masked_not_amount(self):
+        # 13 位纯数字在金额规则（后执行）之前被微信号规则抢先，不再误标 [金额]
+        for t, v in (('微信号：+8613800138000', '+8613800138000'),
+                     ('微信号：8613800138000', '8613800138000')):
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertTrue(any(m.type == '微信号' and m.original == v
+                                    for m in r.mapping),
+                                f'{t} -> {r.text}')
+                self.assertFalse(any(m.type == '金额' for m in r.mapping))
+
+    def test_bank_card_not_wechat(self):
+        r = self.d.mask('微信号：6222020200012345678')
+        self.assertTrue(any(m.type == '银行账号' for m in r.mapping))
+
+    def test_landline_under_wechat_ctx(self):
+        r = self.d.mask('微信号：010-12345678')
+        self.assertTrue(any(m.type == '固定电话' for m in r.mapping))
+
+    def test_restore_roundtrip_with_86(self):
+        src = '原告微信号：138-0013-8000，被告微信号是+8613800138000。'
+        r = self.d.mask(src)
+        self.assertEqual(restore_text(r.text, r.mapping), src)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,3 +1,44 @@
+# 法律文书脱敏工具 v3.7 版本说明
+
+## 版本号
+v3.7 — 扫描件 PDF 内置 OCR（macOS Vision 框架，无需安装任何工具）
+
+## 背景
+用户问"扫描件 PDF 仍无解是什么意思？必须再次 OCR 吗"。解释清楚后，
+实测发现本机 macOS Vision 框架（系统自带）中文 OCR 完全可用——无需
+tesseract/ocrmypdf，故直接内置，实现"扫描件直接上传处理"（9 项要求第 1 项
+"不依赖单纯 OCR 文本识别"在 macOS 上达成）。
+
+## 实现
+- `ocr_vision.swift`：Vision 框架中文/英文 OCR。串行批量（并发会死锁）、
+  文件名排序保证页序、页间 `=====PAGE N=====` 分隔。随工具分发。
+- `_ocr_pdf_with_vision()`：PyMuPDF 每页 200DPI 渲染 PNG → 首次 swiftc
+  编译缓存二进制（/tmp/legal_deid_ocr_vision）→ 批量 OCR → 拼接文本。
+  非 macOS / 无 Vision / OCR 空结果 → 返回 None。
+- `read_text_from_file` PDF 分支：无文本层时先内置 OCR，成功继续脱敏并提示
+  "已用 macOS Vision 内置 OCR 识别扫描件"；失败才明确报错（区分 macOS 已
+  尝试 vs 非 macOS 需外部 OCR）。
+
+## 实测
+- 批量 OCR：`支付宝- 刘方立` / `7399/支***刘方立` / `胡若薇` /
+  `徐常英 中国建设银行` 全部识别
+- 真扫描件（0 文本层、每页 1 图片）端到端：mask 自动 OCR → 脱敏 txt +
+  审阅清单（关键信息 0 残留 + 还原往返一致）
+- 300 DPI 清晰扫描识别明显优于低清；密集表格排版（小字号/无空格汉字串）
+  OCR 有误差——所有 OCR 引擎固有局限，审阅清单"孤立姓名候选"等兜底提示
+
+## 已知边界
+- 内置 OCR 仅 macOS（Vision 框架）；Windows/Linux 回退明确报错+外部 OCR 指引
+- OCR 质量依赖扫描清晰度（建议 ≥300 DPI）
+- 首次运行编译 ocr_vision.swift 约 30~60 秒，之后复用缓存
+
+## 回归
+- 单测 141 → **144**（TestV37PdfOcrFallback 3 个：OCR 成功继续处理 /
+  OCR 不可用明确报错 / ocr_vision.swift 存在性）
+- 红队 105 项 MICRO/MACRO 全 1.0000、误替换 0（规则层无回归）
+- 自检 6 项必检全部通过
+
+---
 # 法律文书脱敏工具 v3.6 版本说明
 
 ## 版本号

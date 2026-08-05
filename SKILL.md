@@ -362,6 +362,44 @@ python3 desensitize.py mask -f 银行流水.xlsx --table-aware --review \
 # 孤立姓名"胡若薇"在户名列被识别为 [当事人_N]（count=1 也识别）
 ```
 
+## v3.7 扫描件 PDF 内置 OCR（macOS Vision，无需安装工具）
+
+### 背景
+v3.6 前扫描件 PDF（无文本层）只能"明确报错 + 提示外部 OCR"。实测本机
+macOS Vision 框架中文 OCR 完全可用（无需 tesseract/ocrmypdf），故内置。
+
+### 实现
+- `ocr_vision.swift`：macOS Vision 框架中文/英文 OCR（串行批量、页码分隔、
+  文件名排序保证页序），随工具分发
+- `_ocr_pdf_with_vision()`：PyMuPDF 把每页 200DPI 渲染为 PNG → 首次
+  `swiftc` 编译缓存二进制 → 批量 OCR → 拼接文本（页间 PAGE 分隔）
+- `read_text_from_file` PDF 分支：无文本层时先内置 OCR，成功则继续脱敏；
+  失败（非 macOS/无 Vision/OCR 空）才明确报错并给外部 OCR 指引
+
+### 使用
+```bash
+# 扫描件直接上传处理（macOS 自动 OCR）
+python3 desensitize.py mask -f 银行流水扫描件.pdf --table-aware --review
+# Windows/Linux：仍提示装外部 OCR（ocrmypdf/WPS/Adobe"识别文本"）
+```
+
+### 已知边界
+- OCR 质量取决于扫描清晰度（建议 ≥300 DPI 扫描）；密集表格排版（小字号、
+  无空格汉字串）识别可能有误差——这是所有 OCR 引擎的固有局限，审阅清单
+  的"孤立姓名候选"等残留检查会兜底提示
+- 内置 OCR 仅 macOS（Vision 框架）；其他平台回退明确报错
+- 首次运行需编译 ocr_vision.swift（约 30~60 秒），之后复用缓存二进制
+
+### 验证方法（v3.7 起）
+```bash
+python3 -m unittest test_desensitize     # 144 个单测（v3.6 141 + v3.7 3）
+python3 evaluate.py                      # 红队用例（105 项命中、误报 0）
+python3 selfcheck.py                     # 自检：6 项必检全部通过
+# 真扫描件（无文本层）端到端
+python3 desensitize.py mask -f 扫描件.pdf --review
+# → 自动 OCR → 脱敏 txt + 审阅清单（关键信息 0 残留 + 还原往返一致）
+```
+
 ## 输入
 
 接受以下格式的文档内容（粘贴或文件路径）：

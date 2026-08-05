@@ -23,6 +23,7 @@ import json
 import os
 import secrets
 import calendar
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
@@ -2997,6 +2998,63 @@ def _iter_xlsx_lines(filepath: str):
 # 文件读取（支持 .txt / .docx / .pdf / .xlsx）
 # ============================================================
 
+# v3.7：扫描件 PDF 内置 OCR（macOS Vision 框架，无需安装任何工具）
+# ocr_vision.swift 位于本工具目录，编译成二进制后批量识别页面图片。
+# Windows/Linux 无 Vision 框架 → 返回 None，调用方回退"明确报错+OCR指引"。
+_OCR_SWIFT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'ocr_vision.swift')
+_OCR_BIN = os.path.join(tempfile.gettempdir(), 'legal_deid_ocr_vision')
+
+def _ocr_pdf_with_vision(filepath: str):
+    """扫描件 PDF → 用 macOS Vision OCR 提取文本（返回拼接文本或 None）。
+
+    流程：PyMuPDF 把每页渲染为 PNG → 编译/调用 ocr_vision.swift 批量识别 →
+    拼接页面文本（页间 "=====PAGE N=====" 分隔）。
+    仅 macOS（darwin）且 Vision 可用时生效；否则返回 None。
+    """
+    if sys.platform != 'darwin':
+        return None
+    try:
+        import fitz
+    except ImportError:
+        return None
+    # 确保 ocr_vision.swift 存在
+    if not os.path.exists(_OCR_SWIFT):
+        return None
+    # 编译二进制（首次；后续直接复用）
+    if not os.path.exists(_OCR_BIN):
+        import subprocess
+        ret = subprocess.run(['swiftc', '-O', '-o', _OCR_BIN, _OCR_SWIFT],
+                             capture_output=True, timeout=180)
+        if ret.returncode != 0:
+            return None
+    tmpdir = tempfile.mkdtemp(prefix='deid_ocr_')
+    try:
+        doc = fitz.open(filepath)
+        try:
+            pages = []
+            for i, page in enumerate(doc):
+                # 200 DPI 渲染（银行流水小字号，高 DPI 识别更准）
+                pix = page.get_pixmap(dpi=200)
+                png = os.path.join(tmpdir, f'page_{i + 1:03d}.png')
+                pix.save(png)
+                pages.append(png)
+            if not pages:
+                return None
+        finally:
+            doc.close()
+        import subprocess
+        ret = subprocess.run([_OCR_BIN] + pages,
+                             capture_output=True, timeout=600)
+        if ret.returncode != 0:
+            return None
+        text = ret.stdout.decode('utf-8', errors='replace')
+        return text.strip() if text.strip() else None
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # v3.6：银行流水列类型（列感知脱敏用）——按表头列名识别字段含义
 # 优先级从高到低：户名 > 日期 > 金额 > 附言 > 默认
 _COL_TYPE_RULES = (
@@ -3146,12 +3204,22 @@ def read_text_from_file(filepath: str) -> str:
         all_text = '\n\n'.join(pages)
         if not all_text.strip():
             # 整份 PDF 未提取到任何文本 → 大概率是纯图片扫描件（文字在图片里）。
-            # 直接继续会产生"空脱敏文件"的假成功，必须明确报错并给出 OCR 指引。
+            # v3.7：先尝试内置 OCR（macOS Vision 框架），成功则继续处理；
+            # 失败（非 macOS/无 Vision/OCR 空结果）才明确报错并给 OCR 指引。
+            ocr_text = _ocr_pdf_with_vision(filepath)
+            if ocr_text:
+                if sys.stderr.isatty():
+                    print('🔎 未提取到文本层，已用 macOS Vision 内置 OCR '
+                          '识别扫描件（{} 页）'.format(len(pages)),
+                          file=sys.stderr)
+                return ocr_text
             sys.exit(
-                '❌ 未从 PDF 提取到任何文本层（整份共 {} 页）。\n'
+                '❌ 未从 PDF 提取到任何文本层（整份共 {} 页），'
+                '且内置 OCR 不可用。\n'
                 '   该文件疑似为纯图片扫描件（文字在图片中，get_text() 提取不到）。\n'
-                '   请先用 OCR 工具生成带文本层的 PDF（如 ocrmypdf / WPS / Adobe：'
-                '"识别文本"），再运行本工具。'.format(len(pages)))
+                '   macOS 已自动尝试 Vision OCR；Windows/Linux 请先用 OCR 工具'
+                '生成带文本层的 PDF（如 ocrmypdf / WPS / Adobe："识别文本"），'
+                '再运行本工具。'.format(len(pages)))
         return all_text
 
     elif ext == '.xlsx' or ext == '.xlsm':

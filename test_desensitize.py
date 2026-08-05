@@ -1417,5 +1417,74 @@ class TestV36TableAware(unittest.TestCase):
         self.assertEqual(hits, [])
 
 
+# ============================================================
+# v3.7 回归：扫描件 PDF 内置 OCR（macOS Vision 回退）
+# ============================================================
+class TestV37PdfOcrFallback(unittest.TestCase):
+    """扫描件 PDF：无文本层时先尝试内置 OCR，成功则继续脱敏、
+    失败（非 macOS）才明确报错。"""
+
+    def _make_scanned_pdf(self, path):
+        """生成纯图片扫描件 PDF（无文本层）。"""
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest('PyMuPDF 未安装')
+        src = fitz.open()
+        page = src.new_page()
+        page.insert_text((50, 80), '支付宝-刘方立', fontname='china-s', fontsize=14)
+        pix = page.get_pixmap(dpi=200)
+        src.close()
+        doc = fitz.open()
+        page = doc.new_page(width=pix.width, height=pix.height)
+        page.insert_image(page.rect, pixmap=pix)
+        doc.save(path)
+        doc.close()
+        # 确认无文本层
+        d = fitz.open(path)
+        self.assertEqual(sum(len(p.get_text()) for p in d), 0)
+        d.close()
+
+    def test_ocr_success_continues(self):
+        """OCR 成功：读取出文本，不再报错。"""
+        import tempfile, os
+        import desensitize as D
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, 'scan.pdf')
+        self._make_scanned_pdf(src)
+        # mock OCR 返回文本（不依赖真实编译/识别）
+        orig = D._ocr_pdf_with_vision
+        D._ocr_pdf_with_vision = lambda p: '支付宝-刘方立\n7399/支***刘方立'
+        try:
+            text = D.read_text_from_file(src)
+            self.assertIn('支付宝-刘方立', text)
+        finally:
+            D._ocr_pdf_with_vision = orig
+
+    def test_ocr_unavailable_reports_error(self):
+        """OCR 不可用（如非 macOS）：明确报错并给 OCR 指引。"""
+        import tempfile, os
+        import desensitize as D
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, 'scan.pdf')
+        self._make_scanned_pdf(src)
+        orig = D._ocr_pdf_with_vision
+        D._ocr_pdf_with_vision = lambda p: None
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                D.read_text_from_file(src)
+            self.assertIn('文本层', str(cm.exception))
+            self.assertIn('OCR', str(cm.exception))
+        finally:
+            D._ocr_pdf_with_vision = orig
+
+    def test_ocr_swift_file_exists(self):
+        """ocr_vision.swift 随工具分发（内置 OCR 依赖）。"""
+        import os
+        import desensitize as D
+        self.assertTrue(os.path.exists(D._OCR_SWIFT),
+                        'ocr_vision.swift 应存在于工具目录')
+
+
 if __name__ == '__main__':
     unittest.main()

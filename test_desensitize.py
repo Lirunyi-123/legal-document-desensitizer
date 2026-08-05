@@ -1312,5 +1312,110 @@ class TestV35BankStatement(unittest.TestCase):
                 self.assertEqual(restore_text(r.text, r.mapping), text)
 
 
+# ============================================================
+# v3.6 回归：列感知脱敏（银行流水表格）— 结构化读取/列类型/孤立姓名/审计增强
+# ============================================================
+class TestV36TableAware(unittest.TestCase):
+    """列感知模式：识别表头列名→按列类型脱敏。户名列孤立姓名也识别、
+    日期列不脱敏、附言列不按金额（联行号不误标）、还原逐单元格一致。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def _make_xlsx(self, path):
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = '交易明细'
+        ws.append(['序号', '交易日期', '摘要', '交易金额', '账户余额',
+                   '交易地点/附言', '对方账号与户名'])
+        ws.append(['61', 20181009, '消费', -2950.00, 10779.00,
+                   '支付宝-刘方立', '7399/支***刘方立'])
+        ws.append(['65', 20181015, '电子汇入', 180000.00, 186771.00,
+                   '电子汇入', '胡若薇'])          # 孤立姓名
+        ws.append(['76', 20181101, 'ATM转账', 50000.00, 227317.00,
+                   340690400059, '徐常英'])       # 联行号 + 孤立姓名
+        wb.save(path)
+
+    def test_read_structured_xlsx(self):
+        import tempfile, os
+        from desensitize import read_structured_table
+        tmp = tempfile.mkdtemp()
+        p = os.path.join(tmp, 't.xlsx')
+        self._make_xlsx(p)
+        res = read_structured_table(p)
+        self.assertIsNotNone(res)
+        headers, rows, types = res
+        self.assertIn('对方账号与户名', headers)
+        self.assertIn('户名', types)
+        self.assertIn('日期', types)
+        self.assertEqual(len(rows), 3)
+
+    def test_read_structured_non_table_returns_none(self):
+        import tempfile, os
+        from openpyxl import Workbook
+        from desensitize import read_structured_table
+        tmp = tempfile.mkdtemp()
+        p = os.path.join(tmp, '无表头.xlsx')
+        wb = Workbook(); ws = wb.active
+        ws.append(['随便', '数据'])
+        ws.append(['abc', 'def'])
+        wb.save(p)
+        self.assertIsNone(read_structured_table(p))
+
+    def test_classify_column(self):
+        from desensitize import _classify_column
+        self.assertEqual(_classify_column('对方账号与户名'), '户名')
+        self.assertEqual(_classify_column('交易日期'), '日期')
+        self.assertEqual(_classify_column('交易金额'), '金额')
+        self.assertEqual(_classify_column('交易地点/附言'), '附言')
+        self.assertEqual(_classify_column('任意列'), '默认')
+
+    def test_mask_table_isolated_names(self):
+        """户名列孤立姓名（count=1 无角色词）也被识别。"""
+        import tempfile, os
+        from desensitize import read_structured_table
+        tmp = tempfile.mkdtemp()
+        p = os.path.join(tmp, 't.xlsx')
+        self._make_xlsx(p)
+        headers, rows, types = read_structured_table(p)
+        r = self.d.mask_table(headers, rows, types)
+        self.assertIn('[当事人', r.text)
+        # 胡若薇 / 徐常英 都被替换
+        self.assertNotIn('胡若薇', r.text)
+        self.assertNotIn('徐常英', r.text)
+
+    def test_mask_table_date_and_branch_kept(self):
+        """日期列原样保留；附言列联行号不按金额。"""
+        import tempfile, os
+        from desensitize import read_structured_table
+        tmp = tempfile.mkdtemp()
+        p = os.path.join(tmp, 't.xlsx')
+        self._make_xlsx(p)
+        headers, rows, types = read_structured_table(p)
+        r = self.d.mask_table(headers, rows, types)
+        self.assertIn('20181009', r.text)          # 日期保留
+        self.assertIn('340690400059', r.text)      # 联行号不标 [金额]
+        self.assertNotIn('[金额]', r.text)
+
+    def test_scan_finds_isolated_name(self):
+        """普通模式下孤立姓名残留：审阅清单必须提示（要求8）。"""
+        import sys; sys.path.insert(0, '.')
+        from desensitize import scan_remaining_risk, Desensitizer
+        d = Desensitizer()
+        masked = d.mask('对方账号与户名:胡若薇').text
+        hits = [x for x in scan_remaining_risk(masked)
+                if x['type'] == '孤立姓名候选']
+        self.assertTrue(any(x['value'] == '胡若薇' for x in hits))
+
+    def test_scan_no_false_positive_common_words(self):
+        from desensitize import scan_remaining_risk, Desensitizer
+        d = Desensitizer()
+        masked = d.mask('消费 转账 摘要 金额 20181009').text
+        hits = [x for x in scan_remaining_risk(masked)
+                if x['type'] == '孤立姓名候选']
+        self.assertEqual(hits, [])
+
+
 if __name__ == '__main__':
     unittest.main()

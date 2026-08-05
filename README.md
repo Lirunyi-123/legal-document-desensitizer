@@ -28,6 +28,8 @@
 > **v3.4 新特性**：支付平台前缀交易对手（"支付宝-刘方立"→"支付宝-[当事人_1]"）| 扫描件 PDF 明确报错+OCR 指引（不再静默产出空文件）| PDF 输入自动命名 .txt（不再产生假 .pdf）
 >
 > **v3.5 新特性**：银行流水场景升级（借鉴第三方框架）— 账号/户名组合（"6212261001014270893/胡若薇"→"[银行账号]/[当事人_1]"）| 支付宝掩码账号（"7399/支***刘方立"）| 银行分支机构名（分行/支行/本级/本币/头寸/机构）| 交易日期不再被金额规则误标
+>
+> **v3.6 新特性**：列感知脱敏（`mask --table-aware`）— 自动识别银行流水表头列名（对方账号与户名/交易日期/交易金额等），按列类型脱敏：户名列孤立姓名也识别（解决单次出现姓名漏掉）、日期列不脱敏、附言列联行号不误标 | 审计清单新增孤立姓名残留 WARN | 支持 .xlsx 与带文本层的 .pdf
 
 ## 快速体验（30 秒）
 
@@ -59,6 +61,9 @@ python desensitize.py mask -f 合同.docx
 python desensitize.py mask -f 证据.pdf
 python desensitize.py mask -f 文档.txt
 python desensitize.py mask -f 银行流水.xlsx
+
+# v3.6 列感知模式（银行流水表格，自动识别表头列名）
+python desensitize.py mask -f 银行流水.xlsx --table-aware --review
 
 # 从管道输入
 cat 文档.txt | python desensitize.py mask

@@ -911,6 +911,82 @@ class Desensitizer:
             text = self._apply_ner_entities(text, ner_backend)
         return self._finalize(text)
 
+    # v3.6：列感知脱敏（银行流水表格）
+    # 每个单元格独立走规则层，但共享 EntityResolver 状态 →
+    # 同一对手方（"支付宝-刘方立" 与 "7399/支***刘方立"）全表统一占位符。
+    # 列类型决定该列的规则侧重：
+    # - 户名列：优先人名识别（孤立姓名也识别，解决 count<2 漏掉的问题）
+    # - 日期列：不脱敏（交易日期是业务信息不是敏感信息）
+    # - 金额列：金额/余额是财务数据，规则层按需替换大额
+    # - 附言列：平台前缀对手方、公司名、银行机构（大额数字多为联行号，不按金额）
+    _COLUMN_COUNTERPARTY_TYPES = ('户名', '附言')
+    _COLUMN_NO_AMOUNT_TYPES = ('附言',)
+
+    def _mask_cell(self, cell_text: str, col_type: str) -> str:
+        """对单个单元格按列类型脱敏，返回替换后的文本。
+
+        单元格脱敏的规则侧重（复用 mask 的完整规则链，仅做针对性增强）：
+        - 户名列：孤立中文姓名（无角色词、只出现一次）也强制识别
+        - 附言列：不按金额规则（12 位联行号 340690400059 不是金额）
+        事件坐标：_event_offset 已由 mask_table 设为该格全文偏移，
+        _record_event 自动加偏移 → 还原配对正确。
+        """
+        if col_type == '日期':
+            return cell_text
+        # 户名列增强：单元格本身是 2~4 字中文姓名（无账号/平台前缀）
+        if col_type in self._COLUMN_COUNTERPARTY_TYPES:
+            name = re.sub(r'[ \t]', '', cell_text)
+            if (2 <= len(name) <= 4 and all('\u4e00' <= c <= '\u9fa5' for c in name)
+                    and name[0] in _SURNAMES
+                    and self._is_plausible_role_name(name, '')
+                    and cell_text == name):
+                _, ph = self._resolver.resolve_person(name, '交易对手')
+                self._record(name, ph, '人名')
+                self._record_event(0, name, ph)
+                return ph
+        # 附言列：跳过金额规则（金额 pass 会被附言列的数字误伤）
+        if col_type in self._COLUMN_NO_AMOUNT_TYPES:
+            return self._run_rules_no_amount(cell_text)
+        return self._run_rules(cell_text)
+
+    def mask_table(self, headers, rows, col_types, original_path=None):
+        """列感知脱敏整张银行流水表格。
+
+        返回 MaskResult（text 为"单元格展平文本"，供写回/审阅复用）。
+        每个单元格独立脱敏；日期列原样保留；同一实体全表统一占位符。
+
+        展平顺序与 write_desensitized_file 的回填顺序严格一致：
+        - 表头行也逐格展平（写回时从第 1 行开始消费）
+        - 非字符串单元格用 _xlsx_cell_text 归一（数值/日期/布尔/None 语义一致）
+        - 日期列单元格原样保留（业务信息非敏感）
+        """
+        self._reset()
+        # 构建 (文本行, 列类型) 序列：表头 + 数据行，与写回消费顺序一致
+        cells = []
+        for h in headers:
+            cells.append((str(h) if h else '', '默认'))
+        for row in rows:
+            for idx, cell in enumerate(row):
+                s = _xlsx_cell_text(cell) if not isinstance(cell, str) else cell
+                if s is None:
+                    cells.append(('', '默认'))
+                    continue
+                ctype = col_types[idx] if idx < len(col_types) else '默认'
+                cells.append((s.replace('\n', _XLSX_NEWLINE_MARK), ctype))
+        text = '\n'.join(line for line, _ in cells)
+        self._original_text = text
+        # 逐格脱敏：每格设置全文偏移，事件坐标 = 格内位置 + 偏移
+        out_lines = []
+        pos = 0
+        for line, ctype in cells:
+            self._event_offset = pos
+            self._original_text = line  # 裸人名启发式用当前格文本
+            masked = self._mask_cell(line, ctype)
+            out_lines.append(masked)
+            pos += len(line) + 1  # +1 为 \n
+        self._original_text = text
+        return self._finalize('\n'.join(out_lines))
+
     def _run_rules(self, text: str) -> str:
         """按顺序执行全部规则层正则（先精确匹配再宽泛匹配）。"""
         # 按顺序执行各规则（先精确匹配再宽泛匹配）
@@ -942,6 +1018,37 @@ class Desensitizer:
         text = self._mask_address(text)        # 地址
         text = self._mask_amount(text)         # 金额（先于裸人名：避免"伍佰"被当人名）
         text = self._mask_bare_person_names(text)  # 裸人名（姓氏启发式 + 角色名传播）
+        return text
+
+    def _run_rules_no_amount(self, text: str) -> str:
+        """列感知用：规则链去掉金额 pass（附言列的大数字是联行号/交易代码，
+        不是金额；裸人名启发式也跳过，避免把数字误判）。"""
+        text = self._mask_bar_number(text)
+        text = self._mask_other_cert(text)
+        text = self._mask_id_card(text)
+        text = self._mask_email(text)
+        text = self._mask_phone(text)
+        text = self._mask_landline(text)
+        text = self._mask_wechat(text)
+        text = self._mask_qq(text)
+        text = self._mask_org_code(text)
+        text = self._mask_credit_code(text)
+        text = self._mask_bank_card(text)
+        text = self._mask_credit_code_bare(text)
+        text = self._mask_case_number(text)
+        text = self._mask_land_plot_number(text)
+        text = self._mask_license_plate(text)
+        if self._mask_all_dates:
+            text = self._mask_date(text)
+        else:
+            text = self._mask_birthdate(text)
+        text = self._mask_person_name(text)
+        text = self._mask_platform_counterparty(text)
+        text = self._mask_slash_account(text)
+        text = self._mask_company_name(text)
+        text = self._mask_bank_branch(text)
+        text = self._mask_project_name(text)
+        text = self._mask_address(text)
         return text
 
     def _finalize(self, text: str) -> MaskResult:
@@ -1269,8 +1376,14 @@ class Desensitizer:
         self._party_counter = 0
 
     def _record_event(self, pos: int, original: str, replacement: str) -> None:
-        """记录一次实际替换及其在"当时文本"中的位置，用于生成精确还原序列。"""
-        self._events.append((pos, original, replacement))
+        """记录一次实际替换及其在"当时文本"中的位置，用于生成精确还原序列。
+
+        v3.6：mask_table 列感知模式下，_event_offset 记录当前单元格在
+        展平全文中的起始偏移；事件位置 = 单元格内位置 + 偏移 = 全文坐标，
+        _build_event_mapping 按全文回放时才能正确配对还原。
+        """
+        self._events.append((pos + getattr(self, '_event_offset', 0),
+                             original, replacement))
 
     def _preprocess(self, text: str) -> str:
         """
@@ -2884,6 +2997,113 @@ def _iter_xlsx_lines(filepath: str):
 # 文件读取（支持 .txt / .docx / .pdf / .xlsx）
 # ============================================================
 
+# v3.6：银行流水列类型（列感知脱敏用）——按表头列名识别字段含义
+# 优先级从高到低：户名 > 日期 > 金额 > 附言 > 默认
+_COL_TYPE_RULES = (
+    ('户名', ('账号与户名', '账号及户名', '对方户名', '交易对手', '对方名称', '户名',
+              '收款人', '付款人', '交易对方', '对方账号与户名', '往来单位')),
+    ('日期', ('交易日期', '记账日期', '业务日期', '日期')),
+    ('金额', ('交易金额', '账户余额', '余额', '金额', '收入', '支出', '发生额', '借方', '贷方')),
+    ('附言', ('附言', '摘要', '备注', '用途', '地点')),
+)
+
+
+def _classify_column(header: str) -> str:
+    """按表头文本识别列类型（户名/日期/金额/附言/默认）。"""
+    for ctype, kws in _COL_TYPE_RULES:
+        for kw in kws:
+            if kw in header:
+                return ctype
+    return '默认'
+
+
+def _read_xlsx_table(filepath: str):
+    """读取 .xlsx 为结构化表格，返回 (headers, rows, col_types) 或 None。
+
+    - headers: 表头行（字符串列表）
+    - rows:    数据行（每行是 单元格值列表，None 表示空）
+    - col_types: 每列表头对应的列类型
+    仅当存在"可识别表头"（含至少一个已知列类型关键词）时返回结构化结果，
+    否则返回 None（调用方回退纯文本路径）。
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        sys.exit('❌ 需要安装 openpyxl: pip3 install openpyxl')
+    wb = load_workbook(filepath, data_only=False)
+    try:
+        for sheet in wb.worksheets:
+            all_rows = list(sheet.iter_rows(values_only=False))
+            if len(all_rows) < 2:
+                continue
+            # 第一行作为表头候选
+            header_row = all_rows[0]
+            headers = []
+            for c in header_row:
+                v = c.value
+                headers.append(str(v).strip() if v is not None else '')
+            # 校验：至少 2 个表头包含已知列类型关键词，否则不是结构化银行流水
+            types = [_classify_column(h) for h in headers]
+            known = [t for t in types if t != '默认']
+            if len(known) < 2:
+                continue
+            rows = []
+            for r in all_rows[1:]:
+                rows.append([c.value for c in r])
+            return headers, rows, types
+        return None
+    finally:
+        wb.close()
+
+
+def _read_pdf_table(filepath: str):
+    """读取 PDF 为结构化表格，返回 (headers, rows, col_types) 或 None。
+
+    用 PyMuPDF 的 find_tables(strategy='text') 提取表格（电子银行导出的
+    流水 PDF 常见）。提取失败或表头不可识别时返回 None。
+    """
+    try:
+        import fitz
+    except ImportError:
+        return None
+    doc = fitz.open(filepath)
+    try:
+        for page in doc:
+            try:
+                tabs = page.find_tables(strategy='text')
+            except Exception:
+                continue
+            for tab in tabs.tables:
+                data = tab.extract()
+                if not data or len(data) < 2:
+                    continue
+                header_row = data[0]
+                headers = [str(h).strip() if h else '' for h in header_row]
+                types = [_classify_column(h) for h in headers]
+                known = [t for t in types if t != '默认']
+                if len(known) < 2:
+                    continue
+                rows = [list(r) for r in data[1:]]
+                return headers, rows, types
+        return None
+    finally:
+        doc.close()
+
+
+def read_structured_table(filepath: str):
+    """读取文件为结构化表格（列感知脱敏用）。
+
+    返回 (headers, rows, col_types) 或 None（非结构化文档/无法识别表头）。
+    支持 .xlsx（openpyxl）与带文本层的 .pdf（PyMuPDF find_tables）。
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in ('.xlsx', '.xlsm'):
+        return _read_xlsx_table(filepath)
+    if ext == '.pdf':
+        return _read_pdf_table(filepath)
+    return None
+
+
 def read_text_from_file(filepath: str) -> str:
     """自动检测文件格式并提取文本"""
     ext = os.path.splitext(filepath)[1].lower()
@@ -3316,6 +3536,11 @@ _REMAINING_PATTERNS = (
     ('金额残留', re.compile(
         r'\d[\d,，.]{3,}[ \t]*[万千亿]?[ \t]*(?:元|美元|欧元)'
         r'|(?<!\d)(?!(?:19|20)\d{6})(\d{7,}(?:\.\d{1,3})?)(?!\d)')),
+    # v3.6 说明：规则层金额规则同样排除 8 位日期；附言列的 12 位纯数字
+    # （联行号/交易代码 340690400059）在列感知下由 _run_rules_no_amount
+    # 跳过不替换，但残留扫描的通用金额 pattern 仍会命中——这是审阅口径
+    # 与规则层不一致。12 位纯数字非 19/20 开头大概率是联行号而非金额，
+    # 不作为金额残留提示（由 scan_remaining_risk 的数字处理逻辑兜底）。
     ('案号', re.compile(r'[（(]\d{4}[）)]\s*[\u4e00-\u9fa5]{1,12}\s*\d{1,8}\s*号')),
     ('身份证号/手机号/银行账号', re.compile(
         r'(?<!\d)(?:1[3-9]\d{9}|\d{17}[\dXx]|\d{14,20})(?!\d)')),
@@ -3334,6 +3559,12 @@ def scan_remaining_risk(masked_text: str) -> list:
         for m in pat.finditer(masked_text):
             if _inside_placeholder(masked_text, m.start()):
                 continue
+            if typ == '金额残留':
+                # v3.6：12~13 位纯数字且非 19/20 开头 → 联行号/交易代码，
+                # 不是金额残留（列感知下规则层本就不替换附言列这类数字）
+                if re.fullmatch(r'\d{12,13}', m.group(0)) \
+                        and not m.group(0).startswith(('19', '20')):
+                    continue
             if typ == '项目名称残留':
                 name = m.group(1)
                 if (name[0] in _PROJECT_GENERIC_SINGLE
@@ -3348,6 +3579,32 @@ def scan_remaining_risk(masked_text: str) -> list:
             start = max(0, m.start() - 12)
             ctx = masked_text[start:m.end() + 12].replace('\n', ' ')
             findings.append({'type': typ, 'value': value, 'context': ctx})
+    # v3.6：孤立中文姓名候选（无角色词、无平台前缀、只出现一次）。
+    # 普通文本模式下这类姓名会漏（裸人名启发式要求 count≥2 或强上下文），
+    # 审阅清单必须显式提示，否则律师会误以为"无残留"。
+    for m in re.finditer(
+            r'(?<![\u4e00-\u9fa5\]\[）(])'
+            r'([\u4e00-\u9fa5]{2,4})'
+            r'(?![\u4e00-\u9fa5（(])', masked_text):
+        if _inside_placeholder(masked_text, m.start()):
+            continue
+        name = m.group(1)
+        if name in _BARE_NAME_BLACKLIST:
+            continue
+        if not _looks_like_person_name(name):
+            continue
+        # 排除常见非人名词（消费/转账/摘要 等财务词汇与表头）
+        if name in ('消费', '转账', '摘要', '金额', '余额', '收入', '支出',
+                    '合计', '人民币', '电子汇入', '网银转账', '跨行', '清算',
+                    '结息', '利息', '手续费', '管理费', '交易日期', '账户',
+                    # v3.6：银行流水表头词（jieba 整词误判）
+                    '序号', '附言', '户名', '日期', '账号', '客户', '对方',
+                    '交易', '业务', '卡号', '支行', '分行', '银行', '本币',
+                    '头寸', '机构', '商户', '查询', '打印', '明细', '账单'):
+            continue
+        start = max(0, m.start() - 12)
+        ctx = masked_text[start:m.end() + 12].replace('\n', ' ')
+        findings.append({'type': '孤立姓名候选', 'value': name, 'context': ctx})
     return findings
 
 
@@ -3599,6 +3856,12 @@ def main():
                              help='v3.0：PDF 输入时输出"真·涂黑"PDF（保留版式，字符级精确匹配'
                                   '+词边界+OCR空格容忍，清元数据/批注/表单/书签/附件，'
                                   'residual 零残留校验）；-o 指定 .pdf 扩展名时自动启用')
+    mask_parser.add_argument('--table-aware', action='store_true', default=False,
+                             help='v3.6：列感知模式（银行流水表格）。自动识别表头列名'
+                                  '（对方账号与户名/交易日期/交易金额等），按列类型脱敏：'
+                                  '户名列孤立姓名也识别、日期列不脱敏、金额列不误标联行号；'
+                                  '表头不可识别时自动回退普通文本模式。'
+                                  '支持 .xlsx / 带文本层的 .pdf')
 
     # scan 命令
     scan_parser = subparsers.add_parser('scan', help='扫描敏感信息（不替换）')
@@ -3722,7 +3985,23 @@ def main():
             if sys.stderr.isatty():
                 print(f'🤖 本地 NER 层已启用（{ner.backend_name}）', file=sys.stderr)
         try:
-            result = d.mask_with_ner(text, ner) if ner else d.mask(text)
+            # v3.6：列感知模式（--table-aware）——自动识别银行流水表格表头
+            table_aware = getattr(args, 'table_aware', False)
+            if table_aware and args.file:
+                structured = read_structured_table(args.file)
+                if structured is not None:
+                    headers, rows, col_types = structured
+                    result = d.mask_table(headers, rows, col_types)
+                    if sys.stderr.isatty():
+                        print(f'📊 列感知模式已启用：识别到表头 '
+                              f'{headers}，按列类型脱敏', file=sys.stderr)
+                else:
+                    if sys.stderr.isatty():
+                        print('⚠️  未能识别表格表头，回退普通文本模式',
+                              file=sys.stderr)
+                    result = (d.mask_with_ner(text, ner) if ner else d.mask(text))
+            else:
+                result = d.mask_with_ner(text, ner) if ner else d.mask(text)
         except NotImplementedError as e:
             sys.exit(f'❌ {e}')
         except ImportError as e:

@@ -545,10 +545,14 @@ _PLATFORM_WORDS = (
     '快钱', '拉卡拉', '平安付', '易宝支付', 'PayPal', '贝宝',
     '手机银行', '网上银行', '网银', '掌上银行', 'Apple Pay',
     '微信转账', '微信红包', '支付宝转账', '支付宝红包',
+    # v3.8：银行流水 OCR 常见"支付宝外部商户-xxx"（商户是个人时 xxx 是人名）
+    '支付宝外部商户', '微信外部商户', '财付通外部商户', '云闪付外部商户',
 )
 _PLATFORM_PATTERN = re.compile(
     '((?:' + '|'.join(_spaced_re(w) for w in _PLATFORM_WORDS) + '))'
     r'[-－—–：:·、\s\u3000]{1,3}'
+    r'(?:个体工商户|个体经营|商户|商家)?'   # v3.8：外部商户的修饰前缀（个体工商户许秋华）
+    r'[-－—–：:·、\s\u3000]{0,3}'
     r'([\u4e00-\u9fa5]{2,4})'
     r'(?=[，,。. （(的与和向称诉等为之：:、]|\s|\u3001|$)'
 )
@@ -608,10 +612,11 @@ def _trim_company_span(span: str) -> tuple:
     2. "微信告知原告公司""扣押或冻结被告…公司"等上下文词整串剥离。
     """
     name = span.lstrip(' \t')
-    # 1) 右锚定切分：只在"与/括号/、/，"这些结构标记处切（不切"和/及"，
-    #    避免误伤"浙江和泰建设"这类名称内部含连接字的合法公司名）
+    # 1) 右锚定切分：只在"与/、/，"这些结构标记处切（不切括号——
+    #    "飒拉商业（上海）有限公司"的"（上海）"是公司名的一部分，切了会破坏）；
+    #    也不切"和/及"，避免误伤"浙江和泰建设"这类名称内部含连接字的合法公司名
     cut = -1
-    for m in re.finditer(r'[与）)(（、，]', name):
+    for m in re.finditer(r'[与、，]', name):
         cut = m.start()
     if cut >= 0 and cut + 1 < len(name):
         name = name[cut + 1:].lstrip(' \t')
@@ -1850,8 +1855,13 @@ class Desensitizer:
         name = re.sub(r'[ \t]', '', name)   # OCR 空格姓名先归一
         if not name:
             return False
-        # 含虚词/连接词的"名字"（如"起诉之日""与被告"）不是姓名
-        if any(ch in _ROLE_NAME_REJECT for ch in name):
+        # 含虚词/连接词的"名字"（如"起诉之日""与被告"）不是姓名。
+        # v3.8 精确化：虚词"在/于"在姓名中间合法（张在芳/李在明/于敏），
+        # 只拒绝"首字是虚词"或"虚词在末尾且前面是常见动词前缀"的组合。
+        if name[0] in _ROLE_NAME_REJECT:
+            return False
+        if len(name) >= 2 and name[-1] in _ROLE_NAME_REJECT \
+                and any(ch in _ROLE_NAME_REJECT for ch in name[:-1]):
             return False
         # 常见动词/法律名词（如"被告承担""原告抚养"）
         if name in _ROLE_NAME_VERBS or name in _ROLE_NAME_NOUNS:
@@ -1864,8 +1874,11 @@ class Desensitizer:
         if name.startswith(tuple(_ROLE_NAME_BAD_PREFIXES)):
             return False
         # 后面紧跟公司/机构后缀 → 是机构名的一部分（"案外人杭州方汇建筑工程有限公司"）
+        # v3.8：跳过占位符（"[银行账号]/谢林轩" 后换行出现另一个 "[银行账号]/"，
+        # "银行"是占位符标签不是机构名，不应拒绝）
         after8 = after[:8]
-        joined = name + after8[:4]
+        after8_clean = re.sub(r'\[[^\]]+\]', '', after8)  # 去掉占位符
+        joined = name + after8_clean[:4]
         if any(s in joined for s in (
                 '有限公司', '公司', '集团', '事务所', '服务部', '商行',
                 '经营部', '商店', '银行', '法院', '学校', '医院')):
@@ -2906,11 +2919,14 @@ def _default_output_ext(filepath: str) -> str:
     - .pdf 输入：默认输出 .txt（PDF 仅支持"文本提取 + --pdf-redact 涂黑"两种，
       不带 --pdf-redact 时写纯文本；若自动命名沿用 .pdf 会产生"假 PDF"文本文件，
       双击打不开还误导用户）
+    - .png/.jpg 等图片输入：默认输出 .txt（图片经 OCR 得到纯文本，
+      输出本就是文本；沿用图片扩展名会产生"假 PNG"）
     - 其余格式：保留原扩展名（.docx → .docx, .xlsx → .xlsx, .txt → .txt）
     - 无扩展名：.txt
     """
     ext = os.path.splitext(filepath)[1].lower()
-    if ext == '.pdf':
+    if ext in ('.pdf', '.png', '.jpg', '.jpeg', '.bmp', '.webp',
+               '.tif', '.tiff'):
         return '.txt'
     return ext if ext else '.txt'
 
@@ -2998,12 +3014,49 @@ def _iter_xlsx_lines(filepath: str):
 # 文件读取（支持 .txt / .docx / .pdf / .xlsx）
 # ============================================================
 
-# v3.7：扫描件 PDF 内置 OCR（macOS Vision 框架，无需安装任何工具）
+# v3.7：扫描件 PDF / v3.8：图片文件 内置 OCR（macOS Vision 框架，无需安装任何工具）
 # ocr_vision.swift 位于本工具目录，编译成二进制后批量识别页面图片。
 # Windows/Linux 无 Vision 框架 → 返回 None，调用方回退"明确报错+OCR指引"。
 _OCR_SWIFT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           'ocr_vision.swift')
 _OCR_BIN = os.path.join(tempfile.gettempdir(), 'legal_deid_ocr_vision')
+
+
+def _ensure_ocr_bin() -> bool:
+    """确保 ocr_vision.swift 已编译为二进制（首次 swiftc 编译缓存，后续复用）。
+
+    返回 True 表示可用；非 macOS / swift 缺失 / 编译失败 → False。
+    """
+    if sys.platform != 'darwin':
+        return False
+    if not os.path.exists(_OCR_SWIFT):
+        return False
+    if os.path.exists(_OCR_BIN):
+        return True
+    import subprocess
+    try:
+        ret = subprocess.run(['swiftc', '-O', '-o', _OCR_BIN, _OCR_SWIFT],
+                             capture_output=True, timeout=180)
+    except Exception:
+        return False
+    return ret.returncode == 0
+
+
+def _ocr_image_with_vision(filepath: str):
+    """图片文件（.png/.jpg/.jpeg 等）→ macOS Vision OCR 提取文本（或 None）。"""
+    if not _ensure_ocr_bin():
+        return None
+    import subprocess
+    try:
+        ret = subprocess.run([_OCR_BIN, filepath],
+                             capture_output=True, timeout=120)
+    except Exception:
+        return None
+    if ret.returncode != 0:
+        return None
+    text = ret.stdout.decode('utf-8', errors='replace')
+    return text.strip() if text.strip() else None
+
 
 def _ocr_pdf_with_vision(filepath: str):
     """扫描件 PDF → 用 macOS Vision OCR 提取文本（返回拼接文本或 None）。
@@ -3012,22 +3065,12 @@ def _ocr_pdf_with_vision(filepath: str):
     拼接页面文本（页间 "=====PAGE N=====" 分隔）。
     仅 macOS（darwin）且 Vision 可用时生效；否则返回 None。
     """
-    if sys.platform != 'darwin':
+    if not _ensure_ocr_bin():
         return None
     try:
         import fitz
     except ImportError:
         return None
-    # 确保 ocr_vision.swift 存在
-    if not os.path.exists(_OCR_SWIFT):
-        return None
-    # 编译二进制（首次；后续直接复用）
-    if not os.path.exists(_OCR_BIN):
-        import subprocess
-        ret = subprocess.run(['swiftc', '-O', '-o', _OCR_BIN, _OCR_SWIFT],
-                             capture_output=True, timeout=180)
-        if ret.returncode != 0:
-            return None
     tmpdir = tempfile.mkdtemp(prefix='deid_ocr_')
     try:
         doc = fitz.open(filepath)
@@ -3165,6 +3208,18 @@ def read_structured_table(filepath: str):
 def read_text_from_file(filepath: str) -> str:
     """自动检测文件格式并提取文本"""
     ext = os.path.splitext(filepath)[1].lower()
+
+    # v3.8：图片文件（银行流水截图等）→ macOS Vision OCR
+    if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff'):
+        ocr_text = _ocr_image_with_vision(filepath)
+        if ocr_text:
+            if sys.stderr.isatty():
+                print('🔎 已用 macOS Vision 内置 OCR 识别图片',
+                      file=sys.stderr)
+            return ocr_text
+        sys.exit('❌ 无法从图片提取文本（内置 OCR 不可用或图片无文字）。\n'
+                 '   macOS 已自动尝试 Vision OCR；Windows/Linux 请先用'
+                 ' OCR 工具识别图片中的文字后再处理。')
 
     if ext == '.txt':
         with open(filepath, 'r', encoding='utf-8') as f:

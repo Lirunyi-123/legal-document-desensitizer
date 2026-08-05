@@ -1486,5 +1486,70 @@ class TestV37PdfOcrFallback(unittest.TestCase):
                         'ocr_vision.swift 应存在于工具目录')
 
 
+# ============================================================
+# v3.8 回归：图片输入支持 + 银行流水 OCR 场景规则修复
+# ============================================================
+class TestV38ImageInput(unittest.TestCase):
+    """图片文件（.png/.jpg）→ macOS Vision OCR；平台外部商户人名/
+    公司名括号/占位符后姓名等银行流水 OCR 场景规则修复。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_image_default_output_txt(self):
+        from desensitize import _default_output_ext
+        self.assertEqual(_default_output_ext('a.png'), '.txt')
+        self.assertEqual(_default_output_ext('a.jpg'), '.txt')
+        self.assertEqual(_default_output_ext('a.jpeg'), '.txt')
+        self.assertEqual(_default_output_ext('a.PNG'), '.txt')
+
+    def test_platform_external_merchant_name(self):
+        """支付宝外部商户-xxx：xxx 是人名（商户为个人）→ 脱敏。"""
+        for t in ('支付宝外部商户-施明月', '支付宝外部商户-徐丹丹',
+                  '支付宝外部商户-张在芳', '支付宝外部商户-个体工商户许秋华'):
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertTrue(any(m.type == '人名' for m in r.mapping),
+                                f'{t} -> {r.text}')
+                self.assertNotIn('施明月' if '施明月' in t else (
+                    '徐丹丹' if '徐丹丹' in t else (
+                        '张在芳' if '张在芳' in t else '许秋华')), r.text)
+                self.assertEqual(restore_text(r.text, r.mapping), t)
+
+    def test_company_name_with_bracket_kept(self):
+        """公司名含地域括号："飒拉商业（上海）有限公司" 整体替换。"""
+        for t in ('支付宝-飒拉商业（上海）有限公司',
+                  '支付宝-迅销（中国）商贸有限公司'):
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertIn('[公司', r.text)
+                self.assertNotIn('飒拉' if '飒拉' in t else '迅销', r.text)
+                self.assertEqual(restore_text(r.text, r.mapping), t)
+
+    def test_bracket_abbrev_still_works(self):
+        """防回归：（以下简称宝冶公司）仍正确切分。"""
+        r = self.d.mask('（以下简称宝冶公司）与被告广州合生东宇房地产有限公司')
+        self.assertIn('以下简称[公司', r.text)
+        self.assertIn('[合同乙方]', r.text)
+
+    def test_slash_name_after_placeholder(self):
+        """占位符后姓名不因"银行"占位符误判机构后缀。"""
+        r = self.d.mask('[银行账号]/谢林轩\n[银行账号]/张三')
+        self.assertIn('[当事人_1]', r.text)
+        self.assertIn('[当事人_2]', r.text)
+        self.assertNotIn('谢林轩', r.text)
+        self.assertEqual(restore_text(r.text, r.mapping),
+                         '[银行账号]/谢林轩\n[银行账号]/张三')
+
+    def test_name_with_zaizi_char(self):
+        """姓名含"在"字（张在芳）不再被虚词表误伤。"""
+        r = self.d.mask('支付宝外部商户-张在芳')
+        self.assertIn('[当事人', r.text)
+        self.assertNotIn('张在芳', r.text)
+        # 防回归："起诉之日"这类词组仍拒绝
+        r2 = self.d.mask('收款人：起诉之日')
+        self.assertNotIn('[当事人', r2.text)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -258,6 +258,7 @@ _COMPOUND_SURNAMES = set(
 _BARE_NAME_BLACKLIST = set(
     (
     '陈述 陈设 陈列 陈旧 陈规 陈词 陈年 陈腐 陈情 陈诉 陈案 '
+    '支付宝 财付通 云闪付 银联 翼支付 京东支付 平安付 易宝支付 微信转账 微信红包 '  # v3.4 支付平台
     '王国 王子 王后 王位 王权 王法 王八 王室 王朝 王宫 王储 '
     '李代 李唐 李树 '
     '张罗 张望 张贴 张狂 张扬 张挂 张榜 张目 张嘴 张口 张冠 '
@@ -533,6 +534,22 @@ _ROLE_PATTERN = re.compile(
     r'(?=[，,。. （(的与和向称诉等为之：:、被就陆续作证签署结算收取领取出具归还返还对账'
     r'支付偿还提交委托要求请求主张认为表示拒绝承认答应起诉上诉申诉复核到庭出庭陈述'
     r'辩称举证质证告适]|\s|\u3001|$)'
+)
+
+# v3.4：支付平台前缀交易对手（银行流水高频格式："支付宝-刘方立" / "微信转账-张三"）
+# 平台词 + 强制分隔符（- — ：: 空格 · 等）+ 2~4 字姓名。
+# 分隔符强制要求 ≥1 个，避免把"微信支付""支付宝到账"这类普通短语误当平台前缀。
+_PLATFORM_WORDS = (
+    '支付宝', '微信', '财付通', '云闪付', '银联', '翼支付', '京东支付',
+    '快钱', '拉卡拉', '平安付', '易宝支付', 'PayPal', '贝宝',
+    '手机银行', '网上银行', '网银', '掌上银行', 'Apple Pay',
+    '微信转账', '微信红包', '支付宝转账', '支付宝红包',
+)
+_PLATFORM_PATTERN = re.compile(
+    '((?:' + '|'.join(_spaced_re(w) for w in _PLATFORM_WORDS) + '))'
+    r'[-－—–：:·、\s\u3000]{1,3}'
+    r'([\u4e00-\u9fa5]{2,4})'
+    r'(?=[，,。. （(的与和向称诉等为之：:、]|\s|\u3001|$)'
 )
 
 
@@ -917,6 +934,7 @@ class Desensitizer:
         else:
             text = self._mask_birthdate(text)   # 仅带出生上下文的日期
         text = self._mask_person_name(text)    # 人名（角色词上下文）
+        text = self._mask_platform_counterparty(text)  # v3.4：支付平台前缀交易对手
         text = self._mask_company_name(text)   # 公司名
         text = self._mask_project_name(text)   # 项目名称（公司名之后，避免吞掉公司简称）
         text = self._mask_address(text)        # 地址
@@ -1782,7 +1800,6 @@ class Desensitizer:
         segmenter = _get_segmenter()
         if segmenter is None:
             return set()  # 无分词器时放弃发现（种子传播不受影响）
-
         tokens = segmenter(text)
         token_at = {}
         pos = 0
@@ -1947,6 +1964,52 @@ class Desensitizer:
                         and cand[2] not in _NAME_GLUE_CHARS):
                     return True
         return False
+
+    def _mask_platform_counterparty(self, text: str) -> str:
+        """v3.4：支付平台前缀交易对手（银行流水高频格式）。
+
+        识别 "支付宝-刘方立" / "微信转账-张三" / "财付通：李四" 等
+        "平台词 + 分隔符 + 人名" 结构。平台词是公开品牌（不脱敏，保留），
+        人名是交易对手 → 绑定"交易对手"角色（占位符回退为 [当事人_N]，
+        不同对手不同编号、同一对手全文一致）。
+
+        安全约束（避免误伤"微信支付""支付宝到账"等普通短语）：
+        - 强制要求分隔符 ≥1 个（- — ：: 空格 · 等）
+        - 候选须以常见姓氏开头（同角色词人名校验）
+        - 候选通过 _is_plausible_role_name 校验（排除 转账/到账/收款 等动词名词）
+        """
+        shift = [0]
+
+        def replacer(m):
+            platform_raw = m.group(1)
+            raw_name = m.group(2)
+            name = re.sub(r'[ \t]', '', raw_name)
+            name_start = m.start(2)   # 相对当前 sub 文本（replacer 收到的 m）
+            # 姓氏开头（单姓/复姓）
+            surname_ok = (name[0] in _SURNAMES
+                          or (len(name) >= 2 and name[:2] in _COMPOUND_SURNAMES))
+            if not surname_ok:
+                return m.group(0)
+            if not self._is_plausible_role_name(
+                    name, text[name_start + len(name):]):
+                return m.group(0)
+            # 交易对手占位符：不同对手不同编号、同一对手全文一致
+            _, placeholder = self._resolver.resolve_person(name, '交易对手')
+            # 注册到 _replaced（_build_event_mapping 需按原文反查类型）
+            self._record(name, placeholder, '人名')
+            # OCR 空格姓名按 raw_name（含空格）记录，保证逐字节还原
+            event_orig = raw_name if (' ' in raw_name or '\t' in raw_name) else name
+            self._record_event(name_start + shift[0], event_orig, placeholder)
+            # 保留平台词与分隔符原文，仅替换姓名部分
+            # group(0) = 平台词 + 分隔符 + 姓名，从 m.start(1) 开始
+            sep_start = len(platform_raw)                     # 分隔符在 group(0) 内起点
+            sep_end = m.start(2) - m.start(1)                 # 分隔符终点 = 平台词+分隔符总长
+            sep = m.group(0)[sep_start:sep_end]
+            out = f'{platform_raw}{sep}{placeholder}'
+            shift[0] += len(out) - len(m.group(0))
+            return out
+
+        return _PLATFORM_PATTERN.sub(replacer, text)
 
     def _mask_bare_person_names(self, text: str) -> str:
         """裸人名统一替换：
@@ -2630,6 +2693,21 @@ def decrypt_mapping_encrypted(filepath: str, password: str) -> str:
 # 文件名自动脱敏
 # ============================================================
 
+def _default_output_ext(filepath: str) -> str:
+    """自动命名时的默认输出扩展名。
+
+    - .pdf 输入：默认输出 .txt（PDF 仅支持"文本提取 + --pdf-redact 涂黑"两种，
+      不带 --pdf-redact 时写纯文本；若自动命名沿用 .pdf 会产生"假 PDF"文本文件，
+      双击打不开还误导用户）
+    - 其余格式：保留原扩展名（.docx → .docx, .xlsx → .xlsx, .txt → .txt）
+    - 无扩展名：.txt
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == '.pdf':
+        return '.txt'
+    return ext if ext else '.txt'
+
+
 def sanitize_filename(filepath: str) -> str:
     """自动将文件名中的敏感信息替换为脱敏占位符。
 
@@ -2747,10 +2825,21 @@ def read_text_from_file(filepath: str) -> str:
             sys.exit('❌ 需要安装 PyMuPDF: pip3 install PyMuPDF')
         doc = fitz.open(filepath)
         pages = []
-        for page in doc:
-            pages.append(page.get_text())
-        doc.close()
-        return '\n\n'.join(pages)
+        try:
+            for page in doc:
+                pages.append(page.get_text())
+        finally:
+            doc.close()
+        all_text = '\n\n'.join(pages)
+        if not all_text.strip():
+            # 整份 PDF 未提取到任何文本 → 大概率是纯图片扫描件（文字在图片里）。
+            # 直接继续会产生"空脱敏文件"的假成功，必须明确报错并给出 OCR 指引。
+            sys.exit(
+                '❌ 未从 PDF 提取到任何文本层（整份共 {} 页）。\n'
+                '   该文件疑似为纯图片扫描件（文字在图片中，get_text() 提取不到）。\n'
+                '   请先用 OCR 工具生成带文本层的 PDF（如 ocrmypdf / WPS / Adobe：'
+                '"识别文本"），再运行本工具。'.format(len(pages)))
+        return all_text
 
     elif ext == '.xlsx' or ext == '.xlsm':
         # Excel：每个参与脱敏的单元格为一行，行序与 write_desensitized_file 回填一致
@@ -3569,14 +3658,15 @@ def main():
             sanitized_basename = getattr(args, '_sanitized_basename', None)
             if sanitized_basename:
                 dir_part = os.path.dirname(args.file)
-                name, ext = os.path.splitext(sanitized_basename)
+                name, _ = os.path.splitext(sanitized_basename)
+                out_ext = _default_output_ext(args.file)
                 if dir_part:
-                    output_path = os.path.join(dir_part, f'{name}_desensitized{ext}')
+                    output_path = os.path.join(dir_part, f'{name}_desensitized{out_ext}')
                 else:
-                    output_path = f'{name}_desensitized{ext}'
+                    output_path = f'{name}_desensitized{out_ext}'
             else:
-                base, ext = os.path.splitext(args.file)
-                output_path = f'{base}_desensitized{ext if ext else ".txt"}'
+                base, _ = os.path.splitext(args.file)
+                output_path = f'{base}_desensitized{_default_output_ext(args.file)}'
 
         if output_path:
             # v3.0：PDF 真·涂黑脱敏（--pdf-redact 或 -o 指定 .pdf 时自动启用）
@@ -3798,8 +3888,8 @@ def main():
         # 输出
         output_path = args.output
         if not output_path and args.file:
-            base, ext = os.path.splitext(args.file)
-            output_path = f'{base}_desensitized{ext if ext else ".txt"}'
+            base, _ = os.path.splitext(args.file)
+            output_path = f'{base}_desensitized{_default_output_ext(args.file)}'
         if output_path:
             write_desensitized_file(args.file, output_path, result.text)
             print(f'✅ 完整脱敏（规则层+LLM层）完成: {output_path}')
@@ -3834,8 +3924,8 @@ def main():
 
         output_path = args.output
         if not output_path:
-            base, e = os.path.splitext(args.file)
-            output_path = f'{base}_语义层{e if e else ".txt"}'
+            base, _ = os.path.splitext(args.file)
+            output_path = f'{base}_语义层{_default_output_ext(args.file)}'
         write_desensitized_file(args.file, output_path, final_text)
         print(f'✅ 语义层脱敏完成: {output_path}')
 

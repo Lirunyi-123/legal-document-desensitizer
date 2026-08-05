@@ -248,6 +248,40 @@ python3 desensitize.py restore -f 银行流水_desensitized.xlsx -m 映射表.md
 # 还原后逐单元格与原文件比对，要求 0 差异（含类型）
 ```
 
+## v3.4 修复（支付平台对手方 / 扫描件 PDF / 假 PDF）
+
+### 1. 支付平台前缀交易对手（银行流水高频格式）
+- "支付宝-刘方立" / "微信转账-张三" / "财付通：李四" / "支付宝 王五" 等
+  "平台词 + 分隔符 + 人名" 结构 → 平台名保留（公开品牌不脱敏）、人名替换为
+  `[当事人_N]`（不同对手不同编号、同一对手全文一致占位符）。
+- 识别约束（避免误伤）：强制要求分隔符 ≥1 个（"微信支付""支付宝到账"等
+  无分隔符普通短语不匹配）；候选须以常见姓氏开头并通过姓名 plausibility 校验。
+- 平台词（支付宝/微信/财付通/云闪付/银联/翼支付/京东支付/快钱/拉卡拉/平安付/
+  易宝支付/PayPal/贝宝/手机银行/网上银行/网银/掌上银行/Apple Pay/微信转账/
+  微信红包/支付宝转账/支付宝红包）同步加入裸人名黑名单，防止"支付宝"被当人名。
+- 归因：v2.7 收紧裸人名（宁漏勿误）导致"平台名+人名"低频格式漏识别。
+
+### 2. 扫描件 PDF 明确报错（不再静默产出空文件）
+- `read_text_from_file` 的 PDF 分支：整份提取不到任何文本 → `sys.exit` 报错
+  "未从 PDF 提取到任何文本层（疑似纯图片扫描件）"并给出 OCR 指引
+  （ocrmypdf / WPS / Adobe "识别文本"）。之前会静默产出 0 字节假成功文件。
+
+### 3. PDF 输入自动命名 .txt（不再产生假 .pdf）
+- mask / full / semantic 对 PDF 输入的自动输出扩展名改为 `.txt`
+  （与 SKILL.md 声明一致）。之前沿用输入扩展名，产出"文本内容 + .pdf 后缀"
+  的假 PDF。`--pdf-redact` 仍自动输出 `_redacted.pdf`。
+
+### 验证方法（v3.4 起）
+```bash
+python3 -m unittest test_desensitize     # 127 个单测（v3.3 120 + v3.4 7）
+python3 evaluate.py                      # 红队用例（105 项命中、误报 0）
+python3 selfcheck.py                     # 自检：6 项必检全部通过
+printf '支付宝-刘方立\n微信转账-张三\n' | python3 desensitize.py mask
+# → 支付宝-[当事人_1] / 微信转账-[当事人_2]
+python3 desensitize.py mask -f 扫描件.pdf   # → 明确报错 + OCR 指引
+python3 desensitize.py mask -f 判决书.pdf   # → 判决书_desensitized.txt（不再假 .pdf）
+```
+
 ## 输入
 
 接受以下格式的文档内容（粘贴或文件路径）：

@@ -1144,5 +1144,99 @@ class TestExcelSupport(unittest.TestCase):
         self.assertEqual(cells['流水'][4][3], '微信号：[微信号]')
 
 
+# ============================================================
+# v3.4 回归：支付平台前缀交易对手 / PDF 空文本报错 / 假 PDF 修复
+# ============================================================
+class TestV34PlatformCounterparty(unittest.TestCase):
+    """银行流水高频格式："支付宝-刘方立" / "微信转账-张三" → 平台名保留、人名脱敏。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_platform_prefix_person_masked(self):
+        for t in ('支付宝-刘方立', '微信转账-张三', '财付通：李四',
+                  '支付宝 王五', '银联-陈建国'):
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertTrue(any(m.type == '人名' for m in r.mapping),
+                                f'{t} -> {r.text}')
+                # 平台名保留（公开品牌，不脱敏）
+                self.assertIn('支付宝' if '支付宝' in t else
+                              ('微信' if '微信' in t else
+                               ('财付通' if '财付通' in t else '银联')), r.text)
+
+    def test_platform_restore_roundtrip(self):
+        for t in ('支付宝-刘方立 转账1000元',
+                  '2024-01-15 微信转账-张三 余额5000.00',
+                  '银联-陈建国\n支付宝-刘方立'):
+            with self.subTest(t=t):
+                r = self.d.mask(t)
+                self.assertEqual(restore_text(r.text, r.mapping), t)
+
+    def test_platform_same_person_same_placeholder(self):
+        r = self.d.mask('支付宝-刘方立\n支付宝-刘方立\n银联-陈建国')
+        self.assertEqual(r.text.count('[当事人_'), 3)
+        # 同一对手（刘方立）两次出现 → 同一占位符；陈建国不同
+        lines = r.text.split('\n')
+        self.assertEqual(lines[0], lines[1], '同一对手跨行应统一占位符')
+        self.assertNotEqual(lines[0], lines[2])
+
+    def test_platform_no_false_positive(self):
+        # 无分隔符的普通短语不是平台前缀，且平台词不是人名
+        r = self.d.mask('微信支付了100元\n支付宝到账2000元')
+        self.assertIn('微信支付了', r.text)
+        self.assertIn('支付宝到账', r.text)
+        self.assertNotIn('[当事人', r.text)
+
+    def test_pdf_no_text_layer_rejected(self):
+        """纯图片扫描件 PDF：明确报错并给出 OCR 指引，而非静默产出空文件。"""
+        import tempfile, os
+        from desensitize import read_text_from_file
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest('PyMuPDF 未安装')
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '扫描件.pdf')
+        doc = fitz.open()
+        page = doc.new_page()
+        page.draw_rect(fitz.Rect(0, 0, 600, 800), color=None, fill=(0.9, 0.9, 0.9))
+        doc.save(src)
+        doc.close()
+        with self.assertRaises(SystemExit) as cm:
+            read_text_from_file(src)
+        self.assertIn('文本层', str(cm.exception))
+        self.assertIn('OCR', str(cm.exception))
+
+    def test_pdf_with_text_still_works(self):
+        import tempfile, os
+        from desensitize import read_text_from_file
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest('PyMuPDF 未安装')
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '正常.pdf')
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((60, 80), '原告陈建国，身份证号110101198001011232。',
+                         fontname='china-s', fontsize=10)
+        doc.save(src)
+        doc.close()
+        text = read_text_from_file(src)
+        self.assertIn('陈建国', text)
+        self.assertIn('110101198001011232', text)
+
+    def test_default_output_ext_pdf_to_txt(self):
+        """PDF 输入未指定 -o 时自动命名 .txt（避免假 PDF），其他格式保留原扩展名。"""
+        from desensitize import _default_output_ext
+        self.assertEqual(_default_output_ext('a.pdf'), '.txt')
+        self.assertEqual(_default_output_ext('a.docx'), '.docx')
+        self.assertEqual(_default_output_ext('a.xlsx'), '.xlsx')
+        self.assertEqual(_default_output_ext('a.txt'), '.txt')
+        self.assertEqual(_default_output_ext('a'), '.txt')
+        self.assertEqual(_default_output_ext('A.PDF'), '.txt')
+
+
 if __name__ == '__main__':
     unittest.main()

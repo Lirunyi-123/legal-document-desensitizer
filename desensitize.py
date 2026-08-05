@@ -935,7 +935,9 @@ class Desensitizer:
             text = self._mask_birthdate(text)   # 仅带出生上下文的日期
         text = self._mask_person_name(text)    # 人名（角色词上下文）
         text = self._mask_platform_counterparty(text)  # v3.4：支付平台前缀交易对手
+        text = self._mask_slash_account(text)  # v3.5：账号/户名 与 支付宝掩码账号/户名
         text = self._mask_company_name(text)   # 公司名
+        text = self._mask_bank_branch(text)    # v3.5：银行分支机构名（分行/支行/本级…）
         text = self._mask_project_name(text)   # 项目名称（公司名之后，避免吞掉公司简称）
         text = self._mask_address(text)        # 地址
         text = self._mask_amount(text)         # 金额（先于裸人名：避免"伍佰"被当人名）
@@ -2011,6 +2013,96 @@ class Desensitizer:
 
         return _PLATFORM_PATTERN.sub(replacer, text)
 
+    # v3.5：银行流水"账号/户名"组合（"6212261001014270893/胡若薇"）与
+    # 支付宝掩码账号（"7399/支***刘方立"）——对方账号与户名列高频格式
+    # 两种形态：完整账号+斜杠+户名；支付宝掩码+户名（掩码后无斜杠）。
+    # 完整账号若已被 _mask_bank_card 替换为 [银行账号] 占位符，同样支持（只补户名）。
+    _SLASH_ACCOUNT_RE = re.compile(
+        r'(?<![\d\u4e00-\u9fa5])(?:'
+        r'(?:\[银行账号\])[/／]([\u4e00-\u9fa5]{2,4})'   # 已被卡号规则替换
+        r'|(?:\d{8,25})[/／]([\u4e00-\u9fa5]{2,4})'      # 6212261001014270893/胡若薇
+        r'|(?:\d{1,4}/支\**)([\u4e00-\u9fa5]{2,4})'      # 7399/支***刘方立
+        r')(?![一-鿿])')
+
+    def _mask_slash_account(self, text: str) -> str:
+        """v3.5：银行流水"账号/户名"与"支付宝掩码账号/户名"组合。
+
+        参考第三方框架：银行流水对方账号与户名列常为
+        "6212261001014270893/胡若薇"、"7399/支***刘方立" 格式——
+        账号部分是敏感信息、斜杠后户名是交易对手人名，两者都要脱敏。
+        """
+        shift = [0]
+
+        def replacer(m):
+            # group1=已被卡号规则替换的 [银行账号]/户名；group2=完整账号/户名；
+            # group3=支付宝掩码/户名
+            g = 1 if m.group(1) is not None else (2 if m.group(2) is not None else 3)
+            name = m.group(g)
+            name_start = m.start(g)
+            if name[0] not in _SURNAMES:
+                return m.group(0)
+            if not self._is_plausible_role_name(
+                    name, text[name_start + len(name):]):
+                return m.group(0)
+            _, placeholder = self._resolver.resolve_person(name, '交易对手')
+            self._record(name, placeholder, '人名')
+            self._record_event(name_start + shift[0], name, placeholder)
+            if g == 1:
+                # 卡号已被 _mask_bank_card 替换为 [银行账号]：占位符与斜杠原样保留，
+                # 不再重复记录账号事件（否则还原时卡号会被二次处理）
+                acct_out = '[银行账号]'
+                sep = m.group(0)[len('[银行账号]'):name_start - m.start()]
+            else:
+                # 账号原文（不含斜杠）单独记录，输出占位符 + 原分隔符
+                acct_orig = m.group(0)[:name_start - m.start()]
+                if acct_orig.endswith('/'):
+                    acct_orig = acct_orig[:-1]
+                    sep = '/'
+                elif acct_orig.endswith('／'):
+                    acct_orig = acct_orig[:-1]
+                    sep = '／'
+                else:
+                    sep = ''
+                if g == 3:
+                    acct_out = '[支付宝账号]'
+                    self._record(acct_orig, acct_out, '支付宝账号')
+                else:
+                    acct_out = '[银行账号]'
+                    self._record(acct_orig, acct_out, '银行账号')
+                self._record_event(m.start() + shift[0], acct_orig, acct_out)
+            out = f'{acct_out}{sep}{placeholder}'
+            shift[0] += len(out) - len(m.group(0))
+            return out
+
+        return self._SLASH_ACCOUNT_RE.sub(replacer, text)
+
+    # v3.5：银行机构名（"中国建设银行股份有限公司安徽省分行本级本币头寸机构"）
+    # 公司名规则已处理"…股份有限公司"，此处补"分行/支行/本级/本币/头寸/机构"尾缀
+    _BANK_BRANCH_RE = re.compile(
+        r'([\u4e00-\u9fa5]{2,12}(?:分行|支行)'
+        r'(?:本级|本币|头寸|机构)*)')
+
+    def _mask_bank_branch(self, text: str) -> str:
+        """v3.5：银行分支机构名（尾缀 分行/支行/本级/本币/头寸/机构）。
+
+        参考第三方框架：银行流水"交易地点/附言"列常见完整机构名，
+        公司名规则只覆盖"…有限公司"，机构尾缀需单独规则补齐。
+        """
+        shift = [0]
+
+        def replacer(m):
+            original = m.group(1)
+            out = '[银行机构]'
+            if original in self._replaced:
+                out = self._replaced[original][0]
+            else:
+                self._record(original, out, '银行机构')
+            self._record_event(m.start(1) + shift[0], original, out)
+            shift[0] += len(out) - len(m.group(0))
+            return out
+
+        return self._BANK_BRANCH_RE.sub(replacer, text)
+
     def _mask_bare_person_names(self, text: str) -> str:
         """裸人名统一替换：
 
@@ -2256,9 +2348,10 @@ class Desensitizer:
         )
         # 大额无单位数字（如结算算式中的 392485911.675）：7 位以上按金额处理
         # 身份证/银行卡/信用代码/案号/手机号已在更早的规则中被替换
+        # v3.5：排除 8 位日期（20181009 是流水交易日期，不是金额）
         text = self._safe_replace(
             text,
-            r'(?<!\d)\d{7,}(?:\.\d{1,3})?(?!\d)',
+            r'(?<!\d)(?!(?:19|20)\d{6})(\d{7,}(?:\.\d{1,3})?)(?!\d)',
             '[金额]',
             '金额'
         )
@@ -2388,7 +2481,7 @@ class Desensitizer:
              'pattern': r'(?<!\d)(\d+(?:\.\d+)?)[万千亿](?![.\d万千亿])(?!像素|股|人|户|平方米|平米|瓦|公里|粉丝|预算|年薪|月薪|彩礼)',
              'handler': self._mask_amount},
             {'type': '金额',
-             'pattern': r'(?<!\d)\d{7,}(?:\.\d{1,3})?(?!\d)',
+             'pattern': r'(?<!\d)(?!(?:19|20)\d{6})(\d{7,}(?:\.\d{1,3})?)(?!\d)',
              'handler': self._mask_amount},
             {'type': '其他证件',
              'pattern': r'((?:护照|护照号|港澳通行证|往来港澳通行证|港澳居民来往内地通行证|台湾居民来往大陆通行证|台胞证|驾驶证|驾驶证号|驾驶证号码|军官证|士兵证|警官证|工作证|营业执照|营业执照号|营业执照号码|税务登记证号|税务登记号)\s*[：:]?\s*)([0-9A-Za-z]{4,20})',
@@ -3170,6 +3263,15 @@ def restore_text(masked_text: str, mappings: List[Mapping]) -> str:
                 # 保留匹配串首尾空白（宽松匹配可能把" 合同乙方 "的空格吞进 span）
                 lead = matched[:len(matched) - len(matched.lstrip())]
                 trail = matched[len(matched.rstrip()):]
+                # v3.5：掩码账号场景 "7399/支***[当事人_1]" 中 `***` 是原文内容
+                # （账号掩码），不是 AI 加粗标记。成对 `**...**` 才是 AI 加粗
+                # （v3.0 restore 漂移容忍，应丢弃）；单侧星号保留为原文。
+                lead_stars = re.match(r'^(\**)', matched).group(1)
+                trail_stars = re.search(r'(\**)$', matched).group(1)
+                if lead_stars and not trail_stars:
+                    lead = lead_stars + lead
+                if trail_stars and not lead_stars:
+                    trail = trail + trail_stars
                 out.append(lead + queue[queue_idx].original + trail)
                 queue_idx += 1
             else:
@@ -3213,7 +3315,7 @@ _REMAINING_PATTERNS = (
         r'([\u4e00-\u9fa5]{2,6})(?:项目|小区|大厦|花园|公寓|家园|新村|广场|商城)')),
     ('金额残留', re.compile(
         r'\d[\d,，.]{3,}[ \t]*[万千亿]?[ \t]*(?:元|美元|欧元)'
-        r'|(?<!\d)\d{7,}(?:\.\d{1,3})?(?!\d)')),
+        r'|(?<!\d)(?!(?:19|20)\d{6})(\d{7,}(?:\.\d{1,3})?)(?!\d)')),
     ('案号', re.compile(r'[（(]\d{4}[）)]\s*[\u4e00-\u9fa5]{1,12}\s*\d{1,8}\s*号')),
     ('身份证号/手机号/银行账号', re.compile(
         r'(?<!\d)(?:1[3-9]\d{9}|\d{17}[\dXx]|\d{14,20})(?!\d)')),

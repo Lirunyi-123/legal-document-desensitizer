@@ -1238,5 +1238,79 @@ class TestV34PlatformCounterparty(unittest.TestCase):
         self.assertEqual(_default_output_ext('A.PDF'), '.txt')
 
 
+# ============================================================
+# v3.5 回归：银行流水场景（账号/户名组合 / 支付宝掩码 / 银行机构 / 日期误伤）
+# ============================================================
+class TestV35BankStatement(unittest.TestCase):
+    """借鉴第三方框架的银行流水专用模式：对方账号与户名、支付宝掩码、
+    银行分支机构名、交易日期不被金额规则误标。"""
+
+    def setUp(self):
+        self.d = Desensitizer()
+
+    def test_slash_account_full(self):
+        # 完整账号/户名：账号与户名都要脱敏
+        r = self.d.mask('6212261001014270893/胡若薇')
+        self.assertIn('[银行账号]', r.text)
+        self.assertIn('[当事人', r.text)
+        self.assertNotIn('胡若薇', r.text)
+        self.assertEqual(restore_text(r.text, r.mapping),
+                         '6212261001014270893/胡若薇')
+
+    def test_alipay_masked_account(self):
+        # 支付宝掩码账号：7399/支***刘方立
+        r = self.d.mask('7399/支***刘方立')
+        self.assertIn('[支付宝账号]', r.text)
+        self.assertIn('[当事人', r.text)
+        self.assertNotIn('刘方立', r.text)
+        self.assertEqual(restore_text(r.text, r.mapping), '7399/支***刘方立')
+
+    def test_bank_branch_masked(self):
+        # 银行机构名：公司名规则处理后残留的机构尾缀补上
+        r = self.d.mask('中国建设银行股份有限公司安徽省分行本级本币头寸机构')
+        self.assertNotIn('安徽省分行本级本币头寸机构', r.text)
+        self.assertIn('[银行机构]', r.text)
+        self.assertEqual(restore_text(r.text, r.mapping),
+                         '中国建设银行股份有限公司安徽省分行本级本币头寸机构')
+
+    def test_bank_branch_plain(self):
+        # 无"公司"后缀的银行机构
+        r = self.d.mask('工商银行北京长安支行')
+        self.assertIn('[银行机构]', r.text)
+        self.assertEqual(restore_text(r.text, r.mapping), '工商银行北京长安支行')
+
+    def test_bank_branch_no_false_positive(self):
+        # "该分行表示同意"不是机构名，不被误伤
+        r = self.d.mask('该分行表示同意')
+        self.assertEqual(r.text, '该分行表示同意')
+        self.assertEqual(len(r.mapping), 0)
+
+    def test_date_not_masked_as_amount(self):
+        # 交易日期（8 位）不被金额规则误标；真大额金额仍识别
+        r = self.d.mask('20181009 20181015 392485911.675')
+        self.assertIn('20181009', r.text)
+        self.assertIn('20181015', r.text)
+        self.assertIn('[金额]', r.text)
+        self.assertEqual(restore_text(r.text, r.mapping),
+                         '20181009 20181015 392485911.675')
+
+    def test_bank_statement_demo_rows(self):
+        # 第三方框架 demo 的 5 行银行流水：全行脱敏 + 逐字节还原
+        rows = [
+            ('消费 20181009 -2950.00 支付宝-刘方立 7399/支***刘方立', 2),  # 平台+掩码
+            ('电子汇入 20181015 180000.00 6212261001014270893/胡若薇', 1),  # 户名
+            ('消费 20181016 -1352.00 支付宝外部商户-上海恒银餐饮管理有限公司 73...', 0),  # 公司非人名
+            ('ATM转账 20181101 50000.00 6227001711200011447/徐常英', 1),
+            ('转账支取 20181104 中国建设银行股份有限公司安徽省分行本级本币头寸机构 6217001710000409331/徐常英', 1),
+        ]
+        for text, expect_people in rows:
+            with self.subTest(text=text):
+                r = self.d.mask(text)
+                people = [m for m in r.mapping if m.type == '人名']
+                self.assertEqual(len(people), expect_people,
+                                 f'{text} -> {r.text}')
+                self.assertEqual(restore_text(r.text, r.mapping), text)
+
+
 if __name__ == '__main__':
     unittest.main()

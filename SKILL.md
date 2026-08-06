@@ -434,6 +434,49 @@ python3 desensitize.py mask -f 银行流水截图.png --review --save-mapping �
 # → 银行流水截图_desensitized.txt + 审阅清单
 ```
 
+## v3.9 原图涂黑脱敏（mask --image-redact）
+
+### 背景
+用户问"为什么不能直接在原图上脱敏然后生成脱敏后的原图 PDF"——技术上完全
+可行：macOS Vision OCR 能返回每个词的坐标框（bounding box）。此前图片输入
+只走"OCR→文本→txt"，丢失坐标信息。v3.9 补齐：直接在**原图上涂黑**敏感区域，
+保留原图版式，输出 PDF。
+
+### 实现
+- `ocr_vision_boxes.swift`：Vision OCR 输出 JSON（text + 归一化 bounding box
+  坐标 x/y/w/h，原点左下），随工具分发
+- `image_redact.py`：图片 → 带坐标 OCR → 用 mask 映射表定位敏感值坐标框 →
+  在原图对应像素区域画黑矩形 → 输出 PDF；**residual 零残留校验**（涂黑后
+  重新 OCR，原文不可读才交付）；零命中拒绝交付"假脱敏"
+- `mask --image-redact`（或 -o 指定 .pdf 自动启用）
+
+### 实测（用户真实建行流水截图）
+- 76 处涂黑，residual 零残留校验通过
+- 复查：卡号 6214661710011477 / 客户名 徐常英 / 施明月 / 账号 / 公司名
+  全部不可读；"卡号/账号"前缀、"交易明细"标题等版式内容保留
+- 输出 PDF 与原图同尺寸（981×1325）
+
+### 使用
+```bash
+# 图片直接输出原图涂黑 PDF（保留版式）
+python3 desensitize.py mask -f 银行流水截图.png --image-redact -o 脱敏.pdf
+```
+
+### 已知边界
+- 仅 macOS（Vision 带坐标 OCR）；Windows/Linux 需外部 OCR
+- 涂黑精度依赖 OCR 坐标质量（低清图/密集排版可能定位偏差）
+- OCR 错字（如 I12=6212）无法匹配定位 → 该值留在 not_found 提示中，
+  需人工/语义层处理
+
+### 验证方法（v3.9 起）
+```bash
+python3 -m unittest test_desensitize     # 153 个单测（v3.8 150 + v3.9 3）
+python3 evaluate.py                      # 红队用例（105 项命中、误报 0）
+python3 selfcheck.py                     # 自检：6 项必检全部通过
+python3 desensitize.py mask -f 截图.png --image-redact -o 脱敏.pdf
+# → 原图涂黑 PDF（保留版式 + residual 校验）
+```
+
 ## 输入
 
 接受以下格式的文档内容（粘贴或文件路径）：

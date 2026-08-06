@@ -3985,6 +3985,11 @@ def main():
                                   '户名列孤立姓名也识别、日期列不脱敏、金额列不误标联行号；'
                                   '表头不可识别时自动回退普通文本模式。'
                                   '支持 .xlsx / 带文本层的 .pdf')
+    mask_parser.add_argument('--image-redact', action='store_true', default=False,
+                             help='v3.9：图片输入时输出"原图涂黑"PDF（保留原图版式）。'
+                                  'macOS Vision 带坐标 OCR 定位敏感值 → 在原图对应'
+                                  '区域涂黑 → 输出 PDF；带 residual 零残留校验。'
+                                  '支持 .png/.jpg 等图片；-o 指定 .pdf 时自动启用')
 
     # scan 命令
     scan_parser = subparsers.add_parser('scan', help='扫描敏感信息（不替换）')
@@ -4176,6 +4181,11 @@ def main():
             # v3.0：PDF 真·涂黑脱敏（--pdf-redact 或 -o 指定 .pdf 时自动启用）
             in_is_pdf = (hasattr(args, 'file') and args.file
                          and os.path.splitext(args.file)[1].lower() == '.pdf')
+            # v3.9：图片输入（--image-redact 或 -o 指定 .pdf 时自动启用）
+            in_is_image = (hasattr(args, 'file') and args.file
+                           and os.path.splitext(args.file)[1].lower()
+                           in ('.png', '.jpg', '.jpeg', '.bmp', '.webp',
+                               '.tif', '.tiff'))
             out_ext = os.path.splitext(output_path)[1].lower()
             # 仅显式启用：--pdf-redact，或用户显式 -o 指定 .pdf 扩展名。
             # 不改变既有默认行为（.pdf 输入 → .txt 输出）。
@@ -4212,6 +4222,26 @@ def main():
                     print(f'⚠️  以下占位符在 PDF 文本层未找到任何出现'
                           f'（可能在图片/扫描层）：{sorted(set(report["not_found"]))[:8]}')
                 print('✅ residual 零残留校验通过（输出中已读不到任何原文）')
+            elif (in_is_image and (bool(getattr(args, 'image_redact', False))
+                                   or (user_gave_output and out_ext == '.pdf'))):
+                # v3.9：图片输入 → 原图涂黑 PDF（保留版式）
+                try:
+                    from image_redact import ImageRedactError, redact_image_pdf
+                except ImportError:
+                    sys.exit('❌ image_redact.py 缺失（工具安装不完整）')
+                if out_ext != '.pdf':
+                    output_path = os.path.splitext(output_path)[0] + '.pdf'
+                pairs = [(m.replacement, m.original) for m in result.mapping]
+                try:
+                    report = redact_image_pdf(args.file, pairs, output_path)
+                except ImageRedactError as e:
+                    sys.exit(f'❌ 图片涂黑失败：{e}')
+                print(f'✅ 原图涂黑脱敏 PDF 已保存: {output_path}'
+                      f'（{report["occurrences"]} 处涂黑）')
+                if report['not_found']:
+                    print(f'⚠️  以下敏感值在图片中未定位到坐标'
+                          f'（OCR 未识别或错字）：{sorted(set(report["not_found"]))[:8]}')
+                print('✅ residual 零残留校验通过（涂黑后原文不可读）')
             else:
                 if out_ext == '.pdf' and not in_is_pdf:
                     print('⚠️  -o 指定了 .pdf 但输入不是 PDF：将以纯文本写入 .pdf'

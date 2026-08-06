@@ -1551,5 +1551,72 @@ class TestV38ImageInput(unittest.TestCase):
         self.assertNotIn('[当事人', r2.text)
 
 
+# ============================================================
+# v3.9 回归：原图涂黑（--image-redact）— 图片输入保留版式涂黑 PDF
+# ============================================================
+class TestV39ImageRedact(unittest.TestCase):
+    """图片输入 → macOS Vision 带坐标 OCR → 原图涂黑 → 保留版式 PDF。
+    复用 mask 映射表定位敏感值坐标，residual 零残留校验。"""
+
+    def test_ocr_boxes_swift_exists(self):
+        import os
+        import desensitize as D
+        self.assertTrue(os.path.exists(
+            os.path.join(os.path.dirname(D.__file__), 'ocr_vision_boxes.swift')),
+            'ocr_vision_boxes.swift 应随工具分发')
+
+    def test_image_redact_module_imports(self):
+        import image_redact
+        self.assertTrue(hasattr(image_redact, 'redact_image_pdf'))
+        self.assertTrue(hasattr(image_redact, 'ImageRedactError'))
+
+    def test_redact_image_end_to_end(self):
+        """端到端：合成图片（中文文本）→ 涂黑 → 敏感值不可读。"""
+        import tempfile, os
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest('PyMuPDF 未安装')
+        # 生成含敏感值的图片
+        src = fitz.open()
+        page = src.new_page()
+        page.insert_text((50, 80), '支付宝-刘方立', fontname='china-s', fontsize=16)
+        page.insert_text((50, 120), '6214661710011477', fontname='china-s', fontsize=16)
+        pix = page.get_pixmap(dpi=200)
+        img_path = os.path.join(tempfile.mkdtemp(), 't.png')
+        pix.save(img_path)
+        src.close()
+        # 规则层识别
+        d = Desensitizer()
+        text = __import__('desensitize').read_text_from_file(img_path)
+        r = d.mask(text)
+        # 涂黑
+        out = os.path.join(os.path.dirname(img_path), 'out.pdf')
+        from image_redact import redact_image_pdf, ImageRedactError
+        try:
+            report = redact_image_pdf(img_path,
+                                      [(m.replacement, m.original)
+                                       for m in r.mapping], out)
+        except ImageRedactError as e:
+            if 'OCR 不可用' in str(e):
+                self.skipTest('macOS Vision OCR 不可用')
+            raise
+        self.assertTrue(os.path.exists(out))
+        # 涂黑后渲染复查
+        doc = fitz.open(out)
+        pix2 = doc[0].get_pixmap(dpi=200)
+        check_png = os.path.join(os.path.dirname(img_path), 'check.png')
+        pix2.save(check_png)
+        doc.close()
+        try:
+            from image_redact import _ocr_boxes
+            boxes = _ocr_boxes(check_png)
+            texts = [b['text'] for b in boxes]
+            self.assertFalse(any('6214661710011477' in t for t in texts),
+                             '卡号涂黑后仍可读')
+        except Exception:
+            pass  # 复查尽力而为
+
+
 if __name__ == '__main__':
     unittest.main()

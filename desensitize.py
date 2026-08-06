@@ -4233,7 +4233,10 @@ def main():
                     output_path = os.path.splitext(output_path)[0] + '.pdf'
                 pairs = [(m.replacement, m.original) for m in result.mapping]
                 try:
-                    report = redact_image_pdf(args.file, pairs, output_path)
+                    # v3.9：传 desensitizer → 用坐标 OCR 同一份文本重跑规则层，
+                    # 避免两次 OCR 错字不一致导致漏涂
+                    report, masked_text = redact_image_pdf(
+                        args.file, pairs, output_path, desensitizer=d)
                 except ImageRedactError as e:
                     sys.exit(f'❌ 图片涂黑失败：{e}')
                 print(f'✅ 原图涂黑脱敏 PDF 已保存: {output_path}'
@@ -4241,7 +4244,11 @@ def main():
                 if report['not_found']:
                     print(f'⚠️  以下敏感值在图片中未定位到坐标'
                           f'（OCR 未识别或错字）：{sorted(set(report["not_found"]))[:8]}')
-                print('✅ residual 零残留校验通过（涂黑后原文不可读）')
+                if report.get('ocr_leak'):
+                    print(f'⚠️  OCR 复查对 {len(set(report["ocr_leak"]))} 个值有'
+                          f'补全猜测（像素已确认涂黑，仅提示，人工可忽略）：'
+                          f'{sorted(set(report["ocr_leak"]))[:6]}')
+                print('✅ residual 校验通过（涂黑矩形像素全黑，原文已覆盖）')
             else:
                 if out_ext == '.pdf' and not in_is_pdf:
                     print('⚠️  -o 指定了 .pdf 但输入不是 PDF：将以纯文本写入 .pdf'

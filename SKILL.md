@@ -488,6 +488,46 @@ python3 desensitize.py mask -f 截图.png --image-redact -o 脱敏.pdf
 # → 原图涂黑 PDF（保留版式 + residual 校验）
 ```
 
+## v3.10 扫描件 PDF → 涂黑 PDF（PDF 输入输出全支持）
+
+### 背景
+用户问"PDF 脱敏后能输出 PDF 吗？只是原图涂黑吗"。实测厘清三种路径：
+- 电子版 PDF（有文本层）→ `--pdf-redact` 字符级涂黑 → PDF ✅（v3.0）
+- 扫描件 PDF（纯图片）→ 此前只输出 txt（OCR 后），缺涂黑 PDF ← v3.10 补齐
+- 图片 → `--image-redact` 原图涂黑 → PDF ✅（v3.9）
+
+### 实现
+- `image_redact.py` 重构：`_redact_pages` 公共核心（多页），
+  `redact_scanned_pdf`（PDF 每页 200DPI 渲染 → 逐页涂黑 → 输出多页 PDF）
+- `_ocr_boxes` / `_ocr_boxes_text` 支持多图列表（一次 OCR 跨全部页，page 字段区分）
+- CLI 自动分流：`--image-redact` 对无文本层 PDF 走 redact_scanned_pdf；
+  `--pdf-redact` 对电子版 PDF 走字符级涂黑；互不干扰
+
+### 绕过的 PyMuPDF 1.26.5 坑（实测定位）
+- 先创建多页、后引用前面页 → page.parent 失效（draw_rect 报 doc is None）
+  → 逐页"创建→插图→Shape画矩形"一步完成
+- 插图后 draw_rect 报错；先画矩形会被图片盖住 → 插图后用 Shape API
+- get_drawings() 把 Shape 画的多个矩形合并成一个 Path（包围盒超宽）
+  → residual 校验改用自己收集的精确矩形 + 多点采样
+
+### 实测
+- 多页扫描件（2 页）：每页正确涂黑，OCR 复查敏感值不可读
+- 用户图片 2 页 PDF 模拟：324 处涂黑，residual 像素全黑
+- 单页图片（v3.9 回归）：74 处涂黑通过；电子版 --pdf-redact 回归正常
+- 修复规则层误伤：温馨/连续/便捷/快捷 加入裸人名黑名单
+  （流水页脚"温馨提示/连续交易"不再被当人名）
+
+### 验证方法（v3.10 起）
+```bash
+python3 -m unittest test_desensitize     # 155 个单测（v3.9 153 + v3.10 2）
+python3 evaluate.py                      # 红队用例（105 项命中、误报 0）
+python3 selfcheck.py                     # 自检：6 项必检全部通过
+# 扫描件 PDF → 涂黑 PDF
+python3 desensitize.py mask -f 银行流水扫描件.pdf --image-redact -o 脱敏.pdf
+# 电子版 PDF → 字符级涂黑 PDF
+python3 desensitize.py mask -f 判决书.pdf --pdf-redact -o 脱敏.pdf
+```
+
 ## 输入
 
 接受以下格式的文档内容（粘贴或文件路径）：

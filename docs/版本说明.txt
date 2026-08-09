@@ -1,3 +1,54 @@
+# 法律文书脱敏工具 v3.10 版本说明
+
+## 版本号
+v3.10 — 扫描件 PDF → 涂黑 PDF（PDF 输入输出全支持）
+
+## 背景
+用户问"PDF 脱敏后能输出 PDF 吗？只是原图涂黑吗"。实测厘清三种路径：
+- 电子版 PDF（有文本层）→ `--pdf-redact` 字符级涂黑 → PDF ✅（v3.0）
+- 扫描件 PDF（纯图片）→ 此前只输出 txt（OCR 后），缺涂黑 PDF ← v3.10 补齐
+- 图片 → `--image-redact` 原图涂黑 → PDF ✅（v3.9）
+
+## 实现
+- `image_redact.py` 重构：`_redact_pages` 公共核心（pages 列表 → 逐页涂黑 →
+  多页 PDF）；`redact_scanned_pdf`（PDF 每页 200DPI 渲染 PNG → 调用核心）
+- `_ocr_boxes` / `_ocr_boxes_text` 支持多图列表（一次 OCR 跨全部页，
+  swift 脚本 page 字段区分页序）
+- CLI 自动分流：`in_is_scanned_pdf` 检测无文本层 PDF；`--image-redact` 对
+  扫描件走 redact_scanned_pdf；`--pdf-redact` 对电子版走字符级涂黑；
+  read_text_from_file 对 image-redact 输入的扫描件失败不阻塞（置空文本，
+  由涂黑分支内部 OCR 接管）
+
+## 绕过的 PyMuPDF 1.26.5 坑（实测定位）
+1. **先创建多页、后引用前面页 → page.parent 失效**（draw_rect 报
+   doc is None）→ 逐页"创建→插图→Shape画矩形"一步完成
+2. **插图后 draw_rect 报错**；且先画矩形会被图片盖住 → 插图后用
+   Shape API（shape.draw_rect + finish + commit）
+3. **get_drawings() 把 Shape 画的多个矩形合并成一个 Path**（rect 为包围盒，
+   可能超宽超大到页面 90%+）→ residual 校验改用自己收集的 rects_by_page
+   （每个精确矩形）+ 多点采样（中心 + 4 角）
+
+## 实测
+- 多页扫描件（2 页）：每页正确涂黑、OCR 复查敏感值不可读、residual 通过
+- 用户图片 2 页 PDF 模拟：324 处涂黑，residual 像素全黑
+- 单页图片（v3.9 回归）：74 处涂黑通过
+- 电子版 PDF --pdf-redact 回归：2 处涂黑 + residual 通过（互不干扰）
+- 规则层修复：温馨/连续/便捷/快捷 加入裸人名黑名单（流水页脚
+  "温馨提示/连续交易"不再被当人名，避免画出整页宽黑块）
+
+## 已知边界
+- 扫描件 PDF 涂黑精度依赖 OCR 坐标质量（低清/密集排版可能定位偏差）
+- OCR 无空格连排（"支付宝-刘方立6217…"）时姓名规则保守不吞数字 →
+  该值列入 not_found 提示，需人工/语义层
+- 仅 macOS（Vision 带坐标 OCR）；Windows/Linux 需外部 OCR
+
+## 回归
+- 单测 153 → **155**（TestV39ImageRedact 增 redact_scanned_pdf 端到端 /
+  模块导出检查）
+- 红队 105 项 MICRO/MACRO 全 1.0000、误替换 0（规则层无回归）
+- 自检 6 项必检全部通过（LLM 项本机未启动 Ollama 时 FAIL 属环境降级）
+
+---
 # 法律文书脱敏工具 v3.9 版本说明
 
 ## 版本号

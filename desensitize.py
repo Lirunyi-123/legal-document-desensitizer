@@ -260,6 +260,7 @@ _BARE_NAME_BLACKLIST = set(
     (
     '陈述 陈设 陈列 陈旧 陈规 陈词 陈年 陈腐 陈情 陈诉 陈案 '
     '支付宝 财付通 云闪付 银联 翼支付 京东支付 平安付 易宝支付 微信转账 微信红包 '  # v3.4 支付平台
+    '温馨提示 温馨 连续交易 连续 便捷 快捷 '  # v3.10 流水页脚词（温馨/连续 非人名）
     '王国 王子 王后 王位 王权 王法 王八 王室 王朝 王宫 王储 '
     '李代 李唐 李树 '
     '张罗 张望 张贴 张狂 张扬 张挂 张榜 张目 张嘴 张口 张冠 '
@@ -4077,7 +4078,20 @@ def main():
         else:
             args._sanitized_basename = None
 
-        text = read_text_from_file(args.file)
+        # v3.10：--image-redact 时，图片/扫描件 PDF 的文本读取不阻塞——
+        # 涂黑分支内部会自行 OCR 生成映射；这里用普通 OCR 文本生成 result
+        # 供映射表/审阅清单复用（扫描件无文本层时 read_text_from_file 会报错，
+        # 捕获后置空文本，由 image-redact 分支接管）
+        try:
+            text = read_text_from_file(args.file)
+        except SystemExit:
+            if (getattr(args, 'image_redact', False)
+                    and os.path.splitext(args.file)[1].lower()
+                    in ('.pdf', '.png', '.jpg', '.jpeg', '.bmp', '.webp',
+                        '.tif', '.tiff')):
+                text = ''
+            else:
+                raise
     else:
         text = sys.stdin.read()
 
@@ -4186,13 +4200,30 @@ def main():
                            and os.path.splitext(args.file)[1].lower()
                            in ('.png', '.jpg', '.jpeg', '.bmp', '.webp',
                                '.tif', '.tiff'))
+            # v3.10：扫描件 PDF（无文本层，纯图片）——--image-redact 涂黑
+            in_is_scanned_pdf = False
+            if (hasattr(args, 'file') and args.file and in_is_pdf
+                    and getattr(args, 'image_redact', False)):
+                try:
+                    import fitz
+                    _doc = fitz.open(args.file)
+                    try:
+                        _has_text = any(p.get_text().strip()
+                                        for p in _doc)
+                    finally:
+                        _doc.close()
+                    in_is_scanned_pdf = not _has_text
+                except Exception:
+                    in_is_scanned_pdf = False
             out_ext = os.path.splitext(output_path)[1].lower()
             # 仅显式启用：--pdf-redact，或用户显式 -o 指定 .pdf 扩展名。
             # 不改变既有默认行为（.pdf 输入 → .txt 输出）。
             user_gave_output = bool(getattr(args, 'output', None))
             want_pdf_redact = (in_is_pdf and user_gave_output
-                               and out_ext == '.pdf') or bool(
-                getattr(args, 'pdf_redact', False) and in_is_pdf)
+                               and out_ext == '.pdf'
+                               and not in_is_scanned_pdf) or bool(
+                getattr(args, 'pdf_redact', False) and in_is_pdf
+                and not in_is_scanned_pdf)
             if want_pdf_redact:
                 try:
                     from pdf_redact import PdfError, redact_pdf
@@ -4222,21 +4253,28 @@ def main():
                     print(f'⚠️  以下占位符在 PDF 文本层未找到任何出现'
                           f'（可能在图片/扫描层）：{sorted(set(report["not_found"]))[:8]}')
                 print('✅ residual 零残留校验通过（输出中已读不到任何原文）')
-            elif (in_is_image and (bool(getattr(args, 'image_redact', False))
-                                   or (user_gave_output and out_ext == '.pdf'))):
-                # v3.9：图片输入 → 原图涂黑 PDF（保留版式）
+            elif (in_is_image or in_is_scanned_pdf) and (
+                    bool(getattr(args, 'image_redact', False))
+                    or (user_gave_output and out_ext == '.pdf')):
+                # v3.9/3.10：图片 / 扫描件 PDF → 原图涂黑 PDF（保留版式）
                 try:
-                    from image_redact import ImageRedactError, redact_image_pdf
+                    from image_redact import (ImageRedactError,
+                                              redact_image_pdf,
+                                              redact_scanned_pdf)
                 except ImportError:
                     sys.exit('❌ image_redact.py 缺失（工具安装不完整）')
                 if out_ext != '.pdf':
                     output_path = os.path.splitext(output_path)[0] + '.pdf'
                 pairs = [(m.replacement, m.original) for m in result.mapping]
                 try:
-                    # v3.9：传 desensitizer → 用坐标 OCR 同一份文本重跑规则层，
-                    # 避免两次 OCR 错字不一致导致漏涂
-                    report, masked_text = redact_image_pdf(
-                        args.file, pairs, output_path, desensitizer=d)
+                    # v3.9/3.10：传 desensitizer → 用坐标 OCR 同一份文本重跑
+                    # 规则层，避免两次 OCR 错字不一致导致漏涂
+                    if in_is_scanned_pdf:
+                        report, masked_text = redact_scanned_pdf(
+                            args.file, pairs, output_path, desensitizer=d)
+                    else:
+                        report, masked_text = redact_image_pdf(
+                            args.file, pairs, output_path, desensitizer=d)
                 except ImageRedactError as e:
                     sys.exit(f'❌ 图片涂黑失败：{e}')
                 print(f'✅ 原图涂黑脱敏 PDF 已保存: {output_path}'

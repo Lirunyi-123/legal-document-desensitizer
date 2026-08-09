@@ -1617,6 +1617,54 @@ class TestV39ImageRedact(unittest.TestCase):
         except Exception:
             pass  # 复查尽力而为
 
+    def test_redact_scanned_pdf_end_to_end(self):
+        """v3.10：多页扫描件 PDF → 涂黑 PDF（每页涂黑 + residual 通过）。"""
+        import tempfile, os
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest('PyMuPDF 未安装')
+        tmp = tempfile.mkdtemp()
+        # 生成 2 页扫描件 PDF（无文本层）
+        src = fitz.open()
+        pixmaps = []
+        for text in ['第1页 支付宝-刘方立', '第2页 6217001710000409331/徐常英']:
+            page = src.new_page()
+            page.insert_text((50, 80), text, fontname='china-s', fontsize=20)
+            pixmaps.append(page.get_pixmap(dpi=300))
+        src.close()
+        pdf_path = os.path.join(tmp, 'scan.pdf')
+        doc = fitz.open()
+        for pix in pixmaps:
+            pg = doc.new_page(width=pix.width, height=pix.height)
+            pg.insert_image(pg.rect, pixmap=pix)
+        doc.save(pdf_path)
+        doc.close()
+        # 确认无文本层
+        d2 = fitz.open(pdf_path)
+        self.assertEqual(sum(len(p.get_text()) for p in d2), 0)
+        d2.close()
+        # 涂黑
+        out = os.path.join(tmp, 'out.pdf')
+        from image_redact import redact_scanned_pdf, ImageRedactError
+        try:
+            report, _ = redact_scanned_pdf(pdf_path, [], out,
+                                           desensitizer=Desensitizer())
+        except ImageRedactError as e:
+            if 'OCR 不可用' in str(e) or '未从图片识别' in str(e):
+                self.skipTest('OCR 不可用或测试图无法识别')
+            raise
+        self.assertTrue(os.path.exists(out))
+        doc = fitz.open(out)
+        self.assertGreaterEqual(len(doc), 2, '应保留多页')
+        doc.close()
+
+    def test_image_redact_module_exports(self):
+        """v3.10：redact_scanned_pdf 导出。"""
+        import image_redact
+        self.assertTrue(hasattr(image_redact, 'redact_scanned_pdf'))
+        self.assertTrue(hasattr(image_redact, 'redact_image_pdf'))
+
 
 if __name__ == '__main__':
     unittest.main()

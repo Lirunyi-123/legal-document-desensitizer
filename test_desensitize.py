@@ -1798,5 +1798,82 @@ class TestReviewTiering(unittest.TestCase):
         self.assertIn('13912345678', review)
 
 
+class TestV311Archive3Fixes(unittest.TestCase):
+    """v3.11：archive3 批量实战（34 份真实/合成文书）修复回归测试。"""
+
+    def test_secure_wechat_shift_signature(self):
+        from desensitize import SecureDesensitizer
+        d = SecureDesensitizer()
+        r = d.mask('微信号：lirunyi_2020，手机号 13800138000。')
+        self.assertIn('[微信号]', r.text)
+        self.assertNotIn('lirunyi_2020', r.text)
+
+    def test_false_positive_name_common_word_context(self):
+        d = Desensitizer()
+        text = ('涉案技术秘密用于威某EX5型号电动汽车，相关底盘零部件供应商'
+                '关于威某方申请涉及底盘零部件的专利，燃油车底盘可以搭载动力电池，'
+                '项目名称备案。')
+        r = d.mask(text)
+        # 这些是"普通词+上下文"假阳性：修复后应保持原文（不涂黑）
+        for fake in ('于威某', '关底盘', '车底盘', '项目名'):
+            self.assertIn(fake, r.text, f'{fake} 不应被错误涂黑')
+
+    def test_false_positive_name_whitespace_context(self):
+        d = Desensitizer()
+        text = '零部件设计的证据，相\n关底盘零部件供应商亦明确否认其来源。'
+        r = d.mask(text)
+        self.assertIn('关底盘', r.text, '跨行"相\n关底盘"不应被误当人名涂黑')
+
+    def test_txn_row_isolated_name(self):
+        d = Desensitizer()
+        text = (
+            '交易日期    摘要      对方户名            对方账号          支出金额\n'
+            '2025-04-03  10:05:00   转账支出   陈志强              6212260200223456789  3200.00\n'
+            '2025-04-12  19:30:00   转账收入   王秀英              6222020100112233445  0.00\n'
+            '2025-04-20  16:40:12   转账支出   张伟                6217003810099887766  1500.00\n'
+        )
+        r = d.mask(text)
+        for name in ('陈志强', '王秀英', '张伟'):
+            self.assertNotIn(name, r.text, f'{name} 应被交易行规则掩码')
+
+    def test_txn_row_does_not_mask_summary(self):
+        d = Desensitizer()
+        text = (
+            '2025-04-01  09:12:30   代发工资   杭州云杉科技有限公司   6214830022334455667  12800.00\n'
+            '2025-04-06  14:22:10   消费      杭州联华超市文二店     0.00               268.50\n'
+        )
+        r = d.mask(text)
+        self.assertIn('代发工资', r.text, '摘要"代发工资"应保留')
+        self.assertNotIn('杭州云杉科技有限公司', r.text, '对方公司应被掩码')
+        self.assertNotIn('代发工资   杭州云杉科技有限公司', r.text)
+
+    def test_english_statement_wechat_gate(self):
+        d = Desensitizer()
+        text = ('Silk Road Banking (Hong Kong) Limited\n'
+                'Business Direct Statement\n'
+                'Mei Ling Tsang\nAccount: 9896-6767-3233')
+        r = d.mask(text)
+        for word in ('Banking', 'Limited', 'Statement', 'Business', 'Direct'):
+            self.assertIn(word, r.text, f'{word} 不应被当作微信号')
+
+    def test_placeholder_whitespace_normalization(self):
+        from desensitize import _normalize_placeholder_ws
+        out = _normalize_placeholder_ws('a[当事人_5\n]b [金额 ]c')
+        self.assertIn('[当事人_5]', out)
+        self.assertIn('[金额]', out)
+        self.assertNotIn('\n]', out)
+
+    def test_semantic_pass_pdf_wrapped_placeholder(self):
+        from desensitize import run_semantic_pass, Mapping
+        masked = '法院认为[当事人_5\n]与[金额]无关'
+        rows = [Mapping(original='张三', replacement='[当事人_5]', type='人名',
+                        count=1, order=1),
+                Mapping(original='100元', replacement='[金额]', type='金额',
+                        count=1, order=2)]
+        final, merged, err = run_semantic_pass(masked, rows)
+        self.assertIsNone(err)
+        self.assertEqual(len(merged), 2)
+
+
 if __name__ == '__main__':
     unittest.main()

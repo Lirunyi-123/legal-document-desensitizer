@@ -335,7 +335,28 @@ _BARE_NAME_BLACKLIST = set(
     '陕西省 云南省 贵州省 安徽省 福建省 甘肃省 青海省 辽宁省 吉林省 黑龙江省 '
     '山西省 海南省 台湾省 内蒙古 广西壮族 西藏 宁夏回族 新疆维吾尔 '
     '曾多次 曾几何 '
-    '徐徐 徐缓').split())
+    '徐徐 徐缓 '
+    # v3.11：常见词开头的"姓"被误当人名（"关于威某""相关底盘""项目名"）
+    '关于 相关 无关 有关 关键 关联 关闭 关节 关怀 关注 关头 关机 关门 '
+    '关系 关照 关卡 关乎 关切 关于其 关联性 关键尺 关联公 '
+    '用于 由于 在于 对于 等于 属于 位于 处于 鉴于 基于 终于 过于 至于 '
+    '敢于 便于 于是 于今 于情 于理 于心 '
+    '项目 项链 项圈 项目名 关系 技术 底盘').split())
+
+# v3.11：候选姓氏与前一字组成常见词 → 该"姓"是普通词的一部分而非人名
+# （"用|于威某"→"用于"、"相|关底盘"→"相关"、"关|于威某"→"关于"）
+_NAME_SURNAME_PREFIX_BLOCK = set(
+    '用于 由于 在于 对于 等于 属于 位于 处于 鉴于 基于 终于 过于 至于 '
+    '敢于 便于 关于 相关 无关 有关 关键 关联 关闭 关节 关怀 关注 关头 '
+    '关机 关门 关系 关照 关卡 关乎 关切 项目 汽车 油车'.split())
+
+# v3.11：以技术/机构类名词结尾的"姓+名"候选（"车底盘""关技术""关系来"）
+# 这类名词几乎不会作为中文名字的末字，直接拒绝
+_NAME_SUFFIX_BLOCK = (
+    '技术', '底盘', '零部件', '供应商', '人员', '图纸', '信息', '证明',
+    '停止', '侵害', '同一', '不同', '汽车', '项目', '关系', '关联',
+    '产品', '车型', '专利', '结构', '连接', '设计', '研发', '制造',
+)
 
 # 强上下文：前接/后接这些字时，候选为名字的可能性显著提高
 _NAME_CONTEXT_BEFORE = set('向与和给对为被由把将叫欠借还付转签交送收出让起诉告称表示委托指定要求主张员')
@@ -594,7 +615,10 @@ _COMPANY_LEAD_WORDS = (
     '委托 法定代表人 负责人 将原由 由原 原由 包括 并 由 将 为 与 和 及 的 在 对 把 被 '
     '于 是 而 且 或 从 向 给 若 因 关于 以 等 之 其 该 此 各 每 '
     # v2.8：实战误吞上下文（"张政微信告知原告公司""扣押或冻结被告…""均由被告…"）
-    '微信 告知 收到 通过 均由 扣押 冻结 查封 系该 本案 涉案 相关 包括 其中 以及 其下'
+    '微信 告知 收到 通过 均由 扣押 冻结 查封 系该 本案 涉案 相关 包括 其中 以及 其下 '
+    # v3.11：银行流水摘要（"代发工资 杭州云杉科技有限公司"→只留公司名）
+    '代发工资 转账支出 转账收入 转账 代发 消费 收入 支出 转入 转出 存入 取现 '
+    '退款 利息 手续费 摘要'
 ).split()
 
 _COMPANY_FUNCTION_CHARS = set('与和及的由将为在原对把被于而是且或并从向给在若因关于以等之其该此各每')
@@ -1591,14 +1615,26 @@ class Desensitizer:
                                                 + len(m.group(1)), shift),
             text
         )
+        # v3.11 实战修复：英文为主的文档（涉外银行流水/外文合同）禁用
+        # "独立微信号"启发式——Silk/Banking/Statement 等 5-20 位英文词
+        # 全部命中微信号模式，整份文档被过度涂黑。
+        # 判断：去掉空白后中文字符占比 <2% 视为非中文文档。
+        cjk_count = len(re.findall(r'[\u4e00-\u9fa5]', text))
+        alnum_count = len(re.sub(r'\s', '', text))
+        if alnum_count and cjk_count / alnum_count < 0.02:
+            return text
         # 独立微信号：字母开头 + 字母数字下划线，6-20位
         # 使用 [a-zA-Z0-9_] 而非 \w 避免匹配中文
         # 排除邮箱（含@）、URL、纯数字；前面紧贴中文时不算（避免误吞"粤B88888"这类车牌）
+        # v3.11：要求含数字/下划线——纯字母的"独立"候选与英文单词无法区分
+        # （涉外银行流水 Banking/Limited/Statement 全被误判微信号）；
+        # 纯字母微信号请走"微信号：xxx"上下文规则或语义层。
         shift2 = [0]
         text = re.sub(
             r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',
-            lambda m: self._safe_replace_wechat(m.group(1), '',
-                                                m.start() + shift2[0], shift2),
+            lambda m: (self._safe_replace_wechat(
+                m.group(1), '', m.start() + shift2[0], shift2)
+                if re.search(r'[0-9_]', m.group(1)) else m.group(0)),
             text
         )
         return text
@@ -1971,16 +2007,32 @@ class Desensitizer:
                     if len(cand) != len(surname) + extra:
                         break
                     if not all('\u4e00' <= c <= '\u9fa5' for c in cand):
-                        break
+                        # v3.11：3 字候选因行内空白/标点非法时，继续尝试 2 字
+                        # 候选（"张伟 "→"张伟"）；此前 break 导致表格列末
+                        # 孤立姓名（如银行流水对方户名）整列漏掉
+                        continue
                     if cand in _BARE_NAME_BLACKLIST:
                         continue
-                    before = text[i - 1] if i > 0 else ''
+                    # 前一字符（跨空白回看："相\n关底盘"→"相"）
+                    _j = i - 1
+                    while _j >= 0 and text[_j] in ' \t\n\r':
+                        _j -= 1
+                    before = text[_j] if _j >= 0 else ''
+                    # v3.11：姓氏与前一字组成常见词（"用|于威某"→"用于"、
+                    # "相|关底盘"→"相关"，含跨行"相\n关底盘"）→ 非人名
+                    if before and (before + surname) in _NAME_SURNAME_PREFIX_BLOCK:
+                        continue
                     after = text[i + len(cand)] if i + len(cand) < n else ''
                     next1 = text[i + len(cand)] if i + len(cand) < n else ''
                     next2 = text[i + len(cand):i + len(cand) + 2]
                     count = text.count(cand)
                     strong = (before in _NAME_CONTEXT_BEFORE
                               or after in _NAME_CONTEXT_AFTER)
+                    if not strong:
+                        # v3.11：银行流水交易行（日期+账号+金额结构）中，
+                        # 对方户名列的孤立姓名（如"王秀英""张伟"）无上下文
+                        # 且只出现一次——按交易行结构识别
+                        strong = self._in_txn_row(text, i, cand)
                     if len(cand) == 2:
                         # 两字名必须有强上下文（向/与/欠/借/付/称/诉…），
                         # 仅凭高频会把"华临/余杭/包给/施工"等常见词误判为人名
@@ -2006,6 +2058,12 @@ class Desensitizer:
                         continue
                     # 地名/职务尾缀（"余杭区""承包人""代理人"）不是人名
                     if cand.endswith(tuple(_NAME_PLACE_SUFFIXES)):
+                        continue
+                    # v3.11：技术/机构类名词结尾（"车底盘""关技术"）
+                    # 或含于候选前缀（"关系等/关系指"→前缀"关系"）
+                    if (cand.endswith(_NAME_SUFFIX_BLOCK)
+                            or any(cand[:k] in _NAME_SUFFIX_BLOCK
+                                   for k in (2, 3))):
                         continue
                     # 后面紧跟"法院/路/街/号"等 → 是地名/机构而非人名
                     after8 = text[i + len(cand):i + len(cand) + 8]
@@ -2034,6 +2092,28 @@ class Desensitizer:
                     break  # 该姓氏位置只取最长合法候选
             i += 1
         return candidates
+
+    @staticmethod
+    def _in_txn_row(text: str, pos: int, cand: str) -> bool:
+        """候选是否位于银行流水交易行的"对方户名"位置。
+
+        结构：行首有日期，候选后（同列）紧跟 8 位以上数字账号，
+        或候选前是摘要词（转账/代发/消费/收入/支出…）。
+        """
+        line_start = text.rfind('\n', 0, pos) + 1
+        line_end = text.find('\n', pos)
+        if line_end == -1:
+            line_end = len(text)
+        line = text[line_start:line_end]
+        if not re.search(r'\d{4}[-/年]\s*\d{1,2}[-/月]\s*\d{1,2}', line):
+            return False
+        tail = text[pos + len(cand):line_end]
+        if re.match(r'[\s　]*\d{8,}', tail):
+            return True
+        head = text[line_start:pos]
+        return bool(re.search(
+            r'(?:转账|代发|消费|收入|支出|退款|取现|存入|转入|转出)'
+            r'[\s　]*$', head))
 
     @staticmethod
     def _cand_valid_in_tokens(cand: str, start: int, surname: str,
@@ -2687,9 +2767,9 @@ class SecureDesensitizer(Desensitizer):
         return result
 
     def _safe_replace_wechat(self, original: str, prefix: str = '',
-                             pos: int = 0) -> str:
+                             pos: int = 0, shift: list = None) -> str:
         """记录微信号替换（安全增强版）"""
-        result = super()._safe_replace_wechat(original, prefix, pos)
+        result = super()._safe_replace_wechat(original, prefix, pos, shift)
         if self._secure_mode:
             try:
                 original = ''
@@ -3029,20 +3109,97 @@ def _ensure_ocr_bin() -> bool:
     """确保 ocr_vision.swift 已编译为二进制（首次 swiftc 编译缓存，后续复用）。
 
     返回 True 表示可用；非 macOS / swift 缺失 / 编译失败 → False。
+
+    v3.11 实战修复：
+    - 使用独立 clang 模块缓存目录，避免系统共享缓存损坏导致编译出
+      "静默返回空" 的失效二进制；
+    - 源码比二进制新（或二进制缺失）时自动重新编译；
+    - 编译后运行 --selftest 校验二进制确实能输出识别文本，
+      不合格则删除并视为不可用。
     """
     if sys.platform != 'darwin':
         return False
     if not os.path.exists(_OCR_SWIFT):
         return False
     if os.path.exists(_OCR_BIN):
-        return True
+        # 源码更新 → 重新编译
+        if os.path.getmtime(_OCR_BIN) >= os.path.getmtime(_OCR_SWIFT):
+            return _ocr_bin_selftest()
+        try:
+            os.remove(_OCR_BIN)
+        except OSError:
+            pass
     import subprocess
+    module_cache = os.path.join(tempfile.gettempdir(), 'legal_deid_swift_cache')
+    os.makedirs(module_cache, exist_ok=True)
+    env = dict(os.environ)
+    env['CLANG_MODULE_CACHE_PATH'] = module_cache
     try:
-        ret = subprocess.run(['swiftc', '-O', '-o', _OCR_BIN, _OCR_SWIFT],
-                             capture_output=True, timeout=180)
+        ret = subprocess.run(
+            ['swiftc', '-O', '-o', _OCR_BIN, _OCR_SWIFT],
+            capture_output=True, timeout=180, env=env)
     except Exception:
         return False
-    return ret.returncode == 0
+    if ret.returncode != 0:
+        return False
+    if not _ocr_bin_selftest():
+        try:
+            os.remove(_OCR_BIN)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _ocr_bin_selftest() -> bool:
+    """运行 ocr_vision 对一张自检图 OCR，确认二进制能输出识别文本。
+
+    优先用 PIL + 系统字体绘制 "ABC 123"，要求 OCR 结果包含 "123"；
+    PIL 或字体不可用时退化为"进程正常退出"的冒烟检查
+    （此时由调用方在真实文档上做最终兜底校验）。
+    """
+    import subprocess
+    try:
+        png_path = os.path.join(tempfile.gettempdir(), 'legal_deid_ocr_selftest.png')
+        if not _write_ocr_selftest_png(png_path):
+            # 无 PIL/字体 → 仅冒烟检查
+            r = subprocess.run([_OCR_BIN, '--help'],
+                               capture_output=True, text=True, timeout=30)
+            return r.returncode == 0
+        r = subprocess.run([_OCR_BIN, png_path],
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode == 0 and '123' in (r.stdout or '')
+    except Exception:
+        return False
+
+
+def _write_ocr_selftest_png(path: str) -> None:
+    """用 PIL + 系统字体绘制 'ABC 123' 并写成 PNG；成功返回 True。"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return False
+    font_path = None
+    for candidate in (
+        '/System/Library/Fonts/Supplemental/Arial.ttf',
+        '/System/Library/Fonts/Helvetica.ttc',
+        '/System/Library/Fonts/PingFang.ttc',
+        '/Library/Fonts/Arial Unicode.ttf',
+    ):
+        if os.path.exists(candidate):
+            font_path = candidate
+            break
+    if not font_path:
+        return False
+    try:
+        img = Image.new('RGB', (720, 180), 'white')
+        d = ImageDraw.Draw(img)
+        font = ImageFont.truetype(font_path, 90)
+        d.text((40, 40), 'ABC 123', fill='black', font=font)
+        img.save(path)
+        return True
+    except Exception:
+        return False
 
 
 def _ocr_image_with_vision(filepath: str):
@@ -3878,6 +4035,9 @@ def run_semantic_pass(masked_text: str, stage1_rows: list) -> tuple:
 
     返回 (最终文本, 合并映射行[(占位符, 原文)], 错误信息或 None)。
     """
+    # v3.11 实战修复：PDF 涂黑输出文本层重排时可能把占位符折行
+    # （"[当事人_5\n]"），先把方括号内的空白归一化，保证后续匹配/合并一致。
+    masked_text = _normalize_placeholder_ws(masked_text)
     final_lines = []
     sem_by_ph = defaultdict(list)
     for pi, line in enumerate(masked_text.split('\n')):
@@ -3903,13 +4063,27 @@ def run_semantic_pass(masked_text: str, stage1_rows: list) -> tuple:
                     break
                 if sem_q and sem_q[-1][0] == pi and sem_q[-1][1] == f:
                     merged.append((ph, sem_q.pop()[2]))
-                else:
+                elif st_q:
                     merged.append((ph, st_q.pop().original))
+                else:
+                    err = (f'映射配对失败：{ph} 在最终文本位置({pi},{f})出现次数'
+                           f'超过阶段一映射记录（阶段一 {len(st_by_ph.get(ph, []))} 处、'
+                           f'语义 {len(sem_by_ph.get(ph, []))} 处）')
+                    break
                 pos = f + len(ph)
+            if err:
+                break
         if st_q or sem_q:
             err = f'映射配对失败：{ph} 剩余阶段一 {len(st_q)} 语义 {len(sem_q)}'
             break
     return final_text, merged, err
+
+
+def _normalize_placeholder_ws(text: str) -> str:
+    """把 '[占 位 符\n]' 这类被 PDF 折行/加空的占位符还原为 '[占位符]'。"""
+    def _strip(m):
+        return '[' + re.sub(r'\s+', '', m.group(1)) + ']'
+    return re.sub(r'\[([^\[\]]*?)\]', _strip, text)
 
 
 # ============================================================
@@ -4411,9 +4585,12 @@ def _run_mask_file(args, d, ner, text) -> dict:
                        in ('.png', '.jpg', '.jpeg', '.bmp', '.webp',
                            '.tif', '.tiff'))
         # v3.10：扫描件 PDF（无文本层，纯图片）——--image-redact 涂黑
+        user_gave_output = bool(getattr(args, 'output', None))
+        out_ext = os.path.splitext(output_path)[1].lower()
         in_is_scanned_pdf = False
         if (hasattr(args, 'file') and args.file and in_is_pdf
-                and getattr(args, 'image_redact', False)):
+                and (getattr(args, 'image_redact', False)
+                     or (user_gave_output and out_ext == '.pdf'))):
             try:
                 import fitz
                 _doc = fitz.open(args.file)
@@ -4425,10 +4602,8 @@ def _run_mask_file(args, d, ner, text) -> dict:
                 in_is_scanned_pdf = not _has_text
             except Exception:
                 in_is_scanned_pdf = False
-        out_ext = os.path.splitext(output_path)[1].lower()
         # 仅显式启用：--pdf-redact，或用户显式 -o 指定 .pdf 扩展名。
         # 不改变既有默认行为（.pdf 输入 → .txt 输出）。
-        user_gave_output = bool(getattr(args, 'output', None))
         want_pdf_redact = (in_is_pdf and user_gave_output
                            and out_ext == '.pdf'
                            and not in_is_scanned_pdf) or bool(
@@ -4463,6 +4638,15 @@ def _run_mask_file(args, d, ner, text) -> dict:
                 print(f'⚠️  以下占位符在 PDF 文本层未找到任何出现'
                       f'（可能在图片/扫描层）：{sorted(set(report["not_found"]))[:8]}')
             print('✅ residual 零残留校验通过（输出中已读不到任何原文）')
+            # v3.11：涂黑 PDF 文本层重排后与掩码文本不一致（占位符折行/漏字），
+            # 阶段二（semantic）与还原校验需要精确文本 → 额外落一份掩码文本侧车
+            sidecar = os.path.splitext(output_path)[0] + '_掩码文本.txt'
+            try:
+                with open(sidecar, 'w', encoding='utf-8') as f:
+                    f.write(result.text)
+                print(f'📄 掩码文本侧车已保存（供语义层/还原校验）: {sidecar}')
+            except OSError as e:
+                print(f'⚠️  掩码文本侧车保存失败：{e}', file=sys.stderr)
         elif (in_is_image or in_is_scanned_pdf) and (
                 bool(getattr(args, 'image_redact', False))
                 or (user_gave_output and out_ext == '.pdf')):
@@ -4497,6 +4681,16 @@ def _run_mask_file(args, d, ner, text) -> dict:
                       f'补全猜测（像素已确认涂黑，仅提示，人工可忽略）：'
                       f'{sorted(set(report["ocr_leak"]))[:6]}')
             print('✅ residual 校验通过（涂黑矩形像素全黑，原文已覆盖）')
+            sidecar = os.path.splitext(output_path)[0] + '_掩码文本.txt'
+            try:
+                with open(sidecar, 'w', encoding='utf-8') as f:
+                    # v3.11：侧车必须与映射表同源（同一份脱敏文本）；
+                    # redact_* 内部会用自己的坐标 OCR 重新跑一遍规则层，
+                    # 其 masked_text 与映射表（基于首次 OCR）可能不一致
+                    f.write(result.text)
+                print(f'📄 掩码文本侧车已保存（供语义层/还原校验）: {sidecar}')
+            except OSError as e:
+                print(f'⚠️  掩码文本侧车保存失败：{e}', file=sys.stderr)
         else:
             if out_ext == '.pdf' and not in_is_pdf:
                 print('⚠️  -o 指定了 .pdf 但输入不是 PDF：将以纯文本写入 .pdf'

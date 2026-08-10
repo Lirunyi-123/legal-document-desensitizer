@@ -130,9 +130,13 @@ def _redact_pages(pages, pairs, output_path, desensitizer=None):
     ocr_text = _ocr_boxes_text([p['path'] for p in pages])
 
     # 用同一份坐标 OCR 文本跑规则层 → 映射与坐标一致
+    # v3.11：返回的是"脱敏后文本"（此前误返回原始 OCR 文本，
+    # 导致扫描件侧车无占位符、语义层配对失败）
+    masked_text = ocr_text
     if desensitizer is not None:
         result = desensitizer.mask(ocr_text)
         pairs = [(m.replacement, m.original) for m in result.mapping]
+        masked_text = result.text
     elif not pairs:
         raise ImageRedactError('映射表为空：请先运行 mask 再涂黑')
 
@@ -250,7 +254,7 @@ def _redact_pages(pages, pairs, output_path, desensitizer=None):
         'not_found': not_found,
         'residual': [],
         'ocr_leak': ocr_leak,   # OCR 补全猜测到的值（像素已涂黑，仅提示）
-    }, ocr_text)
+    }, masked_text)
 
 
 def redact_image_pdf(image_path: str, pairs, output_path: str,

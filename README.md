@@ -91,6 +91,20 @@ node cli.js 扫描件.png pdf -o 扫描件.pdf    # 图片 → PDF
 > ⚠️ 扫描件/图片型 PDF 无文本层，pdf→txt 会明确报错并提示先走脱敏工具的
 > OCR 通道（`--ocr`），不会静默产出空文件。自测：`node test-cli.js`（16 项端到端）。
 
+### ⚠️ 先转换还是直接脱敏？（使用前必读）
+
+format-converter 是**单向提取器**：转换后丢失版式（docx 样式/表格、pdf 排版），
+**不支持转回 docx/pdf**，`restore` 只还原内容、不还原格式。请按需求选择：
+
+| 你的需求 | 怎么做 | 结果 |
+|---|---|---|
+| 最终要 **docx/pdf 原格式**（归档/庭审/提交） | **不要先转换**，直接 `python3 desensitize.py mask -f 合同.docx` 或 `mask -f 判决书.pdf --pdf-redact` | 脱敏后仍是 docx/pdf，可 `restore` 逐字还原 |
+| 只需**提取文本**（核对/摘录/喂 LLM/批量筛查） | 先 `node cli.js 判决书.pdf txt` 再脱敏 | txt/md/json 即最终形态 |
+| 输入是 **html/csv/heic 等**脱敏工具不直接支持的格式 | 必须先用 format-converter 转 txt/md/json | 转出的文本就是最终形态 |
+| **扫描件/图片型 PDF** | pdf→txt 会报错；走脱敏工具 OCR 通道 | 见下方快速开始 |
+
+**一句话**：要"转回原格式"就别转，直接脱敏；format-converter 只用于内容提取。
+
 ## 快速开始
 
 ```bash

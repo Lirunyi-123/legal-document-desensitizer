@@ -422,6 +422,22 @@ def main():
     for lead, body in highlights:
         list_item(doc, dec_id, body, bold_lead=lead + '：')
 
+    # 使用决策 callout（format-converter 单向提取，先转换还是直接脱敏）
+    warn = doc.add_paragraph()
+    wp = warn.paragraph_format
+    wp.space_before = Pt(8)
+    wp.space_after = Pt(12)
+    wp.line_spacing = 1.25
+    wr = warn.add_run('⚠️ 使用决策：format-converter 是单向提取器，转换后丢失版式且不支持转回 '
+                      'docx/pdf（restore 只还原内容、不还原格式）。需要最终 docx/pdf 原格式 '
+                      '（归档/庭审/提交）时不要先转换，直接 mask -f 合同.docx 或 '
+                      'mask -f 判决书.pdf --pdf-redact（保格式、可还原）；只有需要提取文本 '
+                      '（核对/摘录/喂 LLM）或输入是 html/csv/heic 等脱敏工具不直接支持的格式时，'
+                      '才先用 format-converter 转成 txt/md/json。要"转回原格式"就别转，直接脱敏。')
+    set_run_font(wr, size=10, bold=True, color=GRAY)
+    shade_paragraph(warn, 'FFF4E6')
+    border_paragraph(warn)
+
     # ---------- 如何运行 ----------
     add_heading(doc, '如何运行', 1)
     add_heading(doc, '安装', 2)

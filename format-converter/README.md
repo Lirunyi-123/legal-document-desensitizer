@@ -56,6 +56,23 @@ node cli.js photo.heic jpg                  # 手机照片转通用格式
 音视频转换（FFmpeg）、Office 全格式互转（LibreOffice）、OCR（Tesseract）、
 NCM/KGG 音乐解密、ZIP——如需这些能力请使用原版飞鼠格式。
 
+## ⚠️ 使用决策：先转换还是直接脱敏？（重要）
+
+format-converter 是**单向提取器**：docx/pdf → txt/md/json 后，**转换过程会丢失
+版式（docx 样式/表格、pdf 排版），且不支持转回 docx/pdf**。脱敏工具的
+`restore` 只能还原"内容"，不能复原"格式"。
+
+请按最终需求选择路径：
+
+| 你的需求 | 应该怎么做 | 结果 |
+|---|---|---|
+| **最终要 docx/pdf 原格式**（归档、庭审、对外提交） | **不要先转换**，直接交给脱敏工具：`mask -f 合同.docx`（docx 保段落）或 `mask -f 判决书.pdf --pdf-redact`（pdf 字符级涂黑，保留版式） | 脱敏后仍是 docx/pdf，`restore` 逐字还原原文 |
+| **只需提取文本内容**（核对、摘录、喂 LLM 分析、批量筛查） | 先用 format-converter 转换：`cli.js 判决书.pdf txt` / `cli.js 合同.docx txt` | 得到 txt/md/json，直接可用；无需还原 |
+| **输入是 html/csv/heic 等脱敏工具不直接支持的格式** | 必须先用 format-converter 转成 txt/md/json 再脱敏 | 转出的 txt/md 就是最终形态 |
+| **扫描件/图片型 PDF** | 无文本层，pdf→txt 会报错；直接走脱敏工具 OCR 通道（`--ocr` / macOS Vision 内置） | 见脱敏工具文档 |
+
+**一句话**：要"转回原格式"就别转，直接脱敏；format-converter 只用于内容提取。
+
 ## 安装
 
 ```bash

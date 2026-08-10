@@ -79,7 +79,46 @@ python3 desensitize.py mask -f 扫描件.pdf -o 涂黑.pdf
 | 批量处理 | 递归文件夹、断点续跑、原件校验、批量报告 |
 | 红队评测 | `evaluate.py`：entity-level P/R/F1，负样本计误报 |
 | 合成语料 | `synthetic/` 生成合法校验码语料（身份证/信用代码/银行卡） |
-| 格式转换 | `format-converter/`：docx/pdf/html/csv/图片 → txt/md/json |
+| 格式转换 | [format-converter](#格式转换-format-converter)：把不直接支持的格式先转成 txt/md/json |
+
+## 格式转换 format-converter
+
+内置 `format-converter/`（纯 JS、无外部引擎），把脱敏工具不直接支持的输入
+先转成 txt / md / json，再进入脱敏流程。
+
+| 输入 | 可转成 | 典型场景 |
+|------|--------|---------|
+| docx（律师文书、合同） | txt / md / html | 只需提取正文时 |
+| pdf（判决书、裁判文书） | txt | 仅限**带文本层**的电子版 |
+| html（网上复制的文书） | txt / md / json / csv | 网页文书转 Markdown |
+| csv（当事人名单） | json / txt / md / html | 名单互转 |
+| 图片（png/jpg/webp/gif/avif/tiff） | 互转、单图 → pdf | 扫描件统一格式 |
+
+```bash
+cd format-converter && npm install
+node cli.js 判决书.pdf txt -o 判决书.txt    # pdf → 纯文本（仅带文本层）
+node cli.js 裁判文书.html md                # 网页文书 → Markdown
+node cli.js 当事人.csv json                 # 名单 → JSON
+```
+
+> ⚠️ **单向提取，不可逆**：转换会丢失版式（docx 样式/表格、pdf 排版），
+> **转换后无法转回 docx/pdf**；脱敏工具的 `restore` 只还原内容、不还原格式。
+
+### 选择点：先转换，还是直接脱敏？
+
+| 你的需求 | 怎么选 | 结果 |
+|---------|--------|------|
+| 最终要 **docx/pdf 原格式**（归档、庭审、对外提交） | **不转换**，直接 `mask -f 合同.docx` 或 `mask -f 判决书.pdf --pdf-redact` | 脱敏后仍是原格式，可逐字还原 |
+| 只需**提取文本**（核对、摘录、喂 LLM、批量筛查） | 先 `node cli.js 判决书.pdf txt`，再 `mask` | txt/md/json 即最终形态 |
+| 输入是 **html / csv / 图片等**脱敏工具不直接支持的格式 | 必须先用 format-converter 转 txt/md/json | 转出的文本就是最终形态 |
+| **扫描件 / 图片型 PDF** | 不要转（pdf→txt 会失败）；直接 `mask -f 扫描件.pdf -o 涂黑.pdf`，走内置 OCR 涂黑 | 保留原版式的涂黑 PDF |
+
+另一个选择点在**输出端**：`mask` 时用 `-o` 指定扩展名决定输出格式——
+`-o xxx.docx`（保留段落结构）、`-o xxx.pdf`（涂黑 PDF 保留版式）、
+默认 txt（纯文本）。扫描件输出 PDF 即原图涂黑，电子版 PDF 用 `--pdf-redact`
+字符级涂黑。
+
+**一句话**：要"转回原格式"就别转，直接脱敏；format-converter 只用于内容提取。
 
 ## 安全设计
 

@@ -38,6 +38,8 @@
 > **v3.9 新特性**：原图涂黑脱敏（`mask --image-redact`）— 图片输入直接在**原图上涂黑**敏感区域，保留原图版式，输出 PDF（Vision 带坐标 OCR 定位 + residual 零残留校验）
 >
 > **v3.10 新特性**：扫描件 PDF → 涂黑 PDF（`mask --image-redact` 支持 PDF 输入）— 每页渲染后逐页涂黑，保留每页版式，输出多页 PDF；电子版 PDF 用 `--pdf-redact`（字符级涂黑），扫描件 PDF 用 `--image-redact`（原图涂黑），自动分流
+>
+> **v4.0 新特性**：批量模式 `mask --batch <文件夹>` — 递归处理整个卷宗文件夹、断点续跑（`--resume`）、批量处理报告（逐文件结果/原件校验/需人工复核/数据流审计）、审阅清单"重点复核/建议复核"分级、`--clean-temp` 中途记录清理（OCR 缓存/临时渲染/断点文件）
 
 ## 快速体验（30 秒）
 
@@ -72,6 +74,14 @@ python desensitize.py mask -f 银行流水.xlsx
 
 # v3.6 列感知模式（银行流水表格，自动识别表头列名）
 python desensitize.py mask -f 银行流水.xlsx --table-aware --review
+
+# v4.0 批量脱敏整个卷宗文件夹（递归 .txt/.docx/.pdf/.xlsx/图片）
+python desensitize.py mask --batch ./卷宗 --review
+# 断点续跑（跳过已完成文件）
+python desensitize.py mask --batch ./卷宗 --review --resume
+# 输出集中到独立目录，结束清理 OCR 中途记录
+python desensitize.py mask --batch ./卷宗 --review \
+  --output-dir ./脱敏输出 --clean-temp
 
 # 从管道输入
 cat 文档.txt | python desensitize.py mask

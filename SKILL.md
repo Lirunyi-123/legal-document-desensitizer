@@ -519,13 +519,76 @@ python3 desensitize.py mask -f 截图.png --image-redact -o 脱敏.pdf
 
 ### 验证方法（v3.10 起）
 ```bash
-python3 -m unittest test_desensitize     # 155 个单测（v3.9 153 + v3.10 2）
+python3 -m unittest test_desensitize     # 162 个单测（v3.10 155 + v4.0 7）
 python3 evaluate.py                      # 红队用例（105 项命中、误报 0）
 python3 selfcheck.py                     # 自检：6 项必检全部通过
 # 扫描件 PDF → 涂黑 PDF
 python3 desensitize.py mask -f 银行流水扫描件.pdf --image-redact -o 脱敏.pdf
 # 电子版 PDF → 字符级涂黑 PDF
 python3 desensitize.py mask -f 判决书.pdf --pdf-redact -o 脱敏.pdf
+```
+
+## v4.0 批量模式（借鉴本地卷宗处理工作流）
+
+把"整卷宗批量处理"纳入 CLI：`mask --batch <文件夹>` 递归处理文件夹内所有
+支持格式（.txt/.docx/.pdf/.xlsx/.xlsm/图片），逐文件执行与单文件完全相同的
+脱敏全流程，并补齐四件律师最关心的事：
+
+### 1. 断点续跑（--resume）
+- 每个文件处理完成后立即写入 checkpoint（`.desensitize_checkpoint.json`），
+  中断后 `--resume` 只处理未完成的文件，不重复劳动；
+- checkpoint 只记录路径/状态/耗时/替换数/原件指纹，**不保存正文**。
+
+### 2. 批量处理报告
+- 自动生成 `批量脱敏报告.txt`：逐文件结果（状态/耗时/替换数/输出/审阅清单）、
+  原件校验、需人工复核文件清单、数据流审计；
+- 报告分级：🔴 重点复核（关键信息残留/处理失败）→ 🟡 建议复核 → 其余抽查。
+
+### 3. 原件不变校验
+- 处理前后对每个原件记录 大小 + 修改时间 + sha256 指纹，报告输出
+  "✅ 全部原件未被修改" 或列出异常文件；
+- 工具从不修改原件，但把"校验证据"写进报告，供律师放心使用。
+
+### 4. 中途记录清理（--clean-temp）
+- 处理完成后清理 OCR 编译缓存（legal_deid_ocr_vision*）、临时渲染目录
+  （deid_ocr_*/deid_pdf_*）和断点文件；不影响最终脱敏件/映射表/审阅清单。
+
+### 用法
+```bash
+# 批量脱敏整个卷宗文件夹（推荐先 --review 出审阅清单）
+python3 desensitize.py mask --batch ./卷宗 --review
+# 中断后续跑（跳过已完成文件）
+python3 desensitize.py mask --batch ./卷宗 --review --resume
+# 输出集中到独立目录（推荐，避免与输入混放），结束清理 OCR 中途记录
+python3 desensitize.py mask --batch ./卷宗 --review \
+  --output-dir ./脱敏输出 --clean-temp
+# 批量映射表加密保存
+export DESENSITIZER_MAPPING_PASSWORD="your-password"
+python3 desensitize.py mask --batch ./卷宗 --review \
+  --output-dir ./脱敏输出 --encrypt-mapping
+```
+
+### 审阅清单升级（复核分级）
+- 🔴 重点复核：关键信息残留（身份证/手机号/银行卡/案号/信用代码/执业证号等），
+  逐条列出，处理前请勿分享/上传；
+- 🟡 建议复核：低优先级残留（法院名/公司简称/地址/项目名/孤立姓名等）；
+- 报告/清单均注明："复核分级只用于安排检查顺序，不能证明文档已安全；
+  关键信息校验 ✅ 仅表示规则层已覆盖，正式引用/上传前仍需人工抽检原件。"
+
+### 批量模式安全要点
+- 批量输入文件夹内已有的 `_desensitized` / `_redacted` / `_审阅` / `_语义层`
+  输出文件会被自动跳过，不会二次处理；
+- 建议用 `--output-dir` 把脱敏件与原件分目录存放，原件目录保持干净；
+- 批量报告会列出"需人工复核文件"，首次跑大批量前先拿 1–2 份代表性文件
+  （含表格/手写）试跑确认，再分批全量。
+
+### 验证方法（v4.0 起）
+```bash
+python3 -m unittest test_desensitize     # 162 个单测（含批量/断点/报告/分级）
+python3 evaluate.py                      # 红队用例（105 项命中、误报 0）
+# 端到端冒烟
+mkdir -p /tmp/卷宗 && printf '原告陈建国，身份证号110101198001011232。\n' > /tmp/卷宗/a.txt
+python3 desensitize.py mask --batch /tmp/卷宗 --review --output-dir /tmp/脱敏输出
 ```
 
 ## 输入

@@ -24,6 +24,8 @@ import os
 import secrets
 import calendar
 import tempfile
+import hashlib
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
@@ -3747,7 +3749,14 @@ def build_review_text(masked_text: str, stats: dict,
                       remaining: list = None,
                       mapping: list = None,
                       original_text: str = None) -> str:
-    """生成"规则层脱敏结果 + 审阅清单"文本（阶段一交付物）。"""
+    """生成"规则层脱敏结果 + 审阅清单"文本（阶段一交付物）。
+
+    复核分级（借鉴本地卷宗处理工作流的"重点/建议"两级设计）：
+    - 🔴 重点复核：关键信息残留（身份证/手机号/银行卡/案号/信用代码/执业证号等），
+      处理前请勿分享/上传；
+    - 🟡 建议复核：低优先级残留（法院名/公司简称/地址/项目名/孤立姓名等），
+      供律师判断是否需要语义层。
+    """
     if remaining is None:
         remaining = scan_remaining_risk(masked_text)
     lines = []
@@ -3759,14 +3768,15 @@ def build_review_text(masked_text: str, stats: dict,
     for k, v in sorted(stats.items()):
         lines.append(f'  - {k}: {v}')
     lines.append('')
-    lines.append('【二、关键信息校验（必须全部清零后才可用于后续分享）】')
-    critical_hits = {f['type'] for f in remaining
-                     if any(c in f['type'] for c in _CRITICAL_TYPES)}
-    if not critical_hits:
+    lines.append('【二、关键信息校验（🔴 重点复核——处理前请勿分享/上传）】')
+    critical = [f for f in remaining
+                if any(c in f['type'] for c in _CRITICAL_TYPES)]
+    if not critical:
         lines.append('  ✅ 身份证/手机号/银行卡/案号/信用代码/执业证号等关键信息：0 残留')
     else:
-        lines.append(f'  ❌ 仍有关键信息残留：{"、".join(sorted(critical_hits))}'
-                     '（请勿继续分享，需人工处理或反馈修复规则）')
+        lines.append('  ❌ 仍有关键信息残留，请优先人工处理（重点复核）：')
+        for f in critical:
+            lines.append(f"    - [{f['type']}] {f['value']}  （…{f['context']}…）")
     if mapping is not None and original_text is not None:
         restored = restore_text(masked_text, mapping)
         if restored == original_text:
@@ -3774,11 +3784,11 @@ def build_review_text(masked_text: str, stats: dict,
         else:
             lines.append('  ❌ 还原往返校验失败（映射表与脱敏文本不一致，请勿归档/还原）')
     lines.append('')
-    lines.append('【三、剩余低优先级信息（供审阅；如确认需要，再做语义层脱敏）】')
-    if remaining:
-        for f in remaining:
-            if any(c in f['type'] for c in _CRITICAL_TYPES):
-                continue
+    lines.append('【三、剩余低优先级信息（🟡 建议复核——供律师判断是否需要语义层）】')
+    low = [f for f in remaining
+           if not any(c in f['type'] for c in _CRITICAL_TYPES)]
+    if low:
+        for f in low:
             lines.append(f"  - [{f['type']}] {f['value']}  （…{f['context']}…）")
     else:
         lines.append('  （未发现明显残留，仍建议人工抽查案情细节）')
@@ -3788,7 +3798,12 @@ def build_review_text(masked_text: str, stats: dict,
     lines.append('  如需进一步去掉案情敏感细节/公司简称等，请对配置了本技能的 AI 说'
                  '"继续语义层脱敏"，AI 会直接执行，无需外部 API。')
     lines.append('')
-    lines.append('【五、阶段一脱敏后全文】')
+    lines.append('【五、复核说明（重要）】')
+    lines.append('  复核分级只用于安排检查顺序，不能证明文档已安全；')
+    lines.append('  关键信息校验 ✅ 仅表示规则层已覆盖，不构成"无敏感信息"的结论；')
+    lines.append('  正式引用/上传前，请对原始文档做人工抽检。')
+    lines.append('')
+    lines.append('【六、阶段一脱敏后全文】')
     lines.append('-' * 62)
     lines.append(masked_text)
     return '\n'.join(lines)
@@ -3898,6 +3913,632 @@ def run_semantic_pass(masked_text: str, stage1_rows: list) -> tuple:
 
 
 # ============================================================
+# v4.0：批量模式（--batch）+ 断点续跑 + 批量报告 + 原件校验 + 中途记录清理
+# ============================================================
+
+_BATCH_SUPPORTED_EXTS = ('.txt', '.docx', '.pdf', '.xlsx', '.xlsm',
+                         '.png', '.jpg', '.jpeg', '.bmp', '.webp',
+                         '.tif', '.tiff')
+_BATCH_OUTPUT_MARKERS = ('_desensitized', '_redacted', '_审阅', '_语义层')
+_BATCH_CHECKPOINT = '.desensitize_checkpoint.json'
+_BATCH_REPORT = '批量脱敏报告.txt'
+
+
+def _sha256_file(filepath: str) -> str:
+    """计算文件 sha256（分块读取，适合大文件/扫描卷宗）。"""
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _file_fingerprint(filepath: str) -> dict:
+    """处理前/后对原件做指纹（大小 + 修改时间 + sha256），用于"原件未修改"校验。"""
+    st = os.stat(filepath)
+    return {'size': st.st_size,
+            'mtime_ns': st.st_mtime_ns,
+            'sha256': _sha256_file(filepath)}
+
+
+def _fingerprint_equal(a: dict, b: dict) -> bool:
+    return (a.get('size') == b.get('size')
+            and a.get('mtime_ns') == b.get('mtime_ns')
+            and a.get('sha256') == b.get('sha256'))
+
+
+def _collect_batch_files(batch_dir: str) -> list:
+    """递归收集支持格式的文件；跳过输出/映射/检查点等非输入文件。"""
+    files = []
+    for root, dirs, names in os.walk(batch_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
+        for name in sorted(names):
+            if name.startswith('.') or name == _BATCH_CHECKPOINT:
+                continue
+            if name == _BATCH_REPORT:
+                continue
+            stem = os.path.splitext(name)[0]
+            if any(stem.endswith(m) for m in _BATCH_OUTPUT_MARKERS):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in _BATCH_SUPPORTED_EXTS:
+                files.append(os.path.join(root, name))
+    return sorted(files)
+
+
+def _load_checkpoint(batch_dir: str) -> dict:
+    path = os.path.join(batch_dir, _BATCH_CHECKPOINT)
+    if not os.path.exists(path):
+        return {'version': 1, 'files': {}}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            cp = json.load(f)
+        if not isinstance(cp, dict) or 'files' not in cp:
+            return {'version': 1, 'files': {}}
+        return cp
+    except Exception:
+        return {'version': 1, 'files': {}}
+
+
+def _save_checkpoint(batch_dir: str, cp: dict):
+    path = os.path.join(batch_dir, _BATCH_CHECKPOINT)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(cp, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def clean_temp_artifacts(verbose: bool = True) -> list:
+    """清理脱敏过程产生的中途记录（--clean-temp）。
+
+    清理范围（全部位于系统临时目录，不影响最终脱敏件/映射表/审阅清单）：
+    - macOS Vision OCR 编译缓存二进制（legal_deid_ocr_vision*）
+    - 中途渲染目录残留（deid_ocr_*/deid_pdf_*）
+    返回已删除路径列表。
+    """
+    removed = []
+    tmp = tempfile.gettempdir()
+    for name in ('legal_deid_ocr_vision', 'legal_deid_ocr_vision_boxes'):
+        p = os.path.join(tmp, name)
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                removed.append(p)
+            except OSError:
+                pass
+    try:
+        entries = os.listdir(tmp)
+    except OSError:
+        entries = []
+    for name in entries:
+        if name.startswith(('deid_ocr_', 'deid_pdf_')):
+            p = os.path.join(tmp, name)
+            try:
+                import shutil
+                shutil.rmtree(p, ignore_errors=True)
+                removed.append(p)
+            except OSError:
+                pass
+    if verbose and removed:
+        print(f'🧹 已清理中途临时记录（{len(removed)} 项）：')
+        for p in removed:
+            print(f'   - {p}')
+        print('   提示：这些仅为 OCR 缓存/临时渲染，最终脱敏件与映射表不受影响。')
+    elif verbose:
+        print('🧹 未发现需要清理的中途临时记录。')
+    return removed
+
+
+def _review_critical_status(review_path: str) -> str:
+    """从审阅清单文件中读取关键信息校验状态（✅/❌/未生成）。"""
+    if not review_path or not os.path.exists(review_path):
+        return '未生成'
+    try:
+        with open(review_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if '关键信息' in line and ('✅' in line or '❌' in line):
+                    return '✅' if '✅' in line else '❌'
+    except OSError:
+        return '未生成'
+    return '未知'
+
+
+def _build_batch_report(batch_dir: str, cp: dict, total: int, ok: int,
+                        failed: int, changed: list, started_all: float,
+                        ended_all: float, out_dir: str = None) -> str:
+    """生成批量处理报告：逐文件结果 + 原件校验 + 需人工复核 + 数据流审计。"""
+    lines = []
+    lines.append('=' * 66)
+    lines.append('法律文书脱敏 · 批量处理报告')
+    lines.append('=' * 66)
+    lines.append('')
+    lines.append(f'批次目录: {batch_dir}')
+    if out_dir:
+        lines.append(f'输出目录: {out_dir}')
+    lines.append(f'开始时间: {cp.get("started_at", "")}')
+    lines.append(f'结束时间: {time.strftime("%Y-%m-%d %H:%M:%S")}')
+    lines.append(f'总耗时: {ended_all - started_all:.1f} 秒')
+    lines.append(f'文件总数: {total} | 成功: {ok} | 失败: {failed}')
+    lines.append('')
+    lines.append('【一、逐文件结果】')
+    for fpath, rec in sorted(cp.get('files', {}).items()):
+        rel = os.path.relpath(fpath, batch_dir)
+        if rec.get('status') == 'done':
+            lines.append(f"  ✅ {rel}  耗时 {rec.get('elapsed', '?')}s  "
+                         f"替换 {rec.get('replaced', 0)} 处")
+            out = rec.get('output')
+            if out:
+                lines.append(f'      输出: {out}')
+            rv = rec.get('review')
+            if rv:
+                lines.append(f'      审阅: {rv}（关键信息校验 '
+                             f'{_review_critical_status(rv)}）')
+        elif rec.get('status') == 'failed':
+            lines.append(f"  ❌ {rel}  失败: {rec.get('error', '未知错误')}")
+        else:
+            lines.append(f'  ⏭️  {rel}  状态: {rec.get("status", "未知")}')
+    lines.append('')
+    lines.append('【二、原件校验（处理前后原件是否被修改）】')
+    if not changed:
+        lines.append('  ✅ 全部原件未被修改（大小 / 修改时间 / sha256 处理前后一致）')
+    else:
+        lines.append('  ❌ 以下原件与处理前不一致，请立即核查：')
+        for fpath, why in changed:
+            lines.append(f'    - {fpath}：{why}')
+    lines.append('')
+    lines.append('【三、需人工复核文件（先看这些）】')
+    critical_fail = []
+    fail_list = []
+    no_review = []
+    for fpath, rec in sorted(cp.get('files', {}).items()):
+        if rec.get('status') == 'failed':
+            fail_list.append((fpath, rec.get('error', '')))
+            continue
+        rv = rec.get('review')
+        if rec.get('status') == 'done' and rv:
+            if _review_critical_status(rv) == '❌':
+                critical_fail.append((fpath, rv))
+        elif rec.get('status') == 'done' and not rec.get('review'):
+            no_review.append(fpath)
+    if critical_fail:
+        lines.append('  🔴 关键信息残留（请先人工处理或反馈修复规则）：')
+        for fpath, rv in critical_fail:
+            lines.append(f'    - {fpath}（审阅: {rv}）')
+    else:
+        lines.append('  ✅ 已完成文件的审阅清单中无关键信息残留标记')
+    if fail_list:
+        lines.append('  ❌ 处理失败文件：')
+        for fpath, err in fail_list:
+            lines.append(f'    - {fpath}：{err}')
+    if no_review:
+        lines.append('  ⚠️  以下文件未生成审阅清单'
+                     '（本次未加 --review；建议补跑确认关键信息清零）：')
+        for fpath in no_review:
+            lines.append(f'    - {fpath}')
+    lines.append('')
+    lines.append('【四、数据流审计】')
+    lines.append(f'  输入: {batch_dir}')
+    lines.append(f'  输出: {out_dir or batch_dir}（脱敏件 *_desensitized.*）')
+    lines.append('  映射表: 与输出同目录（*_映射表.md / .enc，含原始值，'
+                 '切勿上传网络或AI）')
+    lines.append(f'  审阅清单: 与输出同目录（*_审阅.txt）')
+    lines.append(f'  临时文件: {tempfile.gettempdir()}'
+                 '（OCR 缓存 legal_deid_ocr_vision*；可用 --clean-temp 清理）')
+    lines.append('  外部 API: 本次批量处理未调用外部服务'
+                 '（规则层本地执行；仅 --ner-backend llm / full 会调用 LLM）')
+    lines.append('')
+    lines.append('【五、复核说明（重要）】')
+    lines.append('  本报告只用于安排人工复核顺序，不能证明文档已安全；')
+    lines.append('  关键信息校验 ✅ 仅表示规则层已覆盖，不构成"无敏感信息"的结论；')
+    lines.append('  正式引用/上传前，请回到原始 PDF/原件核对。')
+    return '\n'.join(lines)
+
+
+def _fresh_desensitizer(args) -> 'Desensitizer':
+    """按参数新建一个干净实例（批量模式下每个文件独立，避免跨文件实体串扰）。"""
+    secure_mode = bool(getattr(args, 'secure', False))
+    if getattr(args, 'security_level', None) in ('strict', 'high'):
+        secure_mode = True
+    if secure_mode:
+        level = getattr(args, 'security_level', 'strict')
+        return SecureDesensitizer(security_level=level,
+                                  mask_all_dates=getattr(args, 'all_dates', False),
+                                  bare_names=not getattr(args, 'no_bare_names', False))
+    return Desensitizer(mask_all_dates=getattr(args, 'all_dates', False),
+                        bare_names=not getattr(args, 'no_bare_names', False))
+
+
+def run_batch(batch_dir: str, args, ner=None) -> int:
+    """批量脱敏文件夹（--batch）。
+
+    - 递归收集支持格式文件，逐文件执行与单文件相同的 mask 全流程
+    - checkpoint 断点续跑（--resume）：已完成的文件跳过，不重复处理
+    - 处理前后对原件做 sha256/大小/修改时间指纹校验，报告"原件未修改"
+    - 生成批量处理报告（逐文件结果/原件校验/需人工复核/数据流审计）
+    - --clean-temp：结束后清理 OCR 缓存/临时目录/断点文件
+    返回成功处理文件数。
+    """
+    import argparse
+    batch_dir = os.path.abspath(batch_dir)
+    if not os.path.isdir(batch_dir):
+        sys.exit(f'❌ --batch 路径不是文件夹: {batch_dir}')
+    files = _collect_batch_files(batch_dir)
+    if not files:
+        print(f'⚠️  {batch_dir} 下未找到支持的文档'
+              '（.txt/.docx/.pdf/.xlsx/.xlsm/图片）')
+        return 0
+
+    out_dir = None
+    if getattr(args, 'output_dir', None):
+        out_dir = os.path.abspath(args.output_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        checkpoint_dir = out_dir
+        report_path = os.path.join(out_dir, _BATCH_REPORT)
+    else:
+        checkpoint_dir = batch_dir
+        report_path = os.path.join(batch_dir, _BATCH_REPORT)
+
+    resume = bool(getattr(args, 'resume', False))
+    cp = _load_checkpoint(checkpoint_dir)
+    done_paths = [k for k, v in cp.get('files', {}).items()
+                  if v.get('status') == 'done']
+    if resume and done_paths:
+        print(f'♻️  断点续跑：{len(done_paths)} 个已完成文件将跳过'
+              f'（checkpoint: {os.path.join(checkpoint_dir, _BATCH_CHECKPOINT)}）')
+    elif not resume and done_paths:
+        print('⚠️  检测到上次批量处理的断点记录；本次将重新从头处理。'
+              '如需续跑请加 --resume。')
+
+    total = len(files)
+    ok = failed = 0
+    started_all = time.time()
+    cp.setdefault('files', {})
+    cp['batch_dir'] = batch_dir
+    cp['started_at'] = cp.get('started_at') or time.strftime('%Y-%m-%d %H:%M:%S')
+    want_review = bool(getattr(args, 'review', False))
+
+    for i, fpath in enumerate(files, 1):
+        rel = os.path.relpath(fpath, batch_dir)
+        if resume and cp['files'].get(fpath, {}).get('status') == 'done':
+            print(f'[{i}/{total}] ⏭️  跳过（已完成）: {rel}')
+            ok += 1
+            continue
+
+        fp_before = _file_fingerprint(fpath)
+        fa = argparse.Namespace(**vars(args))
+        fa.file = fpath
+        fa._sanitized_basename = None
+        sanitized_base = sanitize_filename(os.path.basename(fpath))
+        name, _ = os.path.splitext(sanitized_base)
+        out_ext = _default_output_ext(fpath)
+        if out_dir:
+            out_base = os.path.join(out_dir, f'{name}_desensitized{out_ext}')
+            map_base = os.path.join(out_dir, f'{name}_映射表')
+        else:
+            out_base = os.path.join(os.path.dirname(fpath),
+                                    f'{name}_desensitized{out_ext}')
+            map_base = os.path.join(os.path.dirname(fpath), f'{name}_映射表')
+        fa.output = out_base
+        fa.save_mapping = (map_base + '.enc' if getattr(args, 'encrypt_mapping', False)
+                           else map_base + '.md')
+        fa.review = want_review
+        fa.json = False
+        fa.mapping = False
+
+        print(f'[{i}/{total}] 🔄 处理: {rel}')
+        t0 = time.time()
+        file_d = _fresh_desensitizer(args)
+        try:
+            try:
+                ftext = read_text_from_file(fpath)
+            except SystemExit:
+                ext = os.path.splitext(fpath)[1].lower()
+                if (getattr(args, 'image_redact', False)
+                        and ext in ('.pdf', '.png', '.jpg', '.jpeg', '.bmp',
+                                    '.webp', '.tif', '.tiff')):
+                    ftext = ''
+                else:
+                    raise
+            summary = _run_mask_file(fa, file_d, ner, ftext)
+            elapsed = time.time() - t0
+            fp_after = _file_fingerprint(fpath)
+            cp['files'][fpath] = {
+                'status': 'done',
+                'output': summary.get('output'),
+                'mapping': summary.get('mapping'),
+                'review': summary.get('review'),
+                'replaced': summary.get('replaced', 0),
+                'stats': summary.get('stats', {}),
+                'elapsed': round(elapsed, 2),
+                'original': fp_before,
+                'original_unchanged': _fingerprint_equal(fp_before, fp_after),
+            }
+            _save_checkpoint(checkpoint_dir, cp)
+            ok += 1
+        except SystemExit as e:
+            elapsed = time.time() - t0
+            cp['files'][fpath] = {
+                'status': 'failed',
+                'error': str(e),
+                'elapsed': round(elapsed, 2),
+                'original': fp_before,
+            }
+            _save_checkpoint(checkpoint_dir, cp)
+            failed += 1
+            print(f'   ❌ 处理失败: {e}')
+        except Exception as e:
+            elapsed = time.time() - t0
+            cp['files'][fpath] = {
+                'status': 'failed',
+                'error': f'{type(e).__name__}: {e}',
+                'elapsed': round(elapsed, 2),
+                'original': fp_before,
+            }
+            _save_checkpoint(checkpoint_dir, cp)
+            failed += 1
+            print(f'   ❌ 处理失败: {e}')
+
+    # 原件校验：对所有已完成的文件复核指纹
+    changed = []
+    for fpath, rec in sorted(cp.get('files', {}).items()):
+        if rec.get('status') != 'done':
+            continue
+        if not os.path.exists(fpath):
+            changed.append((fpath, '文件已不存在'))
+            continue
+        if not rec.get('original_unchanged'):
+            now = _file_fingerprint(fpath)
+            if not _fingerprint_equal(rec.get('original', {}), now):
+                changed.append((fpath, '大小/修改时间/hash 与处理前不一致'))
+
+    report = _build_batch_report(batch_dir, cp, total, ok, failed, changed,
+                                 started_all, time.time(), out_dir)
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(report)
+    print(f'📋 批量处理报告已生成: {report_path}')
+
+    if getattr(args, 'clean_temp', False):
+        clean_temp_artifacts(verbose=True)
+        cp_path = os.path.join(checkpoint_dir, _BATCH_CHECKPOINT)
+        if os.path.exists(cp_path):
+            os.remove(cp_path)
+            print(f'🧹 已删除断点记录: {cp_path}')
+
+    print(f'🏁 批量处理完成：共 {total} 个文件，成功 {ok}，失败 {failed}；'
+          f'总耗时 {time.time() - started_all:.1f} 秒')
+    return ok
+
+
+def _make_ner(args):
+    """构造本地 NER 层（spaCy/HuggingFace/本地 LLM），未指定时返回 None。"""
+    if not getattr(args, 'ner_backend', None):
+        return None
+    from ner_interface import LegalNER
+    ner_kwargs = {}
+    if args.ner_model:
+        ner_kwargs['model'] = args.ner_model
+    if args.ner_backend == 'llm' and args.ner_endpoint:
+        ner_kwargs['endpoint'] = args.ner_endpoint
+    ner = LegalNER(backend=args.ner_backend, **ner_kwargs)
+    if sys.stderr.isatty():
+        print(f'🤖 本地 NER 层已启用（{ner.backend_name}）', file=sys.stderr)
+    return ner
+
+
+def _run_mask_file(args, d, ner, text) -> dict:
+    """单文件 mask 全流程：规则层（可选列感知/NER）→ 映射表 → 输出 → 审阅清单。
+
+    单文件模式与 --batch 批量模式共用。返回摘要 dict：
+    {'output': str|None, 'mapping': str|None, 'review': str|None,
+     'replaced': int, 'stats': dict}
+    """
+    try:
+        # v3.6：列感知模式（--table-aware）——自动识别银行流水表格表头
+        table_aware = getattr(args, 'table_aware', False)
+        if table_aware and args.file:
+            structured = read_structured_table(args.file)
+            if structured is not None:
+                headers, rows, col_types = structured
+                result = d.mask_table(headers, rows, col_types)
+                if sys.stderr.isatty():
+                    print(f'📊 列感知模式已启用：识别到表头 '
+                          f'{headers}，按列类型脱敏', file=sys.stderr)
+            else:
+                if sys.stderr.isatty():
+                    print('⚠️  未能识别表格表头，回退普通文本模式',
+                          file=sys.stderr)
+                result = (d.mask_with_ner(text, ner) if ner else d.mask(text))
+        else:
+            result = d.mask_with_ner(text, ner) if ner else d.mask(text)
+    except NotImplementedError as e:
+        sys.exit(f'❌ {e}')
+    except ImportError as e:
+        sys.exit(f'❌ NER 后端依赖缺失：{e}')
+
+    # 保存映射表到文件（如果指定了 --save-mapping）
+    mapping_path = None
+    if hasattr(args, 'save_mapping') and args.save_mapping:
+        mapping_content = result.to_markdown()
+        mapping_path = args.save_mapping
+
+        if hasattr(args, 'encrypt_mapping') and args.encrypt_mapping:
+            # AES-256-GCM + PBKDF2 加密保存（v2.1 零信任方案）
+            try:
+                save_mapping_encrypted(mapping_content, mapping_path)
+            except ImportError:
+                sys.exit('❌ 需要安装 cryptography: pip3 install cryptography')
+            print(f'🔐 映射表已 AES-256-GCM 加密保存: {mapping_path}')
+            print(f'🔑 解密时需要输入相同的密码')
+            print(f'   💡 设置环境变量 DESENSITIZER_MAPPING_PASSWORD 可跳过交互式输入')
+        else:
+            # 明文保存（默认行为，发出警告）
+            with open(mapping_path, 'w', encoding='utf-8') as f:
+                f.write(mapping_content)
+            print(f'⚠️ ⚠️ ⚠️  映射表已保存（明文）: {mapping_path}')
+            print(f'⚠️  警告：该文件包含原始敏感信息（身份证号、手机号等）！')
+            print(f'⚠️  切勿上传到任何AI服务或网络！')
+            print(f'⚠️  建议使用 --encrypt-mapping 参数加密保存')
+
+    # 输出到文件（如果指定了 -o 或输入是文件）
+    output_path = None
+    if hasattr(args, 'output') and args.output:
+        output_path = args.output
+    elif hasattr(args, 'file') and args.file and not args.json and not args.mapping:
+        # 优先使用脱敏后的文件名（由 sanitize_filename 生成）
+        sanitized_basename = getattr(args, '_sanitized_basename', None)
+        if sanitized_basename:
+            dir_part = os.path.dirname(args.file)
+            name, _ = os.path.splitext(sanitized_basename)
+            out_ext = _default_output_ext(args.file)
+            if dir_part:
+                output_path = os.path.join(dir_part, f'{name}_desensitized{out_ext}')
+            else:
+                output_path = f'{name}_desensitized{out_ext}'
+        else:
+            base, _ = os.path.splitext(args.file)
+            output_path = f'{base}_desensitized{_default_output_ext(args.file)}'
+
+    if output_path:
+        # v3.0：PDF 真·涂黑脱敏（--pdf-redact 或 -o 指定 .pdf 时自动启用）
+        in_is_pdf = (hasattr(args, 'file') and args.file
+                     and os.path.splitext(args.file)[1].lower() == '.pdf')
+        # v3.9：图片输入（--image-redact 或 -o 指定 .pdf 时自动启用）
+        in_is_image = (hasattr(args, 'file') and args.file
+                       and os.path.splitext(args.file)[1].lower()
+                       in ('.png', '.jpg', '.jpeg', '.bmp', '.webp',
+                           '.tif', '.tiff'))
+        # v3.10：扫描件 PDF（无文本层，纯图片）——--image-redact 涂黑
+        in_is_scanned_pdf = False
+        if (hasattr(args, 'file') and args.file and in_is_pdf
+                and getattr(args, 'image_redact', False)):
+            try:
+                import fitz
+                _doc = fitz.open(args.file)
+                try:
+                    _has_text = any(p.get_text().strip()
+                                    for p in _doc)
+                finally:
+                    _doc.close()
+                in_is_scanned_pdf = not _has_text
+            except Exception:
+                in_is_scanned_pdf = False
+        out_ext = os.path.splitext(output_path)[1].lower()
+        # 仅显式启用：--pdf-redact，或用户显式 -o 指定 .pdf 扩展名。
+        # 不改变既有默认行为（.pdf 输入 → .txt 输出）。
+        user_gave_output = bool(getattr(args, 'output', None))
+        want_pdf_redact = (in_is_pdf and user_gave_output
+                           and out_ext == '.pdf'
+                           and not in_is_scanned_pdf) or bool(
+            getattr(args, 'pdf_redact', False) and in_is_pdf
+            and not in_is_scanned_pdf)
+        if want_pdf_redact:
+            try:
+                from pdf_redact import PdfError, redact_pdf
+            except ImportError:
+                sys.exit('❌ 需要安装 PyMuPDF: pip3 install PyMuPDF')
+            if out_ext != '.pdf':
+                # --pdf-redact 未指定 -o：自动输出 _redacted.pdf
+                output_path = os.path.splitext(output_path)[0] + '.pdf'
+            with open(args.file, 'rb') as f:
+                pdf_bytes = f.read()
+            pairs = [(m.replacement, m.original) for m in result.mapping]
+            try:
+                out_pdf, report = redact_pdf(pdf_bytes, pairs)
+            except PdfError as e:
+                sys.exit(f'❌ PDF 涂黑失败：{e}')
+            with open(output_path, 'wb') as f:
+                f.write(out_pdf)
+            print(f'✅ 涂黑脱敏 PDF 已保存: {output_path}'
+                  f'（{report["occurrences"]} 处涂黑，'
+                  f'批注 {report["annots"]}/表单 {report["widgets"]}/'
+                  f'书签 {report["toc"]}/附件 {report["embedded"]} 清理）')
+            if report['skipped']:
+                print(f'⚠️  跳过 {len(report["skipped"])} 个过短值'
+                      f'（<2 个汉字/字母数字，全文搜索会误涂），仍留在原样：'
+                      f'{sorted(set(report["skipped"]))[:8]}')
+            if report['not_found']:
+                print(f'⚠️  以下占位符在 PDF 文本层未找到任何出现'
+                      f'（可能在图片/扫描层）：{sorted(set(report["not_found"]))[:8]}')
+            print('✅ residual 零残留校验通过（输出中已读不到任何原文）')
+        elif (in_is_image or in_is_scanned_pdf) and (
+                bool(getattr(args, 'image_redact', False))
+                or (user_gave_output and out_ext == '.pdf')):
+            # v3.9/3.10：图片 / 扫描件 PDF → 原图涂黑 PDF（保留版式）
+            try:
+                from image_redact import (ImageRedactError,
+                                          redact_image_pdf,
+                                          redact_scanned_pdf)
+            except ImportError:
+                sys.exit('❌ image_redact.py 缺失（工具安装不完整）')
+            if out_ext != '.pdf':
+                output_path = os.path.splitext(output_path)[0] + '.pdf'
+            pairs = [(m.replacement, m.original) for m in result.mapping]
+            try:
+                # v3.9/3.10：传 desensitizer → 用坐标 OCR 同一份文本重跑
+                # 规则层，避免两次 OCR 错字不一致导致漏涂
+                if in_is_scanned_pdf:
+                    report, masked_text = redact_scanned_pdf(
+                        args.file, pairs, output_path, desensitizer=d)
+                else:
+                    report, masked_text = redact_image_pdf(
+                        args.file, pairs, output_path, desensitizer=d)
+            except ImageRedactError as e:
+                sys.exit(f'❌ 图片涂黑失败：{e}')
+            print(f'✅ 原图涂黑脱敏 PDF 已保存: {output_path}'
+                  f'（{report["occurrences"]} 处涂黑）')
+            if report['not_found']:
+                print(f'⚠️  以下敏感值在图片中未定位到坐标'
+                      f'（OCR 未识别或错字）：{sorted(set(report["not_found"]))[:8]}')
+            if report.get('ocr_leak'):
+                print(f'⚠️  OCR 复查对 {len(set(report["ocr_leak"]))} 个值有'
+                      f'补全猜测（像素已确认涂黑，仅提示，人工可忽略）：'
+                      f'{sorted(set(report["ocr_leak"]))[:6]}')
+            print('✅ residual 校验通过（涂黑矩形像素全黑，原文已覆盖）')
+        else:
+            if out_ext == '.pdf' and not in_is_pdf:
+                print('⚠️  -o 指定了 .pdf 但输入不是 PDF：将以纯文本写入 .pdf'
+                      '（PDF 真·涂黑仅对 PDF 输入生效，请用 --pdf-redact + PDF 输入）')
+            write_desensitized_file(args.file, output_path, result.text)
+            print(f'✅ 脱敏后文件已保存: {output_path}')
+    else:
+        # 输出到 stdout
+        if args.mapping:
+            print(result.to_markdown())
+        elif args.json:
+            print(result.to_json())
+        else:
+            print(result.text)
+
+    # 两阶段工作流阶段一：生成"规则层结果 + 审阅清单"（供律师审阅）
+    review_path = None
+    if getattr(args, 'review', False):
+        review_text = build_review_text(
+            result.text, result.stats,
+            mapping=result.mapping,
+            original_text=getattr(d, '_original_text', None))
+        if output_path:
+            base, ext = os.path.splitext(output_path)
+            review_path = f'{base}_审阅.txt'
+            with open(review_path, 'w', encoding='utf-8') as f:
+                f.write(review_text)
+            print(f'📋 审阅清单已生成: {review_path}')
+            print('   律师审阅确认后，如需继续语义层脱敏，直接对配置了本技能的 AI'
+                  '说"继续语义层脱敏"即可（无需外部 API/本地模型）')
+        else:
+            print()
+            print(review_text)
+
+    return {'output': output_path,
+            'mapping': mapping_path,
+            'review': review_path,
+            'replaced': len(result.mapping),
+            'stats': dict(result.stats)}
+
+
+# ============================================================
 # CLI 入口
 # ============================================================
 
@@ -3945,6 +4586,13 @@ def main():
   # v2.3: 完整脱敏流水线（规则层 + 本地 LLM 二轮脱敏 + 合并映射）
   python desensitize.py full -f 判决书.docx --save-mapping 映射表.enc --encrypt-mapping
   python desensitize.py full -f 聊天记录.txt --llm-api ollama --llm-model qwen2.5
+
+  # v4.0: 批量脱敏整个文件夹（卷宗/合同包），逐文件处理 + 批量报告 + 原件校验
+  python desensitize.py mask --batch ./卷宗 --review
+  # 中断后续跑（跳过已完成文件）
+  python desensitize.py mask --batch ./卷宗 --review --resume
+  # 输出集中到独立目录，结束清理 OCR 中途记录
+  python desensitize.py mask --batch ./卷宗 --review --output-dir ./脱敏输出 --clean-temp
         """
     )
 
@@ -3954,6 +4602,17 @@ def main():
     mask_parser = subparsers.add_parser('mask', help='执行规则层脱敏')
     mask_parser.add_argument('-f', '--file', help='输入文件路径（默认从stdin读取）')
     mask_parser.add_argument('-o', '--output', help='输出文件路径（默认自动生成，如输入为.docx则输出同名的_desensitized.docx）')
+    mask_parser.add_argument('--batch', metavar='文件夹',
+                             help='v4.0：批量脱敏整个文件夹（递归收集 .txt/.docx/.pdf/'
+                                  '.xlsx/.xlsm/图片），逐文件处理并生成批量报告')
+    mask_parser.add_argument('--resume', action='store_true', default=False,
+                             help='v4.0：配合 --batch 从断点继续（跳过已完成的文件）')
+    mask_parser.add_argument('--output-dir', metavar='目录',
+                             help='v4.0：批量模式下输出目录（脱敏件/映射表/审阅清单/'
+                                  '批量报告集中存放）')
+    mask_parser.add_argument('--clean-temp', action='store_true', default=False,
+                             help='v4.0：处理完成后清理中途临时记录（OCR 缓存/临时'
+                                  '渲染/断点文件；不影响最终脱敏件与映射表）')
     mask_parser.add_argument('--json', action='store_true', help='以JSON格式输出')
     mask_parser.add_argument('--mapping', action='store_true', help='仅输出脱敏映射表')
     mask_parser.add_argument('--save-mapping', help='脱敏映射表另存为文件（⚠️ 包含原始值，建议配合 --encrypt-mapping 使用）')
@@ -4060,8 +4719,12 @@ def main():
 
     args = parser.parse_args()
 
-    # 读取输入（支持 .txt / .docx / .pdf）
-    if hasattr(args, 'file') and args.file:
+    is_batch = bool(getattr(args, 'batch', None))
+
+    # 读取输入（支持 .txt / .docx / .pdf / .xlsx / 图片；--batch 逐文件读取）
+    if is_batch:
+        text = ''
+    elif hasattr(args, 'file') and args.file:
         # 文件名自动脱敏检查
         basename = os.path.basename(args.file)
         name_hint = re.findall(r'[\u4e00-\u9fa5]{2,4}(?:诉|与|vs|VS|\.)', basename)
@@ -4115,210 +4778,10 @@ def main():
             print(f'   ⚠️  Python 字符串不可变，内存清理为"尽力而为"的纵深防御', file=sys.stderr)
 
     if args.command == 'mask':
-        ner = None
-        if getattr(args, 'ner_backend', None):
-            from ner_interface import LegalNER
-            ner_kwargs = {}
-            if args.ner_model:
-                ner_kwargs['model'] = args.ner_model
-            if args.ner_backend == 'llm' and args.ner_endpoint:
-                ner_kwargs['endpoint'] = args.ner_endpoint
-            ner = LegalNER(backend=args.ner_backend, **ner_kwargs)
-            if sys.stderr.isatty():
-                print(f'🤖 本地 NER 层已启用（{ner.backend_name}）', file=sys.stderr)
-        try:
-            # v3.6：列感知模式（--table-aware）——自动识别银行流水表格表头
-            table_aware = getattr(args, 'table_aware', False)
-            if table_aware and args.file:
-                structured = read_structured_table(args.file)
-                if structured is not None:
-                    headers, rows, col_types = structured
-                    result = d.mask_table(headers, rows, col_types)
-                    if sys.stderr.isatty():
-                        print(f'📊 列感知模式已启用：识别到表头 '
-                              f'{headers}，按列类型脱敏', file=sys.stderr)
-                else:
-                    if sys.stderr.isatty():
-                        print('⚠️  未能识别表格表头，回退普通文本模式',
-                              file=sys.stderr)
-                    result = (d.mask_with_ner(text, ner) if ner else d.mask(text))
-            else:
-                result = d.mask_with_ner(text, ner) if ner else d.mask(text)
-        except NotImplementedError as e:
-            sys.exit(f'❌ {e}')
-        except ImportError as e:
-            sys.exit(f'❌ NER 后端依赖缺失：{e}')
-
-        # 保存映射表到文件（如果指定了 --save-mapping）
-        if hasattr(args, 'save_mapping') and args.save_mapping:
-            mapping_content = result.to_markdown()
-            mapping_path = args.save_mapping
-
-            if hasattr(args, 'encrypt_mapping') and args.encrypt_mapping:
-                # AES-256-GCM + PBKDF2 加密保存（v2.1 零信任方案）
-                try:
-                    save_mapping_encrypted(mapping_content, mapping_path)
-                except ImportError:
-                    sys.exit('❌ 需要安装 cryptography: pip3 install cryptography')
-                print(f'🔐 映射表已 AES-256-GCM 加密保存: {mapping_path}')
-                print(f'🔑 解密时需要输入相同的密码')
-                print(f'   💡 设置环境变量 DESENSITIZER_MAPPING_PASSWORD 可跳过交互式输入')
-            else:
-                # 明文保存（默认行为，发出警告）
-                with open(mapping_path, 'w', encoding='utf-8') as f:
-                    f.write(mapping_content)
-                print(f'⚠️ ⚠️ ⚠️  映射表已保存（明文）: {mapping_path}')
-                print(f'⚠️  警告：该文件包含原始敏感信息（身份证号、手机号等）！')
-                print(f'⚠️  切勿上传到任何AI服务或网络！')
-                print(f'⚠️  建议使用 --encrypt-mapping 参数加密保存')
-
-        # 输出到文件（如果指定了 -o 或输入是文件）
-        output_path = None
-        if hasattr(args, 'output') and args.output:
-            output_path = args.output
-        elif hasattr(args, 'file') and args.file and not args.json and not args.mapping:
-            # 优先使用脱敏后的文件名（由 sanitize_filename 生成）
-            sanitized_basename = getattr(args, '_sanitized_basename', None)
-            if sanitized_basename:
-                dir_part = os.path.dirname(args.file)
-                name, _ = os.path.splitext(sanitized_basename)
-                out_ext = _default_output_ext(args.file)
-                if dir_part:
-                    output_path = os.path.join(dir_part, f'{name}_desensitized{out_ext}')
-                else:
-                    output_path = f'{name}_desensitized{out_ext}'
-            else:
-                base, _ = os.path.splitext(args.file)
-                output_path = f'{base}_desensitized{_default_output_ext(args.file)}'
-
-        if output_path:
-            # v3.0：PDF 真·涂黑脱敏（--pdf-redact 或 -o 指定 .pdf 时自动启用）
-            in_is_pdf = (hasattr(args, 'file') and args.file
-                         and os.path.splitext(args.file)[1].lower() == '.pdf')
-            # v3.9：图片输入（--image-redact 或 -o 指定 .pdf 时自动启用）
-            in_is_image = (hasattr(args, 'file') and args.file
-                           and os.path.splitext(args.file)[1].lower()
-                           in ('.png', '.jpg', '.jpeg', '.bmp', '.webp',
-                               '.tif', '.tiff'))
-            # v3.10：扫描件 PDF（无文本层，纯图片）——--image-redact 涂黑
-            in_is_scanned_pdf = False
-            if (hasattr(args, 'file') and args.file and in_is_pdf
-                    and getattr(args, 'image_redact', False)):
-                try:
-                    import fitz
-                    _doc = fitz.open(args.file)
-                    try:
-                        _has_text = any(p.get_text().strip()
-                                        for p in _doc)
-                    finally:
-                        _doc.close()
-                    in_is_scanned_pdf = not _has_text
-                except Exception:
-                    in_is_scanned_pdf = False
-            out_ext = os.path.splitext(output_path)[1].lower()
-            # 仅显式启用：--pdf-redact，或用户显式 -o 指定 .pdf 扩展名。
-            # 不改变既有默认行为（.pdf 输入 → .txt 输出）。
-            user_gave_output = bool(getattr(args, 'output', None))
-            want_pdf_redact = (in_is_pdf and user_gave_output
-                               and out_ext == '.pdf'
-                               and not in_is_scanned_pdf) or bool(
-                getattr(args, 'pdf_redact', False) and in_is_pdf
-                and not in_is_scanned_pdf)
-            if want_pdf_redact:
-                try:
-                    from pdf_redact import PdfError, redact_pdf
-                except ImportError:
-                    sys.exit('❌ 需要安装 PyMuPDF: pip3 install PyMuPDF')
-                if out_ext != '.pdf':
-                    # --pdf-redact 未指定 -o：自动输出 _redacted.pdf
-                    output_path = os.path.splitext(output_path)[0] + '.pdf'
-                with open(args.file, 'rb') as f:
-                    pdf_bytes = f.read()
-                pairs = [(m.replacement, m.original) for m in result.mapping]
-                try:
-                    out_pdf, report = redact_pdf(pdf_bytes, pairs)
-                except PdfError as e:
-                    sys.exit(f'❌ PDF 涂黑失败：{e}')
-                with open(output_path, 'wb') as f:
-                    f.write(out_pdf)
-                print(f'✅ 涂黑脱敏 PDF 已保存: {output_path}'
-                      f'（{report["occurrences"]} 处涂黑，'
-                      f'批注 {report["annots"]}/表单 {report["widgets"]}/'
-                      f'书签 {report["toc"]}/附件 {report["embedded"]} 清理）')
-                if report['skipped']:
-                    print(f'⚠️  跳过 {len(report["skipped"])} 个过短值'
-                          f'（<2 个汉字/字母数字，全文搜索会误涂），仍留在原样：'
-                          f'{sorted(set(report["skipped"]))[:8]}')
-                if report['not_found']:
-                    print(f'⚠️  以下占位符在 PDF 文本层未找到任何出现'
-                          f'（可能在图片/扫描层）：{sorted(set(report["not_found"]))[:8]}')
-                print('✅ residual 零残留校验通过（输出中已读不到任何原文）')
-            elif (in_is_image or in_is_scanned_pdf) and (
-                    bool(getattr(args, 'image_redact', False))
-                    or (user_gave_output and out_ext == '.pdf')):
-                # v3.9/3.10：图片 / 扫描件 PDF → 原图涂黑 PDF（保留版式）
-                try:
-                    from image_redact import (ImageRedactError,
-                                              redact_image_pdf,
-                                              redact_scanned_pdf)
-                except ImportError:
-                    sys.exit('❌ image_redact.py 缺失（工具安装不完整）')
-                if out_ext != '.pdf':
-                    output_path = os.path.splitext(output_path)[0] + '.pdf'
-                pairs = [(m.replacement, m.original) for m in result.mapping]
-                try:
-                    # v3.9/3.10：传 desensitizer → 用坐标 OCR 同一份文本重跑
-                    # 规则层，避免两次 OCR 错字不一致导致漏涂
-                    if in_is_scanned_pdf:
-                        report, masked_text = redact_scanned_pdf(
-                            args.file, pairs, output_path, desensitizer=d)
-                    else:
-                        report, masked_text = redact_image_pdf(
-                            args.file, pairs, output_path, desensitizer=d)
-                except ImageRedactError as e:
-                    sys.exit(f'❌ 图片涂黑失败：{e}')
-                print(f'✅ 原图涂黑脱敏 PDF 已保存: {output_path}'
-                      f'（{report["occurrences"]} 处涂黑）')
-                if report['not_found']:
-                    print(f'⚠️  以下敏感值在图片中未定位到坐标'
-                          f'（OCR 未识别或错字）：{sorted(set(report["not_found"]))[:8]}')
-                if report.get('ocr_leak'):
-                    print(f'⚠️  OCR 复查对 {len(set(report["ocr_leak"]))} 个值有'
-                          f'补全猜测（像素已确认涂黑，仅提示，人工可忽略）：'
-                          f'{sorted(set(report["ocr_leak"]))[:6]}')
-                print('✅ residual 校验通过（涂黑矩形像素全黑，原文已覆盖）')
-            else:
-                if out_ext == '.pdf' and not in_is_pdf:
-                    print('⚠️  -o 指定了 .pdf 但输入不是 PDF：将以纯文本写入 .pdf'
-                          '（PDF 真·涂黑仅对 PDF 输入生效，请用 --pdf-redact + PDF 输入）')
-                write_desensitized_file(args.file, output_path, result.text)
-                print(f'✅ 脱敏后文件已保存: {output_path}')
+        if getattr(args, 'batch', None):
+            run_batch(args.batch, args, _make_ner(args))
         else:
-            # 输出到 stdout
-            if args.mapping:
-                print(result.to_markdown())
-            elif args.json:
-                print(result.to_json())
-            else:
-                print(result.text)
-
-        # 两阶段工作流阶段一：生成"规则层结果 + 审阅清单"（供律师审阅）
-        if getattr(args, 'review', False):
-            review_text = build_review_text(
-                result.text, result.stats,
-                mapping=result.mapping,
-                original_text=getattr(d, '_original_text', None))
-            if output_path:
-                base, ext = os.path.splitext(output_path)
-                review_path = f'{base}_审阅.txt'
-                with open(review_path, 'w', encoding='utf-8') as f:
-                    f.write(review_text)
-                print(f'📋 审阅清单已生成: {review_path}')
-                print('   律师审阅确认后，如需继续语义层脱敏，直接对配置了本技能的 AI'
-                      '说"继续语义层脱敏"即可（无需外部 API/本地模型）')
-            else:
-                print()
-                print(review_text)
+            _run_mask_file(args, d, _make_ner(args), text)
 
     elif args.command == 'scan':
         findings = d.scan(text)

@@ -1666,5 +1666,137 @@ class TestV39ImageRedact(unittest.TestCase):
         self.assertTrue(hasattr(image_redact, 'redact_image_pdf'))
 
 
+class TestBatchMode(unittest.TestCase):
+    """v4.0：批量模式（--batch）+ 断点续跑 + 批量报告 + 原件校验 + 临时清理。"""
+
+    def _make_batch(self):
+        import os
+        import tempfile
+        batch = tempfile.mkdtemp(prefix='deid_batch_test_')
+
+        def w(name, content):
+            p = os.path.join(batch, name)
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(content)
+            return p
+
+        p1 = w('a.txt', '原告陈建国，身份证号110101198001011232，电话13800138000。')
+        p2 = w('b.txt', '被告张三，欠款人民币100万元，尾款2024年1月付清。')
+        return batch, p1, p2
+
+    def _batch_args(self, batch, **overrides):
+        import argparse
+        base = dict(batch=batch, output_dir=None, resume=False,
+                    clean_temp=False, review=True, ner_backend=None,
+                    encrypt_mapping=False, table_aware=False,
+                    image_redact=False, pdf_redact=False, all_dates=False,
+                    no_bare_names=False, secure=False, security_level='standard',
+                    output=None, save_mapping=None, mapping=False, json=False)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_collect_batch_files(self):
+        import os
+        from desensitize import _collect_batch_files, _BATCH_REPORT
+        batch, _, _ = self._make_batch()
+        # 输出类文件不应被再次收集（避免递归处理脱敏产物）
+        with open(os.path.join(batch, 'a_desensitized.txt'), 'w',
+                  encoding='utf-8') as f:
+            f.write('x')
+        with open(os.path.join(batch, _BATCH_REPORT), 'w',
+                  encoding='utf-8') as f:
+            f.write('x')
+        files = _collect_batch_files(batch)
+        self.assertEqual(len(files), 2)
+
+    def test_batch_mask_outputs_report_and_originals_intact(self):
+        import os
+        from desensitize import run_batch, _BATCH_REPORT
+        batch, p1, p2 = self._make_batch()
+        ok = run_batch(batch, self._batch_args(batch))
+        self.assertEqual(ok, 2)
+        # 输出与映射表
+        self.assertTrue(os.path.exists(
+            os.path.join(batch, 'a_desensitized.txt')))
+        self.assertTrue(os.path.exists(
+            os.path.join(batch, 'a_映射表.md')))
+        self.assertTrue(os.path.exists(
+            os.path.join(batch, 'a_desensitized_审阅.txt')))
+        # 批量报告
+        report_path = os.path.join(batch, _BATCH_REPORT)
+        self.assertTrue(os.path.exists(report_path))
+        with open(report_path, 'r', encoding='utf-8') as f:
+            report = f.read()
+        self.assertIn('原件校验', report)
+        self.assertIn('数据流审计', report)
+        self.assertIn('需人工复核', report)
+        # 原件未被修改
+        with open(p1, 'r', encoding='utf-8') as f:
+            self.assertIn('110101198001011232', f.read())
+        with open(p2, 'r', encoding='utf-8') as f:
+            self.assertIn('张三', f.read())
+        # 脱敏件内容正确
+        with open(os.path.join(batch, 'a_desensitized.txt'),
+                  'r', encoding='utf-8') as f:
+            self.assertIn('[身份证号]', f.read())
+
+    def test_batch_resume_skips_done_files(self):
+        import os
+        import time
+        from desensitize import run_batch
+        batch, p1, p2 = self._make_batch()
+        run_batch(batch, self._batch_args(batch))
+        out_a = os.path.join(batch, 'a_desensitized.txt')
+        mtime_before = os.path.getmtime(out_a)
+        time.sleep(0.05)
+        ok = run_batch(batch, self._batch_args(batch, resume=True))
+        self.assertEqual(ok, 2)  # 已完成文件计为成功（跳过）
+        # 断点续跑不应重新生成/覆盖已完成输出
+        self.assertEqual(os.path.getmtime(out_a), mtime_before)
+
+    def test_batch_output_dir(self):
+        import os
+        import tempfile
+        from desensitize import run_batch, _BATCH_REPORT
+        batch, _, _ = self._make_batch()
+        out = tempfile.mkdtemp(prefix='deid_batch_out_')
+        ok = run_batch(batch, self._batch_args(batch, output_dir=out))
+        self.assertEqual(ok, 2)
+        self.assertTrue(os.path.exists(os.path.join(out, _BATCH_REPORT)))
+        self.assertTrue(os.path.exists(os.path.join(out, 'a_desensitized.txt')))
+
+    def test_clean_temp_artifacts(self):
+        from desensitize import clean_temp_artifacts
+        removed = clean_temp_artifacts(verbose=False)
+        self.assertIsInstance(removed, list)
+
+
+class TestReviewTiering(unittest.TestCase):
+    """v4.0：审阅清单重点/建议两级复核分级。"""
+
+    def test_review_tiered_sections(self):
+        from desensitize import build_review_text, scan_remaining_risk
+        d = Desensitizer()
+        r = d.mask('原告王强与被告杭州恒达建设集团有限公司纠纷，'
+                   '身份证号110101198001011232，浙江省杭州市余杭区人民法院已受理。')
+        remaining = scan_remaining_risk(r.text)
+        review = build_review_text(r.text, r.stats, remaining)
+        self.assertIn('重点复核', review)
+        self.assertIn('建议复核', review)
+        self.assertIn('复核分级只用于安排检查顺序', review)
+
+    def test_review_critical_remaining_listed(self):
+        from desensitize import build_review_text
+        d = Desensitizer()
+        r = d.mask('原告陈建国，身份证号110101198001011232。')
+        # 模拟规则层未覆盖的关键信息残留（如 OCR 变体手机号）
+        remaining = [{'type': '手机号', 'value': '13912345678',
+                      'context': '…13912345678…'}]
+        review = build_review_text(r.text, r.stats, remaining)
+        self.assertIn('❌', review)
+        self.assertIn('重点复核', review)
+        self.assertIn('13912345678', review)
+
+
 if __name__ == '__main__':
     unittest.main()

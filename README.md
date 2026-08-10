@@ -40,6 +40,8 @@
 > **v3.10 新特性**：扫描件 PDF → 涂黑 PDF（`mask --image-redact` 支持 PDF 输入）— 每页渲染后逐页涂黑，保留每页版式，输出多页 PDF；电子版 PDF 用 `--pdf-redact`（字符级涂黑），扫描件 PDF 用 `--image-redact`（原图涂黑），自动分流
 >
 > **v4.0 新特性**：批量模式 `mask --batch <文件夹>` — 递归处理整个卷宗文件夹、断点续跑（`--resume`）、批量处理报告（逐文件结果/原件校验/需人工复核/数据流审计）、审阅清单"重点复核/建议复核"分级、`--clean-temp` 中途记录清理（OCR 缓存/临时渲染/断点文件）
+>
+> **v4.1 新特性**：内置 `format-converter` 格式转换核心（`format-converter/` 目录）— docx/pdf/html/csv/图片 → 脱敏可用格式（txt/md/json），纯 JS 无外部引擎，扩充脱敏输入链路（详见下文 [格式转换 format-converter](#格式转换-format-converter)）
 
 ## 快速体验（30 秒）
 
@@ -59,6 +61,35 @@ printf '原告：陈建国，男，身份证号110101198001011232，手机138001
 |---------|---------|
 | 身份证号、手机号、银行卡号、案号等 **结构化数据** | 规则引擎（正则匹配，本地运行） |
 | 人名、公司名、地址、金额等 **非结构化信息** | LLM 语义识别（AI 处理） |
+
+## 格式转换 format-converter
+
+`format-converter/` 目录内置一个**法律文书格式转换核心**（纯 JS、无外部引擎依赖），
+把脱敏输入链路里常见但脱敏工具不直接吃的格式，先转换成 txt/md/json 再进脱敏流程。
+
+| 类别 | 输入 → 输出 | 引擎 |
+|---|---|---|
+| 文档 | docx → txt / md / html（律师文书、合同） | mammoth |
+| PDF | pdf → txt（判决书/裁判文书，需带文本层） | pdfjs-dist |
+| 文本 | txt / md / html / json / csv 任意互转 | turndown / marked / csv-parse |
+| 图片 | png / jpg / webp / gif / avif / tiff 互转，单图 → pdf（扫描件） | sharp |
+
+来源：从 [FlyingMouse Format](https://github.com/LaoFeng-mouse/flyingmouse-format)
+（MIT）抽取，**只保留对脱敏有帮助的部分**；音视频/NCM/ZIP/Office 全格式等与脱敏
+无关或需外部引擎的能力已刻意排除。完整说明见 `format-converter/README.md`。
+
+```bash
+cd format-converter && npm install        # 首次使用前安装依赖（node >= 22.13）
+
+node cli.js 合同.docx txt -o 合同.txt      # docx → 纯文本（人名/金额/案号提取）
+node cli.js 判决书.pdf txt -o 判决书.txt    # pdf → 纯文本（仅带文本层的电子版）
+node cli.js 裁判文书.html md               # 网上复制的裁判文书 → Markdown
+node cli.js 当事人.csv json                # 名单 → JSON
+node cli.js 扫描件.png pdf -o 扫描件.pdf    # 图片 → PDF
+```
+
+> ⚠️ 扫描件/图片型 PDF 无文本层，pdf→txt 会明确报错并提示先走脱敏工具的
+> OCR 通道（`--ocr`），不会静默产出空文件。自测：`node test-cli.js`（16 项端到端）。
 
 ## 快速开始
 

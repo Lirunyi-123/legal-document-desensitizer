@@ -273,6 +273,7 @@ let cachedPdfjs = null;
 async function loadPdfjs() {
   if (cachedPdfjs) return cachedPdfjs;
   const packageRoot = path.dirname(require.resolve("pdfjs-dist/package.json"));
+  const workerSrc = pathToFileURL(path.join(packageRoot, "legacy", "build", "pdf.worker.mjs")).href;
   const spec = pathToFileURL(path.join(packageRoot, "legacy", "build", "pdf.mjs")).href;
   let mod;
   try {
@@ -280,7 +281,10 @@ async function loadPdfjs() {
   } catch {
     mod = await import(pathToFileURL(path.join(packageRoot, "legacy", "build", "pdf.js")).href);
   }
-  cachedPdfjs = mod.default || mod;
+  const lib = mod.default || mod;
+  lib.GlobalWorkerOptions = lib.GlobalWorkerOptions || {};
+  lib.GlobalWorkerOptions.workerSrc = workerSrc;
+  cachedPdfjs = lib;
   return cachedPdfjs;
 }
 
@@ -305,7 +309,11 @@ async function convertPdfToText(inputPath, outputPath) {
   } finally {
     await loadingTask.destroy().catch(() => {});
   }
-  await fsp.writeFile(outputPath, `${pageTexts.join("\n\n")}\n`, "utf8");
+  const allText = pageTexts.filter(Boolean).join("\n\n");
+  if (!allText.trim()) {
+    throw new Error("PDF 未提取到任何文本：该文件可能是扫描件/图片型 PDF（无文本层），请先走脱敏工具的 OCR 通道处理。");
+  }
+  await fsp.writeFile(outputPath, `${allText}\n`, "utf8");
   return { category: "pdf", source: "pdf", target: "txt", pages: pdf.numPages };
 }
 

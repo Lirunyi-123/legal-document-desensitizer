@@ -64,7 +64,7 @@ npm install
 ```
 
 依赖：`csv-parse`、`marked`、`turndown`、`sharp`、`mammoth`、`pdfjs-dist`
-（需要 node >= 18）。
+（需要 node >= 22.13，pdfjs-dist 6.x 与 sharp 0.35 的最低要求）。
 
 ## 用法
 

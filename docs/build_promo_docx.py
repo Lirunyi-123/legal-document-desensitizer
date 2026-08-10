@@ -368,7 +368,9 @@ def main():
               '微信聊天记录、邮件等沟通证据的提交前脱敏',
               '尽调材料、证据册的涉密信息筛查',
               '文书上传云端 AI 前的预处理（结构化号码本地先替换）',
-              '律所内部归档 / 协作时的隐私合规']:
+              '律所内部归档 / 协作时的隐私合规',
+              '格式预处理：docx / pdf / html / csv / 扫描件图片先经内置 format-converter '
+              '转成 txt / md / json 再脱敏（判决书 PDF、网上复制的裁判文书、当事人名单等）']:
         list_item(doc, bullet_id, s)
 
     # ---------- 核心亮点 ----------
@@ -409,6 +411,13 @@ def main():
          'macOS Vision 带坐标 OCR 定位敏感值 → 原图对应区域涂黑 → 输出 PDF，'
          '双层 residual 校验（像素级确认涂黑 + OCR 复查）。实测真实建行流水截图'
          '76 处涂黑、覆盖页面 25.4%，关键敏感区像素全黑确认。'),
+        ('内置格式转换 format-converter（v4.1）',
+         '纯 JS 无外部引擎：docx（mammoth）/ pdf（pdfjs-dist）/ 文本互转（turndown、'
+         'marked、csv-parse）/ 图片（sharp）全部本地处理，npm install 即可用。'
+         '扩充脱敏输入链路：判决书 PDF → txt、网上复制的裁判文书 HTML → md、律师文书 '
+         'docx → txt、当事人名单 csv → json、扫描件图片 → pdf。扫描件/图片型 PDF 无文本层'
+         '时明确报错并指引走 OCR 通道，不静默产出空文件；刻意排除与脱敏无关的转换'
+         '（音视频 / NCM / ZIP / Office 全格式），保持轻量。来源 FlyingMouse Format（MIT）。'),
     ]
     for lead, body in highlights:
         list_item(doc, dec_id, body, bold_lead=lead + '：')
@@ -420,9 +429,16 @@ def main():
         'git clone https://github.com/Lirunyi-123/legal-document-desensitizer',
         'cd legal-document-desensitizer',
         'pip3 install -r requirements.txt   # jieba 必装；docx/pdf/加密为可选',
+        'cd format-converter && npm install && cd ..   # 格式转换核心（可选，需 node >= 22.13）',
     ])
     add_heading(doc, '常用命令', 2)
     code_block(doc, [
+        '# 格式预处理（format-converter，可选）：docx/pdf/html/csv/图片 → txt/md/json',
+        'node format-converter/cli.js 判决书.pdf txt -o 判决书.txt',
+        'node format-converter/cli.js 合同.docx txt -o 合同.txt',
+        'node format-converter/cli.js 裁判文书.html md',
+        'node format-converter/cli.js 当事人.csv json',
+        '',
         'python3 desensitize.py scan -f 判决书.docx                  # 扫描敏感信息',
         'python3 desensitize.py mask -f 判决书.docx                  # 规则层脱敏（零模型）',
         'python3 desensitize.py mask -f 判决书.docx --review         # 阶段一：脱敏+审阅清单',
@@ -466,6 +482,9 @@ def main():
               '裸人名是启发式：罕见姓氏、单次出现的数字三字名、网络昵称存在漏判或过度脱敏。',
               'jieba 是必装依赖：缺失时裸人名发现自动关闭。',
               '格式保真有限：docx 保留段落结构；PDF 输出为纯文本。',
+              'format-converter 只做文本层提取：docx→txt/md 依赖 mammoth（不解析复杂宏/嵌入对象），'
+              'pdf→txt 仅限带文本层的电子版文书；扫描件 PDF 需先走 OCR 通道（macOS Vision 内置 / '
+              'Windows/Linux 外部 OCR），图片型材料转 PDF 后脱敏效果取决于 OCR 识别率。',
               '仅面向中文法律文书，英文及其他语种实体规则未覆盖。',
               'full 命令依赖模型执行力：不同模型效果有差异，须用 evaluate.py --llm-api 实测。']:
         list_item(doc, limit_id, s)
@@ -500,6 +519,10 @@ def main():
                             '59 项回归测试 + 60 个红队用例'],
                    ['v2.6', '两阶段工作流：规则层关键信息必清 → --review 审阅清单 → '
                             'Agent 语义层直接执行（无需外部 API）'],
+                   ['v4.1', '内置 format-converter 格式转换核心：docx / pdf / html / csv / 图片 '
+                            '→ txt / md / json，纯 JS 无外部引擎（mammoth / pdfjs-dist / '
+                            'turndown / marked / csv-parse / sharp），扩充脱敏输入链路；'
+                            '来源 FlyingMouse Format（MIT）'],
                ],
                [1.15, 5.35])
 

@@ -5,6 +5,11 @@ runAs: subagent
 allowed-tools: read_file, write_file, grep, ls, glob
 ---
 
+> **本地副本同步规则**：本文件由项目
+> `/Users/lirunyi/Downloads/法律文书脱敏工具/legal-document-desensitizer/SKILL.md`
+> 全量同步而来。常规升级只推送到 GitHub（`git-push-api.py --sync-local`），
+> **不**主动更新本本地副本；仅在用户明确指示"更新本地 skill"时，才重新全量同步。
+
 # 法律文书脱敏工具 (Legal Document Desensitization)
 
 ## v3.11 实战修复（2026-08-11 archive3 批量，34 份真实/合成文书）

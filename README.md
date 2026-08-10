@@ -1,49 +1,23 @@
-# 法律文书脱敏工具 (Legal Document Desensitizer)
+# 法律文书脱敏工具（Legal Document Desensitizer）
 
-规则引擎 + EntityResolver 实体归一化 + 本地 NER + LLM 混合脱敏工具，专为中国法律文书设计。
+面向中国法律实务的**本地优先**文书脱敏工具：判决书、合同、聊天记录、证据材料中的
+敏感信息 → 语义占位符（`[当事人甲（原告）]`、`[身份证号]`），加密映射表 +
+一键无损还原。
 
-> 🧑‍⚖️ **面向中国律师与法律实务的本地优先文书脱敏工具**
-> 判决书 / 合同 / 聊天记录 / 证据材料中的敏感信息 → 语义占位符（[当事人甲（原告）]、[身份证号]），
-> 加密映射表 + 一键无损还原，红队评测量化可信度。
->
-> - 20+ 类中国法律实体（含 GB 11643 / GB 32100 校验码），规则层零模型零联网
-> - 全文实体一致：同一人全篇同一个占位符
-> - AES-256-GCM 加密映射表，`restore` 逐字节还原
-> - 77 个红队用例（v2.8 含 12 条训练语料回归）：结构化期望召回率 100%，保留项误报 0
-> - LLM 层可选（本地 Ollama 或云端 API），失败安全拒绝坏输出
->
-> 📖 详细简介见 [docs/简介.md](docs/简介.md)
+> 规则引擎 + 实体归一化 + 可选本地 NER / LLM，**离线可跑、全文实体一致、可审计还原**。
 
-> **v2.2 新特性**：GB 11643/GB 32100 校验码 | 一键还原 restore | 红队评测 evaluate | 本地 NER 接入
-> **v2.3 新特性**：full 完整脱敏流水线（规则层+本地LLM）| LLM 补充映射合并还原 | evaluate --llm 评测
-> **v2.4 新特性**：裸人名 + 无层级地址进规则层 | 全文实体一致 | jieba 分词过滤
->
-> **v2.5 新特性**：还原精确配对（387/387 段无损还原） | 角色词后名词门控 | OCR 空格兼容 | 金额增强
->
-> **v2.6 新特性**：两阶段工作流（规则层关键信息必清 → `mask --review` 审阅清单 → Agent 语义层，无需外部 API）
-> **v2.1 新特性**：EntityResolver 实体归一化 | SecureDesensitizer 内存安全模式 | 零信任 AES-256-GCM 加密映射表 | 文件名自动脱敏
->
-> **v3.3 新特性**：Excel（.xlsx / .xlsm）支持 — 单元格级脱敏（银行流水、证据清单、对账单），保留工作表/样式/合并/公式，restore 逐单元格还原（金额恢复数值类型）
->
-> **v3.4 新特性**：支付平台前缀交易对手（"支付宝-刘方立"→"支付宝-[当事人_1]"）| 扫描件 PDF 明确报错+OCR 指引（不再静默产出空文件）| PDF 输入自动命名 .txt（不再产生假 .pdf）
->
-> **v3.5 新特性**：银行流水场景升级（借鉴第三方框架）— 账号/户名组合（"6212261001014270893/胡若薇"→"[银行账号]/[当事人_1]"）| 支付宝掩码账号（"7399/支***刘方立"）| 银行分支机构名（分行/支行/本级/本币/头寸/机构）| 交易日期不再被金额规则误标
->
-> **v3.6 新特性**：列感知脱敏（`mask --table-aware`）— 自动识别银行流水表头列名（对方账号与户名/交易日期/交易金额等），按列类型脱敏：户名列孤立姓名也识别（解决单次出现姓名漏掉）、日期列不脱敏、附言列联行号不误标 | 审计清单新增孤立姓名残留 WARN | 支持 .xlsx 与带文本层的 .pdf
->
-> **v3.7 新特性**：扫描件 PDF 内置 OCR（macOS Vision 框架，无需安装任何工具）— 无文本层时自动识别再脱敏，Windows/Linux 才需外部 OCR | `ocr_vision.swift` 随工具分发
->
-> **v3.8 新特性**：图片输入支持（.png/.jpg 银行流水截图 → macOS Vision OCR 直接脱敏）| 支付宝外部商户-人名（商户为个人时识别为当事人）| 公司名含地域括号（飒拉商业（上海）有限公司）不再误切 | 占位符后姓名不再被"银行"误判机构 | 姓名含"在"字（张在芳）不再误伤
->
-> **v3.9 新特性**：原图涂黑脱敏（`mask --image-redact`）— 图片输入直接在**原图上涂黑**敏感区域，保留原图版式，输出 PDF（Vision 带坐标 OCR 定位 + residual 零残留校验）
->
-> **v3.10 新特性**：扫描件 PDF → 涂黑 PDF（`mask --image-redact` 支持 PDF 输入）— 每页渲染后逐页涂黑，保留每页版式，输出多页 PDF；电子版 PDF 用 `--pdf-redact`（字符级涂黑），扫描件 PDF 用 `--image-redact`（原图涂黑），自动分流
->
-> **v4.0 新特性**：批量模式 `mask --batch <文件夹>` — 递归处理整个卷宗文件夹、断点续跑（`--resume`）、批量处理报告（逐文件结果/原件校验/需人工复核/数据流审计）、审阅清单"重点复核/建议复核"分级、`--clean-temp` 中途记录清理（OCR 缓存/临时渲染/断点文件）
->
-> **v4.1 新特性**：内置 `format-converter` 格式转换核心（`format-converter/` 目录）— docx/pdf/html/csv/图片 → 脱敏可用格式（txt/md/json），纯 JS 无外部引擎，扩充脱敏输入链路（详见下文 [格式转换 format-converter](#格式转换-format-converter)）
+## 核心亮点
 
-## 快速体验（30 秒）
+- **20+ 类中国法律实体**：身份证（GB 11643 校验码）、信用代码（GB 32100）、银行卡（Luhn）、
+  案号、手机号、微信号、车牌、证件号、金额、人名、公司名、地址等
+- **语义占位符**：同一人物全篇统一编号，律师可直接阅读，语义关系不丢
+- **加密映射 + 无损还原**：AES-256-GCM 映射表，`restore` 一键逐字节还原原文
+- **真·涂黑 PDF**：电子版字符级涂黑、扫描件原图涂黑，residual 零残留校验
+- **银行流水专项**：列感知模式自动识别表头（户名/账号/日期/金额），孤立姓名也能识别
+- **批量卷宗**：`--batch` 递归处理整个文件夹，断点续跑 + 处理报告
+- **红队可量化**：77 个红队用例 100% 召回、0 误报；还原往返逐字节一致
+
+## 30 秒体验
 
 ```bash
 printf '原告：陈建国，男，身份证号110101198001011232，手机13800138000，尾款80万元。\n' \
@@ -51,384 +25,93 @@ printf '原告：陈建国，男，身份证号110101198001011232，手机138001
 # → 原告：[当事人甲（原告）]，男，身份证号[身份证号]，手机[手机号]，尾款[金额]。
 ```
 
-一键自检：`python3 selfcheck.py`（文件/测试/评测/还原四项比对，PASS 即拷贝无误）
-
-## 功能
-
-一键脱敏法律文书中的敏感信息，支持 **.txt / .docx / .pdf / .xlsx** 四种格式：
-
-| 数据类型 | 处理方式 |
-|---------|---------|
-| 身份证号、手机号、银行卡号、案号等 **结构化数据** | 规则引擎（正则匹配，本地运行） |
-| 人名、公司名、地址、金额等 **非结构化信息** | LLM 语义识别（AI 处理） |
-
-## 格式转换 format-converter
-
-`format-converter/` 目录内置一个**法律文书格式转换核心**（纯 JS、无外部引擎依赖），
-把脱敏输入链路里常见但脱敏工具不直接吃的格式，先转换成 txt/md/json 再进脱敏流程。
-
-| 类别 | 输入 → 输出 | 引擎 |
-|---|---|---|
-| 文档 | docx → txt / md / html（律师文书、合同） | mammoth |
-| PDF | pdf → txt（判决书/裁判文书，需带文本层） | pdfjs-dist |
-| 文本 | txt / md / html / json / csv 任意互转 | turndown / marked / csv-parse |
-| 图片 | png / jpg / webp / gif / avif / tiff 互转，单图 → pdf（扫描件） | sharp |
-
-来源：从 [FlyingMouse Format](https://github.com/LaoFeng-mouse/flyingmouse-format)
-（MIT）抽取，**只保留对脱敏有帮助的部分**；音视频/NCM/ZIP/Office 全格式等与脱敏
-无关或需外部引擎的能力已刻意排除。完整说明见 `format-converter/README.md`。
-
-```bash
-cd format-converter && npm install        # 首次使用前安装依赖（node >= 22.13）
-
-node cli.js 合同.docx txt -o 合同.txt      # docx → 纯文本（人名/金额/案号提取）
-node cli.js 判决书.pdf txt -o 判决书.txt    # pdf → 纯文本（仅带文本层的电子版）
-node cli.js 裁判文书.html md               # 网上复制的裁判文书 → Markdown
-node cli.js 当事人.csv json                # 名单 → JSON
-node cli.js 扫描件.png pdf -o 扫描件.pdf    # 图片 → PDF
-```
-
-> ⚠️ 扫描件/图片型 PDF 无文本层，pdf→txt 会明确报错并提示先走脱敏工具的
-> OCR 通道（`--ocr`），不会静默产出空文件。自测：`node test-cli.js`（16 项端到端）。
-
-### ⚠️ 先转换还是直接脱敏？（使用前必读）
-
-format-converter 是**单向提取器**：转换后丢失版式（docx 样式/表格、pdf 排版），
-**不支持转回 docx/pdf**，`restore` 只还原内容、不还原格式。请按需求选择：
-
-| 你的需求 | 怎么做 | 结果 |
-|---|---|---|
-| 最终要 **docx/pdf 原格式**（归档/庭审/提交） | **不要先转换**，直接 `python3 desensitize.py mask -f 合同.docx` 或 `mask -f 判决书.pdf --pdf-redact` | 脱敏后仍是 docx/pdf，可 `restore` 逐字还原 |
-| 只需**提取文本**（核对/摘录/喂 LLM/批量筛查） | 先 `node cli.js 判决书.pdf txt` 再脱敏 | txt/md/json 即最终形态 |
-| 输入是 **html/csv/heic 等**脱敏工具不直接支持的格式 | 必须先用 format-converter 转 txt/md/json | 转出的文本就是最终形态 |
-| **扫描件/图片型 PDF** | pdf→txt 会报错；走脱敏工具 OCR 通道 | 见下方快速开始 |
-
-**一句话**：要"转回原格式"就别转，直接脱敏；format-converter 只用于内容提取。
+自检：`python3 selfcheck.py`（文件 / 测试 / 评测 / 还原四项比对）
 
 ## 快速开始
 
 ```bash
-# 安装依赖
-pip install -r requirements.txt   # jieba 必装；docx/pdf/xlsx/加密为可选
+pip install -r requirements.txt        # jieba 必装；docx/pdf/xlsx/加密为可选
 
-# 脱敏文件
-python desensitize.py mask -f 合同.docx
-python desensitize.py mask -f 证据.pdf
-python desensitize.py mask -f 文档.txt
-python desensitize.py mask -f 银行流水.xlsx
+# 单文件脱敏（txt / docx / pdf / xlsx / 图片）
+python3 desensitize.py mask -f 合同.docx
+python3 desensitize.py mask -f 判决书.pdf --pdf-redact -o 脱敏.pdf   # 真·涂黑 PDF
+python3 desensitize.py mask -f 银行流水.xlsx --table-aware --review   # 银行流水列感知
 
-# v3.6 列感知模式（银行流水表格，自动识别表头列名）
-python desensitize.py mask -f 银行流水.xlsx --table-aware --review
+# 批量卷宗（断点续跑）
+python3 desensitize.py mask --batch ./卷宗 --review --resume
 
-# v4.0 批量脱敏整个卷宗文件夹（递归 .txt/.docx/.pdf/.xlsx/图片）
-python desensitize.py mask --batch ./卷宗 --review
-# 断点续跑（跳过已完成文件）
-python desensitize.py mask --batch ./卷宗 --review --resume
-# 输出集中到独立目录，结束清理 OCR 中途记录
-python desensitize.py mask --batch ./卷宗 --review \
-  --output-dir ./脱敏输出 --clean-temp
-
-# 从管道输入
-cat 文档.txt | python desensitize.py mask
-
-# 仅扫描敏感信息
-python desensitize.py scan -f 文档.docx
-
-# 生成 LLM 脱敏提示词
-python desensitize.py llm-prompt -f 文档.docx
-
-# v2.1 内存安全模式
-python desensitize.py mask -f 合同.docx --secure
-
-# v2.1 零信任加密映射表（密码不输出到终端）
-export DESENSITIZER_MAPPING_PASSWORD="your-password"
-python desensitize.py mask -f 合同.docx --save-mapping 映射表.enc --encrypt-mapping
-
-# v2.1 解密映射表
-python desensitize.py decrypt -f 映射表.enc -p "your-password"
-
-# v2.2 一键还原（庭审、归档需要原文时）
-python desensitize.py restore -f 脱敏后.docx -m 映射表.enc -p "your-password" -o 还原.docx
-python desensitize.py restore -f 脱敏后.xlsx -m 映射表.md -o 还原.xlsx
-
-# v2.2 红队评测（77 个用例，entity-level per-tag P/R/F1 + support）
-python3 evaluate.py --report 评测报告.md
-
-# v3.0 合成语料管线（LLM 写模板 + 代码注入合法校验值，自动填期望）
-python3 synthetic/generate_synthetic_pii.py -n 300        # → 测试/合成语料.jsonl
-python3 evaluate.py -c 测试/合成语料.jsonl                # 合成语料基线（数百条）
-
-# v3.0 PDF 真·涂黑脱敏（保留版式；residual 零残留校验）
-python desensitize.py mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.pdf
-
-# v2.2 本地 NER 层（可选：spaCy / HuggingFace / 本地 Ollama）
-python desensitize.py mask -f 合同.docx --ner-backend spacy --ner-model zh_core_web_trf
-python desensitize.py mask -f 合同.docx --ner-backend llm --ner-model qwen2.5
-
-# v2.3 完整脱敏流水线（规则层 + 本地 LLM 二轮脱敏，覆盖裸人名/无结构地址/案情细节）
-python desensitize.py full -f 判决书.docx --llm-api ollama --llm-model qwen2.5 \
+# 加密映射表 + 一键还原
+python3 desensitize.py mask -f 起诉状.docx \
   --save-mapping 映射表.enc --encrypt-mapping
+python3 desensitize.py restore -f 起诉状_desensitized.docx \
+  -m 映射表.enc -o 还原.docx
 
-# v2.3 LLM 评测模式（把 LLM 层覆盖项计入召回率）
-python3 evaluate.py --llm-api ollama --llm-model qwen2.5 --report 评测报告.md
-
-# JSON 格式输出
-python desensitize.py mask --json -f 文档.docx
-
-# 所有“年月日”日期也脱敏（默认只处理出生日期）
-python desensitize.py mask -f 聊天记录.txt --all-dates
+# 扫描件/图片：macOS 内置 Vision OCR 自动识别（Windows/Linux 需先外部 OCR）
+python3 desensitize.py mask -f 扫描件.pdf -o 涂黑.pdf
 ```
 
-## 脱敏覆盖范围
+完整命令见 `python3 desensitize.py --help`；两阶段工作流（规则层 → 审阅清单 →
+语义层）说明见 [docs/简介.md](docs/简介.md)。
 
-### 规则层（18类）+ EntityResolver 实体归一化
-身份证号、手机号、固定电话、服务电话（400/800）、邮箱、微信号、QQ号、银行卡号、统一社会信用代码、组织机构代码、案号、律师执业证号、车牌号、出生日期、金额、人名、公司名、地址、护照/港澳通行证/驾驶证等其他证件
+## 架构：规则层 → NER → LLM
 
-### 本地 NER 层（可选，3 种后端）
-spaCy（zh_core_web_trf）| HuggingFace（bert 系中文 NER）| 本地 Ollama（qwen2.5 等）——识别规则层覆盖不到的人名、公司名、地址、法院
-
-### LLM层（5类）
-自然人姓名、公司/机构名称、地址信息、金额、敏感案情细节（通过 `llm-prompt` 生成提示词）
-
-## v3.0 内化 rizzo-pii 五大优点（2026-08）
-
-参照开源项目 [Rizzo-AI-Academy/rizzo-pii](https://github.com/Rizzo-AI-Academy/rizzo-pii.git)
-（LLM 写模板 + 代码注入校验值的合成语料管线），五个优点全部内化：
-
-1. **合成语料管线 `synthetic/`**：LLM（OpenAI 兼容，本地/云端）写中文法律文书模板，
-   只允许白名单占位符 `{当事人甲}` `{身份证}`…；`generate_synthetic_pii.py` 用代码
-   注入数学上合法的号码（身份证 GB 11643、信用代码 GB 32100、银行卡 Luhn），
-   自动填 `expect_masked/expect_kept` 输出红队语料（`--bio` 可输出 BIO 训练语料）。
-   QA 门控 `find_stray_names` 丢弃占位符外夹带姓名的模板。
-2. **校验码 strict/lenient 双档 + validated 标记**：映射表新增"验证"列
-   `✓`（校验码通过）/`—`（仅格式命中），律师一眼看出哪条是算法验证过的。
-3. **PDF 真·涂黑脱敏 `pdf_redact.py`**：`mask -f x.pdf --pdf-redact -o x_redacted.pdf`，
-   字符级匹配 + OCR 空格容忍 + 值长优先防误涂；清元数据/批注/表单/书签/附件；
-   residual 零残留校验，零命中（扫描件）拒绝交付。
-4. **还原容忍 markdown 漂移**：AI 把 `[当事人甲（原告）]` 改成 `**当事人甲（原告）**`、
-   丢括号、加空格，restore 都能无损还原（精确/漂移混用按原文顺序配对）。
-5. **评测口径升级**：entity-level per-tag **P/R/F1 + support**（MICRO/MACRO），
-   `expect_kept` 作负样本计 FP。
-
-基线：94 个单测全过；红队 77 条 100% 召回误报 0；合成语料 300 条召回 99.76%、
-precision 1.0；三份真实训练语料还原往返逐字节一致。详见 `SKILL.md` v3.0 章节与
-`docs/版本说明.txt`。
-
-## v2.3 完整脱敏流水线 full
-
-一条命令跑完"规则层 + LLM 层"，把短板（裸人名、无结构地址、案情敏感细节）补上：
-
-```bash
-# Ollama（默认）
-python desensitize.py full -f 判决书.docx --llm-model qwen2.5 \
-  --save-mapping 映射表.enc --encrypt-mapping
-
-# OpenAI 兼容本地服务（LM Studio / vLLM）
-python desensitize.py full -f 判决书.docx --llm-api openai \
-  --llm-endpoint http://localhost:1234 --llm-model local-model
+```
+规则引擎（本地） → 身份证号等结构化数据替换为占位符 → LLM 只看到 [身份证号]
 ```
 
-执行流程：
-1. **规则层**先把身份证/手机号等结构化数据替换为占位符
-2. **LLM 层**只看到脱敏后的文本，识别并替换剩余敏感信息（裸人名、无省市区层级的地址、案情隐私细节、遗漏金额），输出"脱敏后全文 + 补充映射表"
-3. **失败安全**：LLM 输出若增删行、改动已有占位符、声称替换的值仍残留原文，一律拒绝采用并中止，不产出未经验证的"完整脱敏"文档
-4. **合并映射**：规则层与 LLM 层映射按原文位置统一排序，`restore` 一条命令无损还原
+| 层级 | 职责 | 运行方式 |
+|------|------|---------|
+| **规则层** | 身份证、银行卡、案号、金额等结构化数据 | 本地正则，零模型零联网 |
+| **实体归一化** | 人名/公司全文一致、简称链接全称 | 本地 |
+| **本地 NER（可选）** | 规则层覆盖不到的人名/公司/地址 | spaCy / HuggingFace / Ollama |
+| **LLM 层（可选）** | 案情敏感细节、裸公司简称 | 本地 Ollama 或云端 API，失败安全 |
 
-**数据安全**：默认仅连接本机 Ollama（localhost），规则层之后才发送文本。务必确认 endpoint 是本地或可信服务。
+结构化号码在本地即被替换，AI/云端始终接触不到真实号码。
 
-## 不部署本地模型：云端 API 方案（二选一即可）
+## 能力速览
 
-**不想装 Ollama、不想下载模型？用云端 API 一样能跑 full。** 机器上什么都不用装，
-只要有一个 API Key：
-
-```bash
-# 通义千问（阿里云百炼，新用户有免费额度）
-export LLM_API_KEY="你的通义APIKey"
-python3 desensitize.py full -f 判决书.docx --llm-api openai \
-  --llm-model qwen-plus --llm-endpoint https://dashscope.aliyuncs.com/compatible-mode
-
-# DeepSeek
-export LLM_API_KEY="你的DeepSeekAPIKey"
-python3 desensitize.py full -f 判决书.docx --llm-api openai \
-  --llm-model deepseek-chat --llm-endpoint https://api.deepseek.com
-
-# 智谱 GLM
-export LLM_API_KEY="你的智谱APIKey"
-python3 desensitize.py full -f 判决书.docx --llm-api openai \
-  --llm-model glm-4-plus --llm-endpoint https://open.bigmodel.cn/api/paas/v4
-```
-
-也可用 `--llm-api-key "xxx"` 直接传 Key（会留在 shell 历史里，建议用环境变量）。
-
-### 云端方案的安全边界（必须知道）
-
-- 规则层先把身份证号、手机号、银行卡号等**结构化数据替换成占位符**，
-  所以发送给云端的文本里没有这些号码
-- 但**人名、地址、案情细节会发送给 API 服务商**——这取决于你对"数据出境/交给第三方"的接受度
-- 涉密程度高的材料，请优先本地 Ollama 方案；可接受第三方处理时，云端方案零部署、开箱即用
-- 评测照常可用：`python3 evaluate.py --llm-api openai --llm-model qwen-plus --llm-endpoint https://dashscope.aliyuncs.com/compatible-mode`
-
-### 两个方案怎么选
-
-| 方案 | 部署成本 | 数据去向 | 适用 |
-|------|---------|---------|------|
-| 本地 Ollama | 下载 4~5GB 模型，需 8GB+ 内存 | 不出本机 | 涉密材料、高隐私要求 |
-| 云端 API | 零部署，注册拿 Key | 发送给服务商（已先脱敏结构化数据） | 无本地硬件、接受第三方处理 |
-
-## v2.4 规则层增强：裸人名 + 无层级地址
-
-**裸人名**（无需角色词）：姓氏 + 分词 + 频率/上下文启发式。
-依赖中文分词库 jieba（`pip3 install jieba`）过滤"江省杭""付逾期"这类
-嵌在长词里的假候选；每个姓氏位置只取最长合法候选（尾部吞动词、第二位
-是数字的候选判非法），常见词（陈述/金额/范围）、公司/职务名
-（张律师/华信置业/鼎盛集团）均有黑名单。
-
-**全文一致**：角色词先识别的人名（如"原告：陈建国"）会自动传播到全文
-裸出现处（"陈建国再次到庭"），同一人全篇同一个占位符；全新发现的裸人名
-也通过 EntityResolver 保证一致，`restore` 无损还原。
-
-**无层级地址**：新增两类模式——小区/花园/公寓/大厦/苑/村/镇/区 +
-栋/单元/室/楼/号（"望京西园四区410楼"），以及路/街/大道 + 门牌号
-（"莫干山路100号"）。
-
-```bash
-# 关闭裸人名启发式（只保留角色词人名 + 传播）
-python3 desensitize.py mask -f 文件.docx --no-bare-names
-```
-
-实测（5 份真实法律文书压力测试集）：人名识别零误报、全文一致；
-语料库结构化期望从 42 项提升到 50 项（新增裸人名、无层级地址、一致性用例）。
-LLM 层现在只负责两类：**案情敏感细节** 与 **裸公司简称**。
-
-### evaluate --llm 评测模式
-
-```bash
-python3 evaluate.py --llm-api ollama --llm-model qwen2.5
-```
-
-语料库中的 `llm_only` 条目（裸人名/无结构地址/案情细节）在 LLM 模式下成为硬性期望并计入召回率；
-不传 `--llm-*` 时保持仅规则层评测，如实标注"LLM 层待覆盖项"。
-
-## v2.2 新增能力
-
-### 校验码验证（准确性）
-- **身份证**：GB 11643-1999 第 18 位校验码，`scan` 输出置信度（校验码合法=1.0，仅出生日期合法=0.6）
-- **统一社会信用代码**：GB 32100-2015 校验码（`91350100M000100Y43` 为官方示例通过码）
-- **银行卡**：Luhn 算法，`scan` 标注置信度
-
-### 一键还原 restore
-用映射表（Markdown / JSON / AES-256-GCM 加密 .enc）把脱敏文本无损还原为原文：
-
-```bash
-python desensitize.py mask -f 起诉状.docx --save-mapping 映射表.enc --encrypt-mapping
-python desensitize.py restore -f 起诉状_desensitized.docx -m 映射表.enc -o 还原.docx
-```
-
-映射表自动记录"首次出现顺序"，多个同类型占位符（如多个 `[金额]`）按原文顺序逐一配对，
-往返还原与原文逐字节一致（含"1980年1月1日出生"这类上下文、无分隔符人名等边界）。
-
-### 红队评测 evaluate
-`测试/红队语料库.jsonl` 内置 77 个用例（19 类结构化数据 + 负样本），量化规则层表现；
-v3.0 起 `python3 synthetic/generate_synthetic_pii.py -n 300` 可生成数百条
-`测试/合成语料.jsonl`（身份证/信用代码/银行卡等号码构造上合法，期望自动标注）：
-
-```bash
-python3 evaluate.py                          # 控制台报告
-python3 evaluate.py -c 测试/合成语料.jsonl    # 合成语料基线
-python3 evaluate.py --report 评测报告.md      # Markdown 报告
-python3 evaluate.py --json 结果.json          # JSON 结果
-```
-
-当前基线（v3.0）：红队 **77/77 用例通过，100% 召回，误报 0，泄露 0**；
-合成语料 300 条**召回 99.76%、precision 1.0、误报 0**。
-评测口径为 entity-level per-tag **precision / recall / F1 + support**（外加 MICRO/MACRO），
-`expect_kept` 作负样本计 FP——规则层最怕误伤，precision/F1 才是"改保守了还是改漏了"
-的量化指标。语料库可自行增删用例，作为脱敏质量回归基线。
-
-### 本地 NER 接入
-```bash
-# spaCy（中文模型）
-python desensitize.py mask -f 合同.docx --ner-backend spacy --ner-model zh_core_web_trf
-
-# HuggingFace（中文 NER 模型）
-python desensitize.py mask -f 合同.docx --ner-backend huggingface --ner-model ckiplab/bert-base-chinese-ner
-
-# 本地 Ollama（数据不出本机）
-python desensitize.py mask -f 合同.docx --ner-backend llm --ner-model qwen2.5
-```
-
-规则层先把身份证/手机号等替换为占位符，**本地模型看到的已经是脱敏后的文本**；
-后端缺失时给出安装指引并优雅退出，不影响纯规则层使用。
+| 能力 | 说明 |
+|------|------|
+| 两阶段工作流 | `mask --review` 生成审阅清单，确认后再做语义层，无需外部 API |
+| 真·涂黑 PDF | 电子版 `--pdf-redact`，扫描件 `--image-redact`，保留版式、清元数据 |
+| 扫描件 OCR | macOS Vision 内置 OCR，无文本层自动识别再脱敏 |
+| 列感知表格 | 银行流水/对账单自动识别表头列类型，按列脱敏 |
+| 批量处理 | 递归文件夹、断点续跑、原件校验、批量报告 |
+| 红队评测 | `evaluate.py`：entity-level P/R/F1，负样本计误报 |
+| 合成语料 | `synthetic/` 生成合法校验码语料（身份证/信用代码/银行卡） |
+| 格式转换 | `format-converter/`：docx/pdf/html/csv/图片 → txt/md/json |
 
 ## 安全设计
 
-```
-规则引擎（本地）→ 身份证号等替换为占位符 → LLM 只看到 [身份证号]
-```
+### 分层脱敏（按需选择深度）
 
-- 结构化数据在本地就被替换，AI 永远不会看到真实号码
-- 脱敏映射表保存在本地，不上传
-- 即使 LLM 在云端，也接触不到最敏感的信息
+| 安全等级 | 做法 | 效果 |
+|---------|------|------|
+| 🟡 仅规则层 | `mask` | 结构化号码已替换；人名/地址/金额仍在，**不建议上传云端** |
+| 🟢 规则层 + 本地 LLM | `full`（Ollama） | 全部敏感信息替换，数据不出本机 |
+| 🟢 规则层 + 云端 LLM | `full`（API） | 全部替换；发送给服务商前已去掉结构化号码 |
 
-### v2.1 安全增强
+> 涉密程度高的材料请优先**本地 Ollama**；只跑规则层就把文件上传给 AI，人名、
+> 公司名、金额等仍会泄露。
 
-- **SecureDesensitizer**：`--secure` 启用内存安全模式，脱敏后尽力清空原始字符串引用
-- **零信任加密**：AES-256-GCM + PBKDF2 密码派生，密钥绝不输出到 stdout（修复 v2.0 Fernet 设计缺陷）
-- **文件名自动脱敏**：输出文件时自动替换文件名中的敏感信息（可通过 `--no-sanitize-filename` 禁用）
-- **EntityResolver**：同一人物/公司全文档统一占位符，公司简称自动链接到全称
+### 安全特性
 
-### v2.1.1 行为说明（规则层修复）
+- `--secure`：内存安全模式，尽力清空原始字符串引用
+- 映射表 AES-256-GCM 加密，密钥不落 stdout；明文映射表会明确警告勿外传
+- 输出文件名自动脱敏；PDF 输出清理元数据 / 批注 / 表单 / 书签 / 附件
+- residual 零残留校验：涂黑后原文不可读才交付，扫描件零命中直接拒绝
 
-- **身份证号**：带"身份证/证件"上下文时无条件替换；无标签的 18 位数字只有内嵌有效
-  出生日期才归为身份证号，其余按银行账号处理，避免银行卡被误标。
-- **统一社会信用代码**：无标签时要求以 9 开头，律所执业许可证（如 31110000E000123456）
-  不再被误判为信用代码，而是按"执业许可证号"识别为 `[律师执业证号]`。
-- **日期**：普通日期（合同签署日、开庭日等）默认**不**脱敏，只脱敏带"出生/生日/生于"
-  上下文的日期；如确需全部日期脱敏，使用 `--all-dates`。
-- **映射表计数**：出现次数按原始值统计（同值出现多次累加），不再是按类型合计。
-- **微信号**：只匹配字母开头 6-20 位的合法格式，且不紧贴中文，避免把"粤B88888"
-  这类车牌误当作微信号。
-- **QQ号**：替换后同步记录进映射表。
-- **修复 v2.1 无法运行的类定义顺序问题**（SecureDesensitizer 前向引用 Desensitizer）。
+## 质量基线
 
-### ⚠️ 安全等级说明：请根据你的需求选择脱敏深度
+- 170 项单元测试通过；红队 77 用例召回 100%、误报 0
+- 合成语料 300 条召回 99.76%、precision 1.0
+- 真实文书还原往返逐字节一致
 
-本工具是分层脱敏系统，**不是一键魔法**。你脱敏到哪一层，取决于你对数据安全的判断：
+## 文档
 
-| 安全等级 | 执行步骤 | 替换了什么 | 还剩什么未替换 | 能否上传给云端AI |
-|---------|---------|-----------|---------------|----------------|
-| 🔴 不脱敏 | 什么都不做 | 无 | 全部敏感信息 | ❌ 绝不可上传 |
-| 🟡 仅规则层 | `python3 desensitize.py mask -f 文件.docx` | ✅ 身份证号、手机号、银行卡号、案号、日期等结构化信息 | ⚠️ 人名、公司名、地址、金额、案情细节尚在 | ⚠️ **有风险**，不建议上传 |
-| 🟢 规则层 + LLM层(本地模型) | 规则层后，调用本地Ollama/LM Studio做LLM层脱敏 | ✅ 全部14类敏感信息 | ✅ 全部替换 | ✅ **可以安全上传** |
-| 🟢 规则层 + LLM层(云端AI) | 规则层后，把半脱敏文本给ChatGPT等做LLM层脱敏 | ✅ 全部14类敏感信息 | ✅ 全部替换 | ✅ 可以上传，但LLM层脱敏那一步本身有数据暴露风险 |
-
-**建议**：
-- 如果文件涉密程度高 → 走完全是**规则层+本地LLM层**
-- 如果文件涉密程度中等 → 规则层后自己用肉眼检查一遍，再上传给AI
-- 如果只做案情摘要等不涉密分析 → 规则层处理后即可使用
-
-> ⚠️ **记住：只跑规则层就把文件上传给AI，身份证号虽已替换，但人名、公司名、金额等仍在泄露。**
-> 
-> 完整脱敏 = 规则层 + LLM层（二选一：本地模型或云端AI）
-
-## 推送工具（github.com 直连受限时）
-
-`api-push.py` 通过 GitHub Git API 推送提交，适用于 github.com 无法直连、
-但 api.github.com 可达的网络环境（如国内网络）。
-
-```bash
-# 推送指定文件
-python3 api-push.py -m "fix: 修复xxx" desensitize.py
-
-# 推送全部工作区改动，并同步本地历史（SHA 与远程一致）
-python3 api-push.py -m "feat: xxx" --all --sync-local
-
-# 先看将执行什么，不实际推送
-python3 api-push.py -m "test" --all --dry-run
-```
-
-Token 按 `--token` → `GITHUB_PAT_TOKEN` → gh 配置文件（`~/.config/gh/hosts.yml`）
-的顺序自动读取；网络恢复后仍可直接使用标准 `git push`。
+- [docs/简介.md](docs/简介.md) — 两阶段工作流、完整用法
+- [SKILL.md](SKILL.md) — 规则细节、实战修复记录、评测口径
+- [docs/版本说明.txt](docs/版本说明.txt) — 版本变更记录
 
 ## 授权
 

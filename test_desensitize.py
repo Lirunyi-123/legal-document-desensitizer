@@ -1798,8 +1798,8 @@ class TestReviewTiering(unittest.TestCase):
         self.assertIn('13912345678', review)
 
 
-class TestV311Archive3Fixes(unittest.TestCase):
-    """v3.11：archive3 批量实战（34 份真实/合成文书）修复回归测试。"""
+class TestV41Archive3Fixes(unittest.TestCase):
+    """v4.1：archive3 批量实战（34 份真实/合成文书）修复回归测试。"""
 
     def test_secure_wechat_shift_signature(self):
         from desensitize import SecureDesensitizer

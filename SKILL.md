@@ -12,7 +12,7 @@ allowed-tools: read_file, write_file, grep, ls, glob
 
 # 法律文书脱敏工具 (Legal Document Desensitization)
 
-## v3.11 实战修复（2026-08-11 archive3 批量，34 份真实/合成文书）
+## v4.1 实战修复（2026-08-11 archive3 批量，34 份真实/合成文书）
 
 基于 34 份公开判决书/裁定书/调解书/起诉状/银行流水（27 份 PDF、8 份扫描件）
 的批量实战，修复 8 项问题，新增 8 项回归测试（全量 170 项通过）：

@@ -130,7 +130,7 @@ def _redact_pages(pages, pairs, output_path, desensitizer=None):
     ocr_text = _ocr_boxes_text([p['path'] for p in pages])
 
     # 用同一份坐标 OCR 文本跑规则层 → 映射与坐标一致
-    # v3.11：返回的是"脱敏后文本"（此前误返回原始 OCR 文本，
+    # v4.1：返回的是"脱敏后文本"（此前误返回原始 OCR 文本，
     # 导致扫描件侧车无占位符、语义层配对失败）
     masked_text = ocr_text
     if desensitizer is not None:

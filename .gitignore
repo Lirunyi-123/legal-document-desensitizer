@@ -9,3 +9,6 @@ build/
 
 # 评测报告为运行产物，每次 evaluate 重新生成，不入库
 测试/脱敏评测报告*.md
+
+# format-converter 依赖
+format-converter/node_modules/

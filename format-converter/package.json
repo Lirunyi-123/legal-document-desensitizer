@@ -1,0 +1,27 @@
+{
+  "name": "format-converter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "法律文书格式转换核心（纯 JS，无外部引擎）：docx→txt/md/html、pdf→txt、txt/md/html/json/csv 互转、图片互转+单图转PDF。面向脱敏工作流。",
+  "main": "cli.js",
+  "scripts": {
+    "convert": "node cli.js",
+    "test": "node test-cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "csv-parse": "5.6.0",
+    "mammoth": "^1.12.0",
+    "marked": "9.1.6",
+    "pdfjs-dist": "6.2.108",
+    "sharp": "^0.35.3",
+    "turndown": "^7.2.4"
+  },
+  "devDependencies": {
+    "docx": "^9.5.0",
+    "pdf-lib": "1.17.1"
+  },
+  "license": "MIT"
+}

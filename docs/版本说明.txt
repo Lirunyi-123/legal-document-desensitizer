@@ -1,3 +1,70 @@
+# 法律文书脱敏工具 v4.2 版本说明
+
+## 版本号
+v4.2 — 内置 format-converter 格式转换核心（docx/pdf/文本/图片 → 脱敏可用格式）
+
+## 背景
+脱敏工具的输入链路扩展：docx / pdf / html / csv / 扫描件图片等格式，
+先用 `format-converter/` 转成 txt / md / json，再进入脱敏流程。
+
+## 能力矩阵
+
+| 输入 | 可转成 | 引擎 |
+|------|--------|------|
+| docx（律师文书、合同） | txt / md / html | mammoth |
+| pdf（判决书、裁判文书） | txt（仅带文本层） | pdfjs-dist |
+| txt / md / html / json / csv | 任意互转 | turndown / marked / csv-parse |
+| png / jpg / webp / gif / avif / tiff | 互转、单图 → pdf | sharp |
+
+- 纯 JS 实现，无 FFmpeg / LibreOffice / Poppler / Tesseract 等外部引擎依赖，
+  `npm install` 后即可本机运行（node >= 22.13）
+- 扫描件/图片型 PDF 无文本层 → pdf→txt 明确报错并提示走脱敏工具 OCR 通道，
+  不静默产出空文件
+
+## ⚠️ 单向提取，不可逆
+
+format-converter 是**单向提取器**：转换后丢失版式（docx 样式/表格、pdf 排版），
+**不支持转回 docx/pdf**；脱敏工具的 `restore` 只还原内容、不还原格式。
+
+| 你的需求 | 怎么选 | 结果 |
+|---------|--------|------|
+| 最终要 docx/pdf 原格式（归档、庭审、提交） | **不转换**，直接 `mask -f 合同.docx` 或 `mask -f 判决书.pdf --pdf-redact` | 脱敏后仍是原格式 |
+| 只需提取文本（核对、摘录、喂 LLM、批量筛查） | 先 `node cli.js 判决书.pdf txt` 再脱敏 | txt/md/json 即最终形态 |
+| 输入是 html/csv/图片等不直接支持的格式 | 必须先转 txt/md/json | 转出的文本即最终形态 |
+| 扫描件/图片型 PDF | 不转换，直接 `mask -f 扫描件.pdf -o 涂黑.pdf` 走内置 OCR | 原图涂黑 PDF |
+
+**一句话**：要"转回原格式"就别转，直接脱敏；format-converter 只用于内容提取。
+
+## 实现
+
+- `cli.js` 统一入口：`node cli.js <输入文件> <目标格式> [-o 输出] [-f]`
+- `text-conversion.js` / `image-conversion.js`：文本与图片转换核心
+- 明确排除与脱敏无关或需外部引擎的能力：音视频（FFmpeg）、Office 全格式
+  （LibreOffice）、OCR（Tesseract）、NCM/KGG 音乐解密、ZIP
+- 安全默认：单图上限 50MP / 16384px；HTML→MD 表格安全序列化；
+  JSON→CSV 扁平化嵌套对象；动画 gif/webp 转静态保留第一帧并提示
+
+## 实测
+
+- 16 项端到端自测通过（`node test-cli.js`）：md/html/csv/json 互转、
+  png/jpg/gif/tiff/pdf 图片转换、docx→txt/md、pdf→txt、错误处理
+- 中文 docx 提取实测 1.5 万字正常
+
+## 来源与许可
+
+- 从 [FlyingMouse Format / 飞鼠格式](https://github.com/LaoFeng-mouse/flyingmouse-format)
+  （MIT License, Copyright (c) 2026 LaoFeng）抽取，仅保留对脱敏有帮助的部分
+- `text-conversion.js` / `image-conversion.js` 许可随附
+  `format-converter/LICENSE-flyingmouse-format.txt`；
+  `cli.js` / `package.json` 为本地封装
+
+## 回归
+
+- 不影响脱敏核心（独立目录、独立依赖）
+- README 已补充能力说明、单向不可逆警告与"先转换还是直接脱敏"选择点
+
+---
+
 # 法律文书脱敏工具 v4.1 版本说明
 
 ## 版本号

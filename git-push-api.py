@@ -70,6 +70,16 @@ def load_token(arg_token=""):
                       text, re.S)
         if m:
             return m.group(1)
+    # gh 新版登录把 token 存进系统钥匙串（hosts.yml 不再含 oauth_token），
+    # 回退到 `gh auth token` 读取
+    try:
+        p = subprocess.run(["gh", "auth", "token"],
+                           capture_output=True, text=True, timeout=30)
+        token = (p.stdout or "").strip()
+        if p.returncode == 0 and token:
+            return token
+    except Exception:
+        pass
     raise SystemExit("未找到 token：请用 --token、设置 GITHUB_PAT_TOKEN 或先 gh auth login")
 
 

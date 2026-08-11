@@ -357,7 +357,17 @@ def main():
             created = api("POST", f"{API}/repos/{repo}/git/blobs", token, payload)
             if created["sha"] != local_blob_sha:
                 raise SystemExit(f"blob 校验不一致: {path} {created['sha']} vs {local_blob_sha}")
-            tree_updates.append({"path": path, "mode": "100644",
+            # 保留本地文件模式（100644 / 100755 / 120000），避免
+            # chmod +x 等模式变更导致远程树与本地树 SHA 不一致
+            entry = git("ls-tree", sha, "--", path)
+            parts = entry.stdout.strip().split(None, 3)
+            if len(parts) >= 2:
+                mode, etype = parts[0], parts[1]
+            else:
+                mode, etype = "100644", "blob"
+            if etype != "blob":
+                continue  # 子树/子模块等非常规条目跳过
+            tree_updates.append({"path": path, "mode": mode,
                                  "type": "blob", "sha": created["sha"]})
 
         # 建树（基于远程父树）

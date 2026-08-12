@@ -21,6 +21,8 @@ import tempfile
 # realpath：desensitize.py 经软链启动时 image_redact 由 sys.path 引导后加载，
 # 用 realpath 保证资源文件定位不受软链/相对路径影响。
 _IMAGE_REDACT_DIR = os.path.dirname(os.path.realpath(__file__))
+if _IMAGE_REDACT_DIR not in sys.path:
+    sys.path.insert(0, _IMAGE_REDACT_DIR)
 _OCR_BOXES_SWIFT = os.path.join(_IMAGE_REDACT_DIR, 'ocr_vision_boxes.swift')
 _OCR_BOXES_BIN = os.path.join(tempfile.gettempdir(),
                               'legal_deid_ocr_vision_boxes')
@@ -35,92 +37,26 @@ class ImageRedactError(Exception):
 def _ensure_ocr_boxes_bin() -> bool:
     """确保 ocr_vision_boxes.swift 已编译为带坐标 OCR 二进制。
 
-    v5.1：与文本 OCR 一致的稳健策略——源码更新时重编译并自检；重编译失败
-    （Swift 编译器与 SDK 版本不匹配等）回退已有缓存二进制，再到 /tmp、
-    /private/tmp 等常见位置寻找可用二进制复制到当前 TMPDIR。
+    编译/缓存/自检/回退的公共逻辑见 ocr_common.ensure_bin。
     """
-    if sys.platform != 'darwin':
-        return False
-    if not os.path.exists(_OCR_BOXES_SWIFT):
-        return False
-    if os.path.exists(_OCR_BOXES_BIN) \
-            and os.path.getmtime(_OCR_BOXES_BIN) >= os.path.getmtime(_OCR_BOXES_SWIFT):
-        if _ocr_boxes_bin_selftest(_OCR_BOXES_BIN):
-            return True
-    if _try_compile_ocr_boxes_bin():
-        return True
-    if os.path.exists(_OCR_BOXES_BIN) and _ocr_boxes_bin_selftest(_OCR_BOXES_BIN):
-        _warn_ocr_boxes_fallback('重编译失败，沿用本机已有带坐标 OCR 二进制')
-        return True
-    for d in _OCR_BOXES_BIN_FALLBACK_DIRS:
-        alt = os.path.join(d, os.path.basename(_OCR_BOXES_BIN))
-        if os.path.exists(alt) and _ocr_boxes_bin_selftest(alt):
-            try:
-                import shutil
-                shutil.copy2(alt, _OCR_BOXES_BIN)
-                _warn_ocr_boxes_fallback(
-                    f'重编译失败，已复用 {d} 中可用的带坐标 OCR 二进制')
-                return True
-            except OSError:
-                return False
-    return False
-
-
-def _try_compile_ocr_boxes_bin() -> bool:
-    """重新编译 ocr_vision_boxes.swift，编译成功且过自检才返回 True。"""
-    import subprocess
-    module_cache = os.path.join(tempfile.gettempdir(),
-                                'legal_deid_swift_cache_boxes')
-    os.makedirs(module_cache, exist_ok=True)
-    env = dict(os.environ)
-    env['CLANG_MODULE_CACHE_PATH'] = module_cache
-    try:
-        ret = subprocess.run(['swiftc', '-O', '-o', _OCR_BOXES_BIN,
-                              _OCR_BOXES_SWIFT],
-                             capture_output=True, timeout=180, env=env)
-    except Exception:
-        return False
-    return ret.returncode == 0 and _ocr_boxes_bin_selftest(_OCR_BOXES_BIN)
-
-
-def _write_ocr_selftest_png(path: str) -> bool:
-    """用 PIL + 系统字体绘制 'ABC 123' 并写成 PNG；成功返回 True。"""
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except ImportError:
-        return False
-    font_path = None
-    for candidate in (
-        '/System/Library/Fonts/Supplemental/Arial.ttf',
-        '/System/Library/Fonts/Helvetica.ttc',
-        '/System/Library/Fonts/PingFang.ttc',
-        '/Library/Fonts/Arial Unicode.ttf',
-    ):
-        if os.path.exists(candidate):
-            font_path = candidate
-            break
-    if not font_path:
-        return False
-    try:
-        img = Image.new('RGB', (720, 180), 'white')
-        d = ImageDraw.Draw(img)
-        font = ImageFont.truetype(font_path, 90)
-        d.text((40, 40), 'ABC 123', fill='black', font=font)
-        img.save(path)
-        return True
-    except Exception:
-        return False
+    import ocr_common
+    return ocr_common.ensure_bin(
+        _OCR_BOXES_SWIFT, _OCR_BOXES_BIN, _OCR_BOXES_BIN_FALLBACK_DIRS,
+        os.path.join(tempfile.gettempdir(), 'legal_deid_swift_cache_boxes'),
+        _ocr_boxes_bin_selftest, bin_label='带坐标 OCR',
+        warn=ocr_common.warn_fallback)
 
 
 def _ocr_boxes_bin_selftest(bin_path: str = None) -> bool:
     """运行带坐标 OCR 对自检图识别，校验能输出含 '123' 的 JSON 框。"""
+    import subprocess
+    import ocr_common
     if bin_path is None:
         bin_path = _OCR_BOXES_BIN
-    import subprocess
     try:
         png_path = os.path.join(tempfile.gettempdir(),
                                 'legal_deid_ocr_boxes_selftest.png')
-        if not _write_ocr_selftest_png(png_path):
+        if not ocr_common.write_selftest_png(png_path):
             # 无 PIL/字体 → 仅冒烟检查
             r = subprocess.run([bin_path, '--help'],
                                capture_output=True, text=True, timeout=30)
@@ -133,12 +69,6 @@ def _ocr_boxes_bin_selftest(bin_path: str = None) -> bool:
         return any('123' in (b.get('text') or '') for b in items)
     except Exception:
         return False
-
-
-def _warn_ocr_boxes_fallback(reason: str) -> None:
-    """带坐标 OCR 缓存回退时输出一次提示（stderr），避免静默降级。"""
-    print(f'⚠️  {reason}；如需彻底修复，请更新 Xcode Command Line Tools'
-          '（xcode-select --install 或软件更新）', file=sys.stderr)
 
 
 def _ocr_boxes(image_paths) -> list:

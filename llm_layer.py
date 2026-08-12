@@ -133,7 +133,6 @@ def call_llm(prompt: str, config: LLMConfig) -> str:
             'model': config.model,
             'prompt': prompt,
             'stream': False,
-            'format': 'json',
             'options': {'temperature': 0.0},
         }
         headers = {'Content-Type': 'application/json'}

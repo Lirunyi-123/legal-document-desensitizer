@@ -1588,7 +1588,12 @@ class TestV39ImageRedact(unittest.TestCase):
         src.close()
         # 规则层识别
         d = Desensitizer()
-        text = __import__('desensitize').read_text_from_file(img_path)
+        try:
+            text = __import__('desensitize').read_text_from_file(img_path)
+        except SystemExit:
+            # 沙箱/非 macOS 环境下 Vision OCR 不可用（read_text_from_file 会
+            # sys.exit），此时应跳过而非报错。
+            self.skipTest('macOS Vision OCR 不可用（沙箱或非 macOS 环境）')
         r = d.mask(text)
         # 涂黑
         out = os.path.join(os.path.dirname(img_path), 'out.pdf')
@@ -2312,6 +2317,123 @@ class TestV50(unittest.TestCase):
         self.assertTrue(os.path.exists(out))
         self.assertEqual(audit['output']['page_match'], True)
         self.assertEqual(audit['output']['pages'], 1)
+
+
+class TestV52Bugfixes(unittest.TestCase):
+    """v5.2 后续修复的回归测试：docx 表格、xlsx 元数据、scan/mask 一致性等。"""
+
+    def test_docx_table_roundtrip(self):
+        try:
+            from docx import Document
+        except ImportError:
+            self.skipTest('python-docx 缺失')
+        import os
+        import tempfile
+        from desensitize import Desensitizer, read_text_from_file, \
+            write_desensitized_file
+
+        tmp = tempfile.mkdtemp(prefix='deid_v52_docx_')
+        src = os.path.join(tmp, 'a.docx')
+        doc = Document()
+        doc.add_paragraph('原告：张三')
+        table = doc.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = '甲方公司'
+        table.cell(0, 1).text = '乙方公司'
+        table.cell(1, 0).text = '北京华信科技有限公司'
+        table.cell(1, 1).text = '上海宝冶集团有限公司'
+        doc.save(src)
+
+        text = read_text_from_file(src)
+        result = Desensitizer().mask(text)
+        out = os.path.join(tmp, 'out.docx')
+        write_desensitized_file(src, out, result.text)
+
+        out_doc = Document(out)
+        self.assertEqual(out_doc.paragraphs[0].text,
+                         '原告：[当事人甲（原告）]')
+        table_out = out_doc.tables[0]
+        self.assertEqual(len(table_out.rows), 2)
+        self.assertEqual(len(table_out.rows[0].cells), 2)
+        self.assertEqual(table_out.cell(0, 0).text, '甲方公司')
+        self.assertEqual(table_out.cell(0, 1).text, '乙方公司')
+        self.assertNotIn('北京华信', table_out.cell(1, 0).text)
+        self.assertNotIn('上海宝冶', table_out.cell(1, 1).text)
+
+    def test_xlsx_metadata_cleared(self):
+        try:
+            import openpyxl
+        except ImportError:
+            self.skipTest('openpyxl 缺失')
+        import os
+        import tempfile
+        from desensitize import write_desensitized_file
+
+        tmp = tempfile.mkdtemp(prefix='deid_v52_xlsx_')
+        src = os.path.join(tmp, 'a.xlsx')
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws['A1'] = '张三'
+        wb.properties.creator = '张三律师'
+        wb.properties.lastModifiedBy = '李四'
+        wb.properties.title = '机密合同'
+        wb.properties.subject = '案件'
+        wb.save(src)
+
+        out = os.path.join(tmp, 'out.xlsx')
+        write_desensitized_file(src, out, '[当事人甲]')
+
+        wb2 = openpyxl.load_workbook(out)
+        self.assertFalse(wb2.properties.creator)
+        self.assertFalse(wb2.properties.lastModifiedBy)
+        self.assertFalse(wb2.properties.title)
+        self.assertFalse(wb2.properties.subject)
+
+    def test_scan_value_excludes_prefix(self):
+        from desensitize import Desensitizer
+        text = ('原告：张三，身份证号110101198001011232，'
+                '住浙江省杭州市西湖区文一西路1号，1980年1月1日出生。'
+                '被告杭州华信科技有限公司。')
+        by_type = {}
+        for finding in Desensitizer().scan(text):
+            by_type.setdefault(finding['type'], []).append(finding['value'])
+        self.assertIn('张三', by_type.get('人名', []))
+        self.assertNotIn('原告：张三', by_type.get('人名', []))
+        self.assertIn('浙江省杭州市西湖区文一西路1号',
+                      by_type.get('地址', []))
+        self.assertIn('1980年1月1日', by_type.get('出生日期', []))
+        self.assertIn('杭州华信科技有限公司', by_type.get('公司名', []))
+
+    def test_scan_driving_license_not_id(self):
+        from desensitize import Desensitizer
+        findings = Desensitizer().scan('驾驶证号330106198001011234')
+        types = {f['type'] for f in findings}
+        self.assertIn('驾驶证号', types)
+        self.assertNotIn('身份证号', types)
+
+    def test_scan_includes_fine_license(self):
+        from desensitize import Desensitizer
+        findings = Desensitizer().scan('罚没许可证号：07040008')
+        self.assertTrue(any(f['type'] == '罚没许可证号'
+                            and f['value'] == '07040008'
+                            for f in findings))
+
+    def test_scan_standalone_wechat_requires_digit(self):
+        from desensitize import Desensitizer
+        findings = Desensitizer().scan('Banking Limited Statement')
+        self.assertFalse(any(f['type'] == '微信号' for f in findings))
+
+    def test_license_plate_boundary(self):
+        from desensitize import Desensitizer
+        d = Desensitizer()
+        self.assertIn('[车牌号]', d.mask('车牌粤B88888到场').text)
+        self.assertNotIn('[车牌号]', d.mask('A粤B88888').text)
+
+    def test_parse_fernet_key_safe(self):
+        from desensitize import _parse_fernet_key
+        self.assertEqual(_parse_fernet_key('hello'), b'hello')
+        self.assertEqual(_parse_fernet_key("b'hello'"), b'hello')
+        with self.assertRaises((ValueError, SyntaxError)):
+            _parse_fernet_key("b'x' + __import__('os').system('id')")
 
 
 if __name__ == '__main__':

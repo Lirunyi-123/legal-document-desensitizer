@@ -179,6 +179,39 @@ class TestCloudAPI(unittest.TestCase):
         self.assertEqual(captured['body']['temperature'], 0.0)
         self.assertIn('### 脱敏后文本', out)
 
+    def test_ollama_call_has_no_json_format(self):
+        """Ollama 请求体不得带 format:'json'——full 提示词期望的是
+        '### 脱敏后文本 … ### 补充映射表' 混合文本格式，强制 JSON 会破坏解析。"""
+        from llm_layer import call_llm, LLMConfig
+        captured = {}
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({
+                    'response': '### 脱敏后文本\nX\n\n### 补充映射表\n[]'
+                }).encode('utf-8')
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=180):
+            captured['body'] = json.loads(req.data.decode('utf-8'))
+            return FakeResp()
+
+        with mock.patch('llm_layer.urllib.request.urlopen',
+                        side_effect=fake_urlopen):
+            out = call_llm('prompt', LLMConfig(
+                api='ollama', model='mock',
+                endpoint='http://127.0.0.1:11434'))
+
+        self.assertNotIn('format', captured['body'])
+        self.assertEqual(captured['body']['stream'], False)
+        self.assertEqual(captured['body']['model'], 'mock')
+        self.assertIn('### 脱敏后文本', out)
+
 
 if __name__ == '__main__':
     unittest.main()

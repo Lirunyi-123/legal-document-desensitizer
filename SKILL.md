@@ -2,7 +2,7 @@
 name: legal-document-desensitization
 description: 法律文书涉密脱敏工具 — 规则+本地NER+LLM混合引擎，对合同/协议/沟通记录/证据材料中的敏感信息进行语义替换脱敏，生成映射表并可一键还原、红队评测。
 runAs: subagent
-allowed-tools: read_file, write_file, grep, ls, glob
+allowed-tools: bash, read_file, write_file, grep, ls, glob
 ---
 
 > **本地副本同步规则**：本文件由项目
@@ -11,6 +11,22 @@ allowed-tools: read_file, write_file, grep, ls, glob
 > **不**主动更新本本地副本；仅在用户明确指示"更新本地 skill"时，才重新全量同步。
 
 # 法律文书脱敏工具 (Legal Document Desensitization)
+
+## v5.3 缺陷修复与一致性升级（2026-08-13）
+
+- **docx 表格结构修复**：读取与写回统一为"逐单元格段落"展平，修复含表格
+  文书脱敏/还原后内容错位、丢失、混入 ` | ` 的问题。
+- **xlsx 元数据清理生效**：清理逻辑移到 `save()` 之前，输出不再残留
+  `creator/lastModifiedBy/title` 等敏感元数据。
+- **`decrypt` 安全修复**：`-k` 参数改用 `ast.literal_eval` 解析字节字面量，
+  移除 `eval` 注入风险。
+- **scan 与 mask 对齐**：`scan` 复用 `_extract_scan_value`（人名只取姓名、
+  公司名先修剪、地址只取本体）；补齐罚没许可证号/地块编号/银行机构规则；
+  独立微信号要求含数字/下划线；车牌号补词边界，与脱敏行为一致。
+- **`full` 命令修复**：Ollama 请求去掉 `format:'json'`，避免与
+  `### 脱敏后文本` 混合格式冲突导致解析失败。
+- **skill 工具声明**：`allowed-tools` 增加 `bash`，支持代为执行本机命令。
+- 新增 9 项回归测试（全量 206 项通过，红队 105 项命中、误报 0）。
 
 ## v5.0 可验证本地闭环 · AI 安全出口（2026-08-11，安全交付升级）
 

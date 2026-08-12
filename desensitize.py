@@ -18,6 +18,7 @@ Usage:
 """
 
 import re
+import ast
 import sys
 import json
 import os
@@ -1410,11 +1411,21 @@ class Desensitizer:
             rule_name = rule['type']
             pattern = rule['pattern']
             for match in re.finditer(pattern, text):
-                value = match.group(rule.get('group', 0))
-                confidence = 1.0
+                # 与 mask 的行为保持一致：value 走同一套提取逻辑
+                # （人名只取姓名、公司名先修剪上下文、地址只取地址本体等），
+                # 避免 scan 把"原告：张三"整体当成敏感值。
+                value = self._extract_scan_value(match, rule)
                 validate = rule.get('validate')
+                confidence = 1.0
                 if validate is not None:
-                    confidence = validate(value)
+                    try:
+                        confidence = validate(value)
+                    except Exception:
+                        confidence = 1.0
+                    # validate 返回布尔 False 表示"不符合、mask 会跳过"（如
+                    # 纯字母的独立微信号），scan 也应跳过，保持一致。
+                    if confidence is False:
+                        continue
                 findings.append({
                     'type': rule_name,
                     'value': value,
@@ -1804,10 +1815,14 @@ class Desensitizer:
         )
 
     def _mask_license_plate(self, text: str) -> str:
-        """车牌号：粤B88888 / 京A12345 等格式 — 1个汉字省份简称+1个字母城市代码+5-6位字母数字"""
+        """车牌号：粤B88888 / 京A12345 等格式 — 1个汉字省份简称+1个字母城市代码+5-6位字母数字。
+
+        前后加字母数字边界（与 _get_all_rules 的 scan 规则保持一致），
+        避免把嵌在更长字母数字串里的片段误当车牌。
+        """
         return self._safe_replace(
             text,
-            r'[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}',
+            r'(?<![A-Za-z0-9])[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}(?![\dA-Za-z])',
             '[车牌号]',
             '车牌号'
         )
@@ -2631,6 +2646,11 @@ class Desensitizer:
         def bank_confidence(value):
             return 1.0 if _luhn_check(value) else 0.6
 
+        def wechat_standalone_valid(value):
+            # 与 _mask_wechat 的独立微信号启发式一致：纯字母英文单词无法与
+            # 微信号区分，只有含数字/下划线才是合法独立微信号候选。
+            return bool(re.search(r'[0-9_]', value))
+
         rules = [
             {'type': '律师执业证号',
              'pattern': r'((?:执业证号|执业许可证号|律师执业证号|律师执业证|执业证)\s*[：:]?\s*)([0-9A-Z]{17,18})',
@@ -2666,7 +2686,8 @@ class Desensitizer:
              'handler': self._mask_wechat, 'group': 2, 'value_group': 2},
             {'type': '微信号',
              'pattern': r'(?<![\u4e00-\u9fa5a-zA-Z0-9_@/.])([a-zA-Z][a-zA-Z0-9_]{5,19})(?![a-zA-Z0-9_@]|\.com|\.cn)',
-             'handler': self._mask_wechat, 'group': 1, 'value_group': 1},
+             'handler': self._mask_wechat, 'group': 1, 'value_group': 1,
+             'validate': wechat_standalone_valid},
             {'type': 'QQ号',
              'pattern': r'((?:QQ|Qq|qq)\s*[：:]?\s*)(\d{5,12})(?!\d)',
              'handler': self._mask_qq, 'group': 2, 'value_group': 2},
@@ -2697,6 +2718,10 @@ class Desensitizer:
                         r'[\u4e00-\u9fa5]{1,10}[ \t]*\d{0,6}[ \t]*'
                         r'[\u4e00-\u9fa5]{0,6}[ \t]*\d{1,6}[ \t]*号',
              'handler': self._mask_case_number},
+            {'type': '地块编号',
+             'pattern': r'[\u4e00-\u9fa5]{1,4}储出[ \t]*[（(][ \t]*\d{4}[ \t]*[）)]'
+                        r'[ \t]*\d+[ \t]*号?[ \t]*地块?',
+             'handler': self._mask_land_plot_number},
             {'type': '车牌号',
              'pattern': r'(?<![A-Za-z0-9])[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}(?![\dA-Za-z])',
              'handler': self._mask_license_plate, 'value_group': 0},
@@ -2711,6 +2736,10 @@ class Desensitizer:
                         + _COMPANY_OFFICE_PATTERN.pattern + '|'
                         + _COMPANY_SHORT_PATTERN.pattern,
              'handler': self._mask_company_name, 'value_fn': 'company'},
+            {'type': '银行机构',
+             'pattern': r'([\u4e00-\u9fa5]{2,12}(?:分行|支行)'
+                        r'(?:本级|本币|头寸|机构)*)',
+             'handler': self._mask_bank_branch, 'value_group': 1},
             {'type': '项目名称',
              'pattern': _PROJECT_PATTERN.pattern,
              'handler': self._mask_project_name},
@@ -2736,10 +2765,17 @@ class Desensitizer:
             {'type': '金额',
              'pattern': r'(?<!\d)(?!(?:19|20)\d{6})(\d{7,}(?:\.\d{1,3})?)(?!\d)',
              'handler': self._mask_amount},
-            {'type': '其他证件',
-             'pattern': r'((?:护照|护照号|港澳通行证|往来港澳通行证|港澳居民来往内地通行证|台湾居民来往大陆通行证|台胞证|驾驶证|驾驶证号|驾驶证号码|军官证|士兵证|警官证|工作证|营业执照|营业执照号|营业执照号码|税务登记证号|税务登记号)\s*[：:]?\s*)([0-9A-Za-z]{4,20})',
-             'handler': self._mask_other_cert, 'value_group': 2},
         ]
+        # 其他证件（护照/港澳通行证/驾驶证/军官证/营业执照/税务/罚没等）与
+        # _mask_other_cert 一一对应，插到身份证/邮箱/手机号之前，保持
+        # "scan 报告 = mask 行为"的顺序一致（此前合并成一条且排在金额之后，
+        # 导致"驾驶证号"被 scan 误判为身份证号、"护照号"误判为微信号）。
+        cert_rules = [
+            {'type': label, 'pattern': pat, 'handler': self._mask_other_cert,
+             'group': 2, 'value_group': 2}
+            for pat, label in _OTHER_CERT_PATTERNS
+        ]
+        rules = rules[:1] + cert_rules + rules[1:]
         if self._mask_all_dates:
             rules.append({'type': '日期',
                           'pattern': r'(?<!\d)(\d{4}年\d{1,2}月\d{1,2}日)(?!\d)',
@@ -3082,6 +3118,19 @@ def decrypt_mapping_encrypted(filepath: str, password: str) -> str:
     key = b'\x00' * 32
 
     return plaintext.decode('utf-8')
+
+
+def _parse_fernet_key(key: str) -> bytes:
+    """把 `-k` 传入的 Fernet 密钥解析为 bytes。
+
+    兼容两种写法：普通字符串（按 UTF-8 编码）与 `b'...'` 字节字面量。
+    字节字面量用 `ast.literal_eval` 安全解析，绝不使用 `eval`（避免
+    用户可控的 `-k` 造成任意代码执行）。
+    """
+    key = (key or '').strip()
+    if key.startswith('b'):
+        return ast.literal_eval(key)
+    return key.encode('utf-8')
 
 
 # ============================================================
@@ -3513,18 +3562,16 @@ def read_text_from_file(filepath: str) -> str:
         except ImportError:
             sys.exit('❌ 需要安装 python-docx: pip3 install python-docx')
         doc = Document(filepath)
-        # 只提取正文段落文本（每段一行，保持结构映射）
-        paragraphs = [p.text for p in doc.paragraphs]
-        # 表格文本附加在末尾
-        tables_text = []
+        # 逐段落展平：正文段落一行；表格按"单元格 → 段落"逐行展平，
+        # 与 write_desensitized_file 的回填顺序严格一致。此前把表格按
+        # "每行 cell1 | cell2" 压缩成一行，与写回的"每单元格段落一行"对不上，
+        # 导致含表格的 docx 脱敏/还原后内容错位、丢失、混入 ' | '。
+        lines = [p.text for p in doc.paragraphs]
         for table in doc.tables:
             for row in table.rows:
-                cells = [cell.text for cell in row.cells]
-                tables_text.append(' | '.join(cells))
-        all_text = '\n'.join(paragraphs)
-        if tables_text:
-            all_text += '\n\n' + '\n'.join(tables_text)
-        return all_text
+                for cell in row.cells:
+                    lines.extend(p.text for p in cell.paragraphs)
+        return '\n'.join(lines)
 
     elif ext == '.pdf':
         try:
@@ -3711,22 +3758,24 @@ def write_desensitized_file(input_path: str, output_path: str, masked_text: str,
                                     if num is not None:
                                         cell.value = num
                             idx += 1
+            # 清理工作簿核心元数据（必须在 save 之前，否则改动不会写入文件；
+            # 此前写在 save 与 close 之后，导致 creator/lastModifiedBy/title 等
+            # 敏感元数据原样保留在输出 xlsx 中）
+            try:
+                props = orig_wb.properties
+                props.creator = ''
+                props.lastModifiedBy = ''
+                props.category = ''
+                props.description = ''
+                props.keywords = ''
+                props.title = ''
+                props.subject = ''
+            except Exception:
+                pass
             orig_wb.save(output_path)
         finally:
             orig_wb.close()
 
-        # 清理工作簿核心元数据
-        try:
-            props = orig_wb.properties
-            props.creator = ''
-            props.lastModifiedBy = ''
-            props.category = ''
-            props.description = ''
-            props.keywords = ''
-            props.title = ''
-            props.subject = ''
-        except Exception:
-            pass
         try:
             os.chmod(output_path, 0o600)  # 仅当前用户可读写
         except Exception:
@@ -5711,7 +5760,7 @@ def main():
                     '   或重新用 v2.0 工具解密后，用 v2.1 重新加密。'
                 )
             from cryptography.fernet import Fernet
-            key = args.key.encode('utf-8') if not args.key.startswith('b') else eval(args.key)
+            key = _parse_fernet_key(args.key)
             cipher = Fernet(key)
             decrypted = cipher.decrypt(file_data)
             print('⚠️  使用旧版 Fernet 格式解密成功。建议用 v2.1 的 AES-GCM 重新加密。', file=sys.stderr)

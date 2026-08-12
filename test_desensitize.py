@@ -1804,6 +1804,86 @@ class TestPrivacyDefaults(unittest.TestCase):
                 os.environ['DESENSITIZER_MAPPING_PASSWORD'] = old
 
 
+class TestFinalizePack(unittest.TestCase):
+    """v5.2：finalize 打包 06_掩码文本 侧车；扫描件还原校验用侧车而非反向 OCR。"""
+
+    def test_finalize_packs_sidecar_and_roundtrip(self):
+        import argparse
+        import os
+        import tempfile
+        from desensitize import Desensitizer, run_finalize
+        tmp = tempfile.mkdtemp()
+        text = '张三的电话是13800138000'
+        d = Desensitizer()
+        r = d.mask(text)
+        src = os.path.join(tmp, '案卷_desensitized.txt')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(r.text)
+        sidecar = os.path.join(tmp, '案卷_desensitized_掩码文本.txt')
+        with open(sidecar, 'w', encoding='utf-8') as f:
+            f.write(r.text)
+        with open(os.path.join(tmp, '案卷.txt'), 'w', encoding='utf-8') as f:
+            f.write(text)
+        mapping = os.path.join(tmp, '映射表.md')
+        with open(mapping, 'w', encoding='utf-8') as f:
+            f.write(r.to_markdown())
+        with open(os.path.join(tmp, '案卷_desensitized_审阅.txt'),
+                  'w', encoding='utf-8') as f:
+            f.write('review')
+        with open(os.path.join(tmp, '案卷_desensitized_审计单.json'),
+                  'w', encoding='utf-8') as f:
+            f.write('{}')
+        out_dir = run_finalize(argparse.Namespace(
+            file=src, mapping=mapping,
+            audit=os.path.join(tmp, '案卷_desensitized_审计单.json'),
+            original=os.path.join(tmp, '案卷.txt'),
+            output=os.path.join(tmp, '交付包')))
+        names = sorted(os.listdir(out_dir))
+        self.assertIn('01_案卷_desensitized.txt', names)
+        self.assertIn('02_映射表.md', names)
+        self.assertIn('03_审计单.json', names)
+        self.assertIn('04_审阅清单.txt', names)
+        self.assertIn('05_签发单.txt', names)
+        self.assertIn('06_掩码文本.txt', names)
+        with open(os.path.join(out_dir, '05_签发单.txt'),
+                  encoding='utf-8') as f:
+            sheet = f.read()
+        self.assertIn('[x] 还原往返校验', sheet)
+
+    def test_mask_pack_creates_delivery_folder(self):
+        import os
+        import subprocess
+        import sys
+        import tempfile
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'desensitize.py')
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, '案卷.txt')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('张三的电话是13800138000')
+        out = os.path.join(tmp, '案卷_desensitized.txt')
+        mapping = os.path.join(tmp, '映射表.enc')
+        env = dict(os.environ)
+        env['DESENSITIZER_MAPPING_PASSWORD'] = 'test-pw'
+        r = subprocess.run(
+            [sys.executable, script, 'mask', '-f', src, '-o', out,
+             '--save-mapping', mapping, '--encrypt-mapping', '--review',
+             '--audit', '--offline', '--pack',
+             '--pack-output', os.path.join(tmp, '交付包')],
+            capture_output=True, text=True, timeout=180, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        pack = os.path.join(tmp, '交付包')
+        names = sorted(os.listdir(pack))
+        self.assertIn('01_案卷_desensitized.txt', names)
+        self.assertIn('02_映射表.enc', names)
+        self.assertIn('03_审计单.json', names)
+        self.assertIn('04_审阅清单.txt', names)
+        self.assertIn('05_签发单.txt', names)
+        with open(os.path.join(pack, '05_签发单.txt'), encoding='utf-8') as f:
+            sheet = f.read()
+        self.assertIn('[x] 还原往返校验', sheet)
+
+
 class TestBatchMode(unittest.TestCase):
     """v4.0：批量模式（--batch）+ 断点续跑 + 批量报告 + 原件校验 + 临时清理。"""
 

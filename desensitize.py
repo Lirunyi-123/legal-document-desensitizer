@@ -5226,6 +5226,11 @@ def run_finalize(args) -> str:
     shutil.copy2(mapping, dst_map)
 
     base = os.path.splitext(src)[0]
+    sidecar_src = base + '_掩码文本.txt'
+    dst_sidecar = None
+    if os.path.exists(sidecar_src):
+        dst_sidecar = os.path.join(out_dir, '06_掩码文本.txt')
+        shutil.copy2(sidecar_src, dst_sidecar)
     review_src = base + '_审阅.txt'
     dst_review = None
     if os.path.exists(review_src):
@@ -5254,7 +5259,13 @@ def run_finalize(args) -> str:
             if not maps:
                 roundtrip = '映射表为空'
             else:
-                masked_text = read_text_from_file(src)
+                # v5.2：扫描件/图片涂黑 PDF 无法反向 OCR 出文本，
+                # 有掩码文本侧车时优先用侧车做还原校验（与映射表同源）
+                if os.path.exists(sidecar_src):
+                    with open(sidecar_src, encoding='utf-8') as f:
+                        masked_text = f.read()
+                else:
+                    masked_text = read_text_from_file(src)
                 restored = restore_text(masked_text, maps)
                 orig_text = read_text_from_file(args.original)
                 roundtrip = restored == orig_text
@@ -5272,6 +5283,8 @@ def run_finalize(args) -> str:
         lines.append(f'审阅清单: {os.path.abspath(dst_review)}')
     if dst_audit:
         lines.append(f'审计单: {os.path.abspath(dst_audit)}')
+    if dst_sidecar:
+        lines.append(f'掩码文本侧车: {os.path.abspath(dst_sidecar)}')
     lines.append('')
     lines.append('检查项（律师逐项确认后勾选）：')
     lines.append('  [ ] 关键信息校验：审阅清单确认关键信息 0 残留')
@@ -5305,6 +5318,8 @@ def run_finalize(args) -> str:
         print('   - 03_审计单: 已包含')
     if dst_review:
         print('   - 04_审阅清单: 已包含')
+    if dst_sidecar:
+        print('   - 06_掩码文本: 已包含')
     print('   - 05_签发单: 律师签字后方可进入 AI 工作流')
     return out_dir
 
@@ -5446,6 +5461,15 @@ def main():
                              help='v5.2：映射表加密密码自动生成并保存到该文件（0600），'
                                   '不打印到终端；非交互环境未指定时默认存到'
                                   ' 映射表.password.txt')
+    mask_parser.add_argument('--pack', action='store_true', default=False,
+                             help='v5.2：脱敏完成后自动把全部交付物装进一个文件夹'
+                                  '（01_脱敏稿/02_映射表/03_审计单/04_审阅清单/'
+                                  '05_签发单/06_掩码文本），并做还原往返校验')
+    mask_parser.add_argument('--pack-output', default=None,
+                             help='v5.2：交付包目录（默认 脱敏稿_交付包/）')
+    mask_parser.add_argument('--pack-original', default=None,
+                             help='v5.2：交付包还原校验用的原始文件'
+                                  '（默认取输入文件）')
 
     # scan 命令
     scan_parser = subparsers.add_parser('scan', help='扫描敏感信息（不替换）')
@@ -5618,6 +5642,22 @@ def main():
                 with open(audit_path, 'w', encoding='utf-8') as f:
                     json.dump(audit, f, ensure_ascii=False, indent=2)
                 print(f'📋 审计单已生成: {audit_path}')
+            # v5.2：--pack 自动把全部交付物装进一个文件夹
+            if getattr(args, 'pack', False):
+                if not summary.get('output') or not summary.get('mapping'):
+                    print('⚠️  跳过 --pack：需要 -o 输出与 --save-mapping 才能打包',
+                          file=sys.stderr)
+                else:
+                    pack_out = getattr(args, 'pack_output', None) \
+                        or (os.path.splitext(summary['output'])[0] + '_交付包')
+                    fargs = argparse.Namespace(
+                        file=summary['output'],
+                        mapping=summary['mapping'],
+                        audit=(audit_path if audit is not None else None),
+                        original=getattr(args, 'pack_original', None) or args.file,
+                        output=pack_out)
+                    pack_dir = run_finalize(fargs)
+                    print(f'📦 交付包已生成（全部交付物已装进一个文件夹）: {pack_dir}')
 
     elif args.command == 'scan':
         findings = d.scan(text)

@@ -64,6 +64,45 @@ python3 -m unittest test_desensitize     # 181 个单测（v4.2 172 + v5.0 9）
 python3 evaluate.py                      # 红队用例（105 项命中、误报 0）
 ```
 
+## v5.1 实战修复（2026-08-12，众楽汇扫描件合同脱敏）
+
+基于一份 2 页扫描件销售合同（`众楽汇5.pdf`）的实战脱敏，修复 3 类问题并
+新增 3 项回归测试（全量 181 → 184 项通过）：
+
+### 1. 软链启动失效（~/.local/bin/desensitize 报"内置 OCR 不可用"）
+- 根因：直接执行软链时 `__file__` 指向软链本身、`sys.path[0]` 指向软链目录，
+  工具据此找 `ocr_vision.swift`/`image_redact.py` 全部落空 → OCR 静默不可用；
+- 修复：脚本启动时用 `os.path.realpath(__file__)` 定位真实目录并注入
+  `sys.path`，资源文件路径全部改用 realpath；
+- 回归：`TestLauncherRobustness`（软链方式跑 `mask` 断言输出正常）。
+
+### 2. Swift 编译器与 SDK 版本不匹配 → OCR 重编译失败即"全废"
+- 根因：Xcode Command Line Tools 更新后 `swiftc`（6.3.3）与 SDK（6.3.2）
+  版本不匹配，`_ensure_ocr_bin` 删除旧缓存重编译失败 → 直接返回不可用；
+- 修复：重编译失败时**不静默放弃**——先回退沿用本机已有缓存二进制
+  （过自检即用），再到 `/tmp`、`/private/tmp` 等常见位置寻找可用二进制并
+  复制到当前 TMPDIR；同时给带坐标 OCR（`ocr_vision_boxes`）补上与文本 OCR
+  一致的"自检 + 回退"策略（此前只查存在性，不校验可用性）；
+- 均输出 stderr 提示（含修复建议：更新 Xcode Command Line Tools），不静默降级。
+
+### 3. 扫描件漏涂 + 审阅清单还原校验误报
+- 漏涂：OCR 同行多框重建时两家公司名被拼成一个带空格的串
+  （`A公司 B公司`），整串定位单个框失败 → 该处不涂黑；
+  修复：新增 `match_boxes_for` 定位函数，整串失败时按空白拆 token 逐个
+  定位（宁多勿漏），涂黑数 19 → 21；
+- 误报：扫描件流程 `redact_scanned_pdf` 用第二份 OCR 文本在内部重跑规则层，
+  覆盖 `d._original_text`，而审阅清单仍拿它做还原往返校验 → 与第一份
+  映射表不一致误报"❌ 还原往返校验失败"；
+  修复：审阅校验改用 `_run_mask_file` 传入的第一份原文；
+- 回归：`TestV39ImageRedact.test_match_boxes_token_fallback`、
+  `TestReviewOriginalText`。
+
+### 验证方法（v5.1 起）
+```bash
+python3 -m unittest test_desensitize     # 184 个单测
+python3 evaluate.py                      # 红队用例（105 项命中、误报 0）
+```
+
 ## v4.2 零上传本地模式（2026-08-11，默认工作流）
 
 针对"脱敏时把文书上传给 AI、原文可能被读取"的顾虑，从 v4.2 起默认工作流
@@ -152,6 +191,8 @@ pip3 install -r requirements.txt
 # 2. 软链为全局命令（~/.local/bin 已在 PATH 且免 sudo）
 ln -s /Users/lirunyi/Downloads/法律文书脱敏工具/legal-document-desensitizer/desensitize.py \
   ~/.local/bin/desensitize
+# （v5.1 起软链启动已修复：工具会按 realpath 定位自身目录，
+#   不再出现"软链方式 OCR 不可用"的问题）
 
 # 3. 验证
 desensitize --help

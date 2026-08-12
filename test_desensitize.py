@@ -1665,6 +1665,87 @@ class TestV39ImageRedact(unittest.TestCase):
         self.assertTrue(hasattr(image_redact, 'redact_scanned_pdf'))
         self.assertTrue(hasattr(image_redact, 'redact_image_pdf'))
 
+    def test_match_boxes_token_fallback(self):
+        """v5.1：同行多框重建的合并公司名——整串定位失败时按 token 兜底。"""
+        from image_redact import match_boxes_for
+        boxes = [
+            {'page': 0, 'text': '广东众燊汇新材料科技有限公司',
+             'x': 0.1, 'y': 0.1, 'w': 0.3, 'h': 0.05},
+            {'page': 0, 'text': '上海卓湘海智能科技有限公司',
+             'x': 0.4, 'y': 0.1, 'w': 0.3, 'h': 0.05},
+        ]
+        merged = '广东众燊汇新材料科技有限公司 上海卓湘海智能科技有限公司'
+        # 整串无法命中 → 按空白拆分，两个 token 各自命中 → 返回两个框
+        hits = match_boxes_for(merged, boxes)
+        self.assertEqual(hits, boxes)
+        # 整串命中优先于 token 拆分
+        self.assertEqual(match_boxes_for(boxes[0]['text'], boxes), [boxes[0]])
+        # 无法定位 → 空
+        self.assertEqual(match_boxes_for('不存在的名称', boxes), [])
+
+
+class TestLauncherRobustness(unittest.TestCase):
+    """v5.1：通过软链启动（SKILL 安装方式）也能正确定位模块与资源。"""
+
+    def test_symlink_launcher_runs_mask(self):
+        import tempfile
+        import os
+        import subprocess
+        import sys
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        tmp = tempfile.mkdtemp()
+        link = os.path.join(tmp, 'desensitize')
+        os.symlink(os.path.join(src_dir, 'desensitize.py'), link)
+        txt = os.path.join(tmp, 'in.txt')
+        with open(txt, 'w', encoding='utf-8') as f:
+            f.write('张三的电话是13800138000')
+        out = os.path.join(tmp, 'out.txt')
+        r = subprocess.run([sys.executable, link, 'mask', '-f', txt,
+                            '-o', out], capture_output=True, text=True,
+                           timeout=120, cwd=tmp)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        with open(out, encoding='utf-8') as f:
+            content = f.read()
+        self.assertIn('[手机号]', content)
+
+
+class TestReviewOriginalText(unittest.TestCase):
+    """v5.1：审阅清单的还原校验必须与"第一份原文"比对。
+
+    扫描件流程中 redact_* 会用第二份 OCR 文本在内部重跑规则层并覆盖
+    d._original_text；若审阅校验仍读 _original_text，会误报
+    "还原往返校验失败"（映射表/脱敏稿是第一份的结果）。
+    """
+
+    def test_review_roundtrip_uses_passed_original_text(self):
+        import argparse
+        import tempfile
+        import os
+        from desensitize import Desensitizer, _run_mask_file
+
+        class _FakeD(Desensitizer):
+            def mask(self, text):
+                # 模拟扫描件内部二次 OCR 覆盖 _original_text
+                r = super().mask(text)
+                self._original_text = '被内部二次 OCR 覆盖的文本'
+                return r
+
+        text = '张三的电话是13800138000，尾款500万元。'
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, 'in.txt')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(text)
+        out = os.path.join(tmp, 'out.txt')
+        args = argparse.Namespace(
+            file=src, output=out, save_mapping=None, encrypt_mapping=False,
+            review=True, table_aware=False, image_redact=False,
+            pdf_redact=False, json=False, mapping=False)
+        summary = _run_mask_file(args, _FakeD(), None, text, audit=None)
+        with open(summary['review'], encoding='utf-8') as f:
+            review = f.read()
+        self.assertIn('✅ 还原往返校验', review)
+        self.assertNotIn('❌ 还原往返校验失败', review)
+
 
 class TestBatchMode(unittest.TestCase):
     """v4.0：批量模式（--batch）+ 断点续跑 + 批量报告 + 原件校验 + 临时清理。"""

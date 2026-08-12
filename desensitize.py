@@ -31,6 +31,15 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
 
+# 支持通过软链启动（SKILL 安装方式：ln -s …/desensitize.py ~/.local/bin/desensitize）：
+# 直接执行软链时 __file__ 指向软链路径、sys.path[0] 指向软链所在目录，必须用
+# realpath 定位真实脚本目录并加入 sys.path，否则本地模块（image_redact/pdf_redact
+# 等）与资源文件（ocr_vision.swift 等）会找不到。
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+
 # ============================================================
 # 数据模型
 # ============================================================
@@ -3141,9 +3150,11 @@ def _iter_xlsx_lines(filepath: str):
 # v3.7：扫描件 PDF / v3.8：图片文件 内置 OCR（macOS Vision 框架，无需安装任何工具）
 # ocr_vision.swift 位于本工具目录，编译成二进制后批量识别页面图片。
 # Windows/Linux 无 Vision 框架 → 返回 None，调用方回退"明确报错+OCR指引"。
-_OCR_SWIFT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          'ocr_vision.swift')
+_OCR_SWIFT = os.path.join(_SCRIPT_DIR, 'ocr_vision.swift')
 _OCR_BIN = os.path.join(tempfile.gettempdir(), 'legal_deid_ocr_vision')
+# v5.1：重编译失败时回退查找的常见缓存位置（换 TMPDIR / 软链环境后，
+# 之前编译好的二进制可能只存在于 /tmp 或 /private/tmp）。
+_OCR_BIN_FALLBACK_DIRS = ('/tmp', '/private/tmp')
 
 
 def _ensure_ocr_bin() -> bool:
@@ -3157,19 +3168,45 @@ def _ensure_ocr_bin() -> bool:
     - 源码比二进制新（或二进制缺失）时自动重新编译；
     - 编译后运行 --selftest 校验二进制确实能输出识别文本，
       不合格则删除并视为不可用。
+
+    v5.1（软链 / Swift 工具链不匹配修复）：
+    - 脚本经软链启动时也能正确定位 ocr_vision.swift（realpath）；
+    - Swift 编译器与 SDK 版本不匹配导致重编译失败时不再直接放弃：
+      先回退沿用本机已有缓存二进制（过自检即用），再到 /tmp、/private/tmp
+      等常见位置寻找可用二进制并复制到当前 TMPDIR，避免"重编译失败=OCR 全废"。
     """
     if sys.platform != 'darwin':
         return False
     if not os.path.exists(_OCR_SWIFT):
         return False
-    if os.path.exists(_OCR_BIN):
-        # 源码更新 → 重新编译
-        if os.path.getmtime(_OCR_BIN) >= os.path.getmtime(_OCR_SWIFT):
-            return _ocr_bin_selftest()
-        try:
-            os.remove(_OCR_BIN)
-        except OSError:
-            pass
+    if os.path.exists(_OCR_BIN) \
+            and os.path.getmtime(_OCR_BIN) >= os.path.getmtime(_OCR_SWIFT):
+        if _ocr_bin_selftest(_OCR_BIN):
+            return True
+    # 源码更新或缓存缺失/自检失败 → 尝试重编译
+    if _try_compile_ocr_bin():
+        return True
+    # 重编译失败（如 Swift 工具链与 SDK 版本不匹配）→ 回退已有缓存二进制
+    if os.path.exists(_OCR_BIN) and _ocr_bin_selftest(_OCR_BIN):
+        _warn_ocr_fallback('重编译失败，沿用本机已有 Vision OCR 二进制')
+        return True
+    # 回退常见缓存位置（换 TMPDIR / 软链环境后缓存可能只在 /tmp）
+    for d in _OCR_BIN_FALLBACK_DIRS:
+        alt = os.path.join(d, os.path.basename(_OCR_BIN))
+        if os.path.exists(alt) and _ocr_bin_selftest(alt):
+            try:
+                import shutil
+                shutil.copy2(alt, _OCR_BIN)
+                _warn_ocr_fallback(
+                    f'重编译失败，已复用 {d} 中可用的 Vision OCR 二进制')
+                return True
+            except OSError:
+                return False
+    return False
+
+
+def _try_compile_ocr_bin() -> bool:
+    """重新编译 ocr_vision.swift 到 _OCR_BIN，编译成功且过自检才返回 True。"""
     import subprocess
     module_cache = os.path.join(tempfile.gettempdir(), 'legal_deid_swift_cache')
     os.makedirs(module_cache, exist_ok=True)
@@ -3183,35 +3220,37 @@ def _ensure_ocr_bin() -> bool:
         return False
     if ret.returncode != 0:
         return False
-    if not _ocr_bin_selftest():
-        try:
-            os.remove(_OCR_BIN)
-        except OSError:
-            pass
-        return False
-    return True
+    return _ocr_bin_selftest(_OCR_BIN)
 
 
-def _ocr_bin_selftest() -> bool:
+def _ocr_bin_selftest(bin_path: str = None) -> bool:
     """运行 ocr_vision 对一张自检图 OCR，确认二进制能输出识别文本。
 
     优先用 PIL + 系统字体绘制 "ABC 123"，要求 OCR 结果包含 "123"；
     PIL 或字体不可用时退化为"进程正常退出"的冒烟检查
     （此时由调用方在真实文档上做最终兜底校验）。
     """
+    if bin_path is None:
+        bin_path = _OCR_BIN
     import subprocess
     try:
         png_path = os.path.join(tempfile.gettempdir(), 'legal_deid_ocr_selftest.png')
         if not _write_ocr_selftest_png(png_path):
             # 无 PIL/字体 → 仅冒烟检查
-            r = subprocess.run([_OCR_BIN, '--help'],
+            r = subprocess.run([bin_path, '--help'],
                                capture_output=True, text=True, timeout=30)
             return r.returncode == 0
-        r = subprocess.run([_OCR_BIN, png_path],
+        r = subprocess.run([bin_path, png_path],
                            capture_output=True, text=True, timeout=60)
         return r.returncode == 0 and '123' in (r.stdout or '')
     except Exception:
         return False
+
+
+def _warn_ocr_fallback(reason: str) -> None:
+    """OCR 缓存回退时输出一次提示（stderr），避免静默降级。"""
+    print(f'⚠️  {reason}；如需彻底修复，请更新 Xcode Command Line Tools'
+          '（xcode-select --install 或软件更新）', file=sys.stderr)
 
 
 def _write_ocr_selftest_png(path: str) -> None:
@@ -5025,7 +5064,7 @@ def _run_mask_file(args, d, ner, text, audit=None) -> dict:
         review_text = build_review_text(
             result.text, result.stats,
             mapping=result.mapping,
-            original_text=getattr(d, '_original_text', None))
+            original_text=text)
         if output_path:
             base, ext = os.path.splitext(output_path)
             review_path = f'{base}_审阅.txt'

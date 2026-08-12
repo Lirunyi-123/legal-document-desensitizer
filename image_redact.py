@@ -18,10 +18,14 @@ import subprocess
 import sys
 import tempfile
 
-_OCR_BOXES_SWIFT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                'ocr_vision_boxes.swift')
+# realpath：desensitize.py 经软链启动时 image_redact 由 sys.path 引导后加载，
+# 用 realpath 保证资源文件定位不受软链/相对路径影响。
+_IMAGE_REDACT_DIR = os.path.dirname(os.path.realpath(__file__))
+_OCR_BOXES_SWIFT = os.path.join(_IMAGE_REDACT_DIR, 'ocr_vision_boxes.swift')
 _OCR_BOXES_BIN = os.path.join(tempfile.gettempdir(),
                               'legal_deid_ocr_vision_boxes')
+# v5.1：重编译失败时回退查找的常见缓存位置。
+_OCR_BOXES_BIN_FALLBACK_DIRS = ('/tmp', '/private/tmp')
 
 
 class ImageRedactError(Exception):
@@ -29,19 +33,112 @@ class ImageRedactError(Exception):
 
 
 def _ensure_ocr_boxes_bin() -> bool:
+    """确保 ocr_vision_boxes.swift 已编译为带坐标 OCR 二进制。
+
+    v5.1：与文本 OCR 一致的稳健策略——源码更新时重编译并自检；重编译失败
+    （Swift 编译器与 SDK 版本不匹配等）回退已有缓存二进制，再到 /tmp、
+    /private/tmp 等常见位置寻找可用二进制复制到当前 TMPDIR。
+    """
     if sys.platform != 'darwin':
         return False
     if not os.path.exists(_OCR_BOXES_SWIFT):
         return False
-    if os.path.exists(_OCR_BOXES_BIN):
+    if os.path.exists(_OCR_BOXES_BIN) \
+            and os.path.getmtime(_OCR_BOXES_BIN) >= os.path.getmtime(_OCR_BOXES_SWIFT):
+        if _ocr_boxes_bin_selftest(_OCR_BOXES_BIN):
+            return True
+    if _try_compile_ocr_boxes_bin():
         return True
+    if os.path.exists(_OCR_BOXES_BIN) and _ocr_boxes_bin_selftest(_OCR_BOXES_BIN):
+        _warn_ocr_boxes_fallback('重编译失败，沿用本机已有带坐标 OCR 二进制')
+        return True
+    for d in _OCR_BOXES_BIN_FALLBACK_DIRS:
+        alt = os.path.join(d, os.path.basename(_OCR_BOXES_BIN))
+        if os.path.exists(alt) and _ocr_boxes_bin_selftest(alt):
+            try:
+                import shutil
+                shutil.copy2(alt, _OCR_BOXES_BIN)
+                _warn_ocr_boxes_fallback(
+                    f'重编译失败，已复用 {d} 中可用的带坐标 OCR 二进制')
+                return True
+            except OSError:
+                return False
+    return False
+
+
+def _try_compile_ocr_boxes_bin() -> bool:
+    """重新编译 ocr_vision_boxes.swift，编译成功且过自检才返回 True。"""
+    import subprocess
+    module_cache = os.path.join(tempfile.gettempdir(),
+                                'legal_deid_swift_cache_boxes')
+    os.makedirs(module_cache, exist_ok=True)
+    env = dict(os.environ)
+    env['CLANG_MODULE_CACHE_PATH'] = module_cache
     try:
         ret = subprocess.run(['swiftc', '-O', '-o', _OCR_BOXES_BIN,
                               _OCR_BOXES_SWIFT],
-                             capture_output=True, timeout=180)
+                             capture_output=True, timeout=180, env=env)
     except Exception:
         return False
-    return ret.returncode == 0
+    return ret.returncode == 0 and _ocr_boxes_bin_selftest(_OCR_BOXES_BIN)
+
+
+def _write_ocr_selftest_png(path: str) -> bool:
+    """用 PIL + 系统字体绘制 'ABC 123' 并写成 PNG；成功返回 True。"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return False
+    font_path = None
+    for candidate in (
+        '/System/Library/Fonts/Supplemental/Arial.ttf',
+        '/System/Library/Fonts/Helvetica.ttc',
+        '/System/Library/Fonts/PingFang.ttc',
+        '/Library/Fonts/Arial Unicode.ttf',
+    ):
+        if os.path.exists(candidate):
+            font_path = candidate
+            break
+    if not font_path:
+        return False
+    try:
+        img = Image.new('RGB', (720, 180), 'white')
+        d = ImageDraw.Draw(img)
+        font = ImageFont.truetype(font_path, 90)
+        d.text((40, 40), 'ABC 123', fill='black', font=font)
+        img.save(path)
+        return True
+    except Exception:
+        return False
+
+
+def _ocr_boxes_bin_selftest(bin_path: str = None) -> bool:
+    """运行带坐标 OCR 对自检图识别，校验能输出含 '123' 的 JSON 框。"""
+    if bin_path is None:
+        bin_path = _OCR_BOXES_BIN
+    import subprocess
+    try:
+        png_path = os.path.join(tempfile.gettempdir(),
+                                'legal_deid_ocr_boxes_selftest.png')
+        if not _write_ocr_selftest_png(png_path):
+            # 无 PIL/字体 → 仅冒烟检查
+            r = subprocess.run([bin_path, '--help'],
+                               capture_output=True, text=True, timeout=30)
+            return r.returncode == 0
+        r = subprocess.run([bin_path, png_path],
+                           capture_output=True, timeout=60)
+        if r.returncode != 0:
+            return False
+        items = json.loads(r.stdout.decode('utf-8', errors='replace'))
+        return any('123' in (b.get('text') or '') for b in items)
+    except Exception:
+        return False
+
+
+def _warn_ocr_boxes_fallback(reason: str) -> None:
+    """带坐标 OCR 缓存回退时输出一次提示（stderr），避免静默降级。"""
+    print(f'⚠️  {reason}；如需彻底修复，请更新 Xcode Command Line Tools'
+          '（xcode-select --install 或软件更新）', file=sys.stderr)
 
 
 def _ocr_boxes(image_paths) -> list:
@@ -108,6 +205,32 @@ def _ocr_boxes_text(image_paths) -> str:
     return '\n'.join(parts)
 
 
+def match_boxes_for(orig: str, boxes) -> list:
+    """返回覆盖 orig 的 OCR 框。
+
+    整串命中优先（含 OCR 空格容忍）；若整串无法命中但按空白拆分后的
+    每个 token 都能各自命中（OCR 同行多框重建时公司名可能被拼成
+    "A公司 B公司" 一个串），按 token 兜底，宁多勿漏。
+    """
+    hits = []
+    for b in boxes:
+        if orig in b['text'] or b['text'].replace(' ', '') == orig.replace(' ', ''):
+            hits.append(b)
+    if hits:
+        return hits
+    tokens = [t for t in orig.split() if len(t) >= 2]
+    if len(tokens) >= 2:
+        token_hits = []
+        for t in tokens:
+            for b in boxes:
+                if t in b['text'] or b['text'].replace(' ', '') == t.replace(' ', ''):
+                    token_hits.append(b)
+                    break
+        if len(token_hits) == len(tokens):
+            return token_hits
+    return []
+
+
 def _redact_pages(pages, pairs, output_path, desensitizer=None):
     """对多页图片执行涂黑脱敏（公共核心）。
 
@@ -164,20 +287,19 @@ def _redact_pages(pages, pairs, output_path, desensitizer=None):
         for ph, orig in items:
             if not orig:
                 continue
-            for b in boxes:
-                if orig in b['text'] or b['text'].replace(' ', '') == orig.replace(' ', ''):
-                    pid = b.get('page', 0)
-                    if pid >= len(pages):
-                        continue
-                    pw, phh = pages[pid]['width'], pages[pid]['height']
-                    rect = to_page_rect(b, pw, phh)
-                    # v3.10：超宽矩形防护——OCR 可能把整段页脚并成一个超长框，
-                    # 画它会产生几乎整页宽的黑块；超过页面 50% 宽度视为异常跳过
-                    if rect.width > pw * 0.5:
-                        continue
-                    rect = fitz.Rect(rect.x0 - 2, rect.y0 - 2,
-                                     rect.x1 + 2, rect.y1 + 2)
-                    rects_by_page.setdefault(pid, []).append(rect)
+            for b in match_boxes_for(orig, boxes):
+                pid = b.get('page', 0)
+                if pid >= len(pages):
+                    continue
+                pw, phh = pages[pid]['width'], pages[pid]['height']
+                rect = to_page_rect(b, pw, phh)
+                # v3.10：超宽矩形防护——OCR 可能把整段页脚并成一个超长框，
+                # 画它会产生几乎整页宽的黑块；超过页面 50% 宽度视为异常跳过
+                if rect.width > pw * 0.5:
+                    continue
+                rect = fitz.Rect(rect.x0 - 2, rect.y0 - 2,
+                                 rect.x1 + 2, rect.y1 + 2)
+                rects_by_page.setdefault(pid, []).append(rect)
         # 第二步：逐页创建页面 → 插入渲染图 → Shape 画全部矩形
         page_objs = []
         for idx, p in enumerate(pages):
@@ -201,10 +323,7 @@ def _redact_pages(pages, pairs, output_path, desensitizer=None):
     # 统计（基于 rects_by_page）
     by_placeholder = {}
     occurrences = sum(len(v) for v in rects_by_page.values())
-    not_found = [o for _, o in items
-                 if not any(o in b['text']
-                            or b['text'].replace(' ', '') == o.replace(' ', '')
-                            for b in boxes)]
+    not_found = [o for _, o in items if not match_boxes_for(o, boxes)]
 
     if occurrences == 0:
         doc.close()

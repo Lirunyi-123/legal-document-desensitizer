@@ -1747,6 +1747,63 @@ class TestReviewOriginalText(unittest.TestCase):
         self.assertNotIn('❌ 还原往返校验失败', review)
 
 
+class TestPrivacyDefaults(unittest.TestCase):
+    """v5.2：默认不在终端/对话暴露敏感原值与映射表密码。"""
+
+    def test_warning_detail_hides_raw_values_by_default(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stdout
+        from desensitize import _print_warning_detail
+        tmp = tempfile.mkdtemp()
+        sidecar = os.path.join(tmp, '警告明细.txt')
+        values = ['广东众燊汇新材料科技有限公司 上海卓湘海智能科技有限公司',
+                  '某敏感地址']
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_warning_detail('未定位', values, raw=False,
+                                  sidecar_path=sidecar)
+        out = buf.getvalue()
+        self.assertIn('共 2 个', out)
+        self.assertNotIn('广东众燊汇', out)
+        self.assertNotIn('某敏感地址', out)
+        with open(sidecar, encoding='utf-8') as f:
+            detail = f.read()
+        self.assertIn('广东众燊汇', detail)
+        # raw=True（--show-raw-warnings）时才把原值打印到终端
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            _print_warning_detail('未定位', values, raw=True)
+        self.assertIn('广东众燊汇', buf2.getvalue())
+
+    def test_mapping_password_file_not_printed(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stdout
+        from desensitize import _get_mapping_password
+        old = os.environ.pop('DESENSITIZER_MAPPING_PASSWORD', None)
+        try:
+            tmp = tempfile.mkdtemp()
+            pw_file = os.path.join(tmp, 'map.enc.password.txt')
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                pw = _get_mapping_password(password_file=pw_file)
+            self.assertEqual(len(pw), 24)  # secrets.token_hex(12)
+            self.assertNotIn(pw, buf.getvalue())  # 密码绝不打印
+            self.assertIn(pw_file, buf.getvalue())
+            with open(pw_file, encoding='utf-8') as f:
+                self.assertEqual(f.read().strip(), pw)
+            self.assertEqual(os.stat(pw_file).st_mode & 0o777, 0o600)
+            # 再次调用复用同一密码（幂等，重跑不换密码）
+            pw2 = _get_mapping_password(password_file=pw_file)
+            self.assertEqual(pw, pw2)
+        finally:
+            if old is not None:
+                os.environ['DESENSITIZER_MAPPING_PASSWORD'] = old
+
+
 class TestBatchMode(unittest.TestCase):
     """v4.0：批量模式（--batch）+ 断点续跑 + 批量报告 + 原件校验 + 临时清理。"""
 

@@ -2912,14 +2912,54 @@ def make_llm_prompt(rule_masked_text: str) -> str:
 # 零信任映射表加密（AES-256-GCM + PBKDF2）
 # ============================================================
 
-def _get_mapping_password() -> str:
-    """获取映射表加密密码。优先级：环境变量 > 交互式输入。
+def _write_private_file(path: str, content: str) -> None:
+    """以 0600 权限追加写入本地文件。
 
-    环境变量：DESENSITIZER_MAPPING_PASSWORD
+    v5.2：密码、警告明细等敏感内容只落盘、不进终端/对话。
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        with os.fdopen(fd, 'a', encoding='utf-8') as f:
+            f.write(content)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _get_mapping_password(password_file: str = None) -> str:
+    """获取映射表加密密码。优先级：环境变量 > 密码文件 > 交互式输入。
+
+    环境变量：DESENSITIZER_MAPPING_PASSWORD（推荐用于自动化）
+    密码文件（v5.2）：非交互环境自动生成随机密码并写入本地 0600 文件，
+      密码本身绝不打印到终端，仅提示文件路径——避免密码进入终端/对话。
     交互式输入：使用 getpass（不回显）
     """
     password = os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '')
     if password:
+        return password
+
+    if password_file:
+        try:
+            with open(password_file, 'r', encoding='utf-8') as f:
+                saved = f.read().strip()
+            if saved:
+                return saved
+        except OSError:
+            pass
+        password = secrets.token_hex(12)
+        try:
+            _write_private_file(password_file, password + '\n')
+        except OSError as e:
+            sys.exit(f'❌ 无法写入密码文件 {password_file}: {e}')
+        print(f'🔑 映射表密码已生成并保存到本地文件'
+              f'（请妥善保管，勿上传；不打印到终端）: {password_file}')
         return password
 
     # 交互式输入
@@ -2936,7 +2976,8 @@ def _get_mapping_password() -> str:
         sys.exit(f'❌ 无法读取密码（请设置环境变量 DESENSITIZER_MAPPING_PASSWORD）：{e}')
 
 
-def save_mapping_encrypted(mapping_content: str, filepath: str) -> bytes:
+def save_mapping_encrypted(mapping_content: str, filepath: str,
+                           password_file: str = None) -> bytes:
     """使用 AES-256-GCM + PBKDF2 加密映射表。
 
     加密方案：
@@ -2946,6 +2987,7 @@ def save_mapping_encrypted(mapping_content: str, filepath: str) -> bytes:
 
     密码来源：
     - 环境变量 DESENSITIZER_MAPPING_PASSWORD（推荐用于自动化）
+    - 本地密码文件（v5.2，--mapping-password-file / 非交互默认生成）
     - 或交互式 getpass 输入（不 echo）
     """
     try:
@@ -2955,7 +2997,7 @@ def save_mapping_encrypted(mapping_content: str, filepath: str) -> bytes:
     except ImportError:
         sys.exit('❌ 需要安装 cryptography: pip3 install cryptography')
 
-    password = _get_mapping_password()
+    password = _get_mapping_password(password_file)
 
     # 生成随机盐和随机 nonce
     salt = os.urandom(32)
@@ -4803,6 +4845,61 @@ def _make_ner(args):
     return ner
 
 
+def _print_warning_detail(label: str, values, raw: bool,
+                          sidecar_path: str = None) -> None:
+    """打印"未定位/未涂黑"等敏感值警告。
+
+    v5.2 隐私默认：只输出数量，原值写入本地 0600 明细文件，避免敏感原值
+    出现在终端/对话（AI 代跑时可见即等于进对话）；raw=True
+    （--show-raw-warnings）时才把原值打印到终端，供用户本人终端使用。
+    """
+    unique = sorted({str(v) for v in values if v})
+    if not unique:
+        return
+    if raw:
+        print(f'⚠️  {label}：{unique[:8]}')
+        return
+    print(f'⚠️  {label}：共 {len(unique)} 个'
+          '（原值不打印，避免进入终端/对话；明细已写入本地文件）')
+    if sidecar_path:
+        try:
+            _write_private_file(sidecar_path,
+                                f'【{label}】\n' + '\n'.join(unique) + '\n')
+            print(f'   📄 明细已保存（本地，勿上传）: {sidecar_path}')
+        except OSError as e:
+            print(f'   ⚠️  明细写入失败：{e}', file=sys.stderr)
+
+
+def _resolve_mapping_decrypt_password(args, mapping_path: str) -> str:
+    """解析映射表解密密码：-p/--password > 环境变量 > --password-file >
+    默认密码文件（映射表.password.txt）> 交互式 getpass。"""
+    p = getattr(args, 'password', None)
+    if p:
+        return p
+    env = os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '')
+    if env:
+        return env
+    candidates = []
+    pf = getattr(args, 'password_file', None)
+    if pf:
+        candidates.append(pf)
+    if mapping_path:
+        candidates.append(mapping_path + '.password.txt')
+    for c in candidates:
+        try:
+            with open(c, 'r', encoding='utf-8') as f:
+                pw = f.read().strip()
+            if pw:
+                return pw
+        except OSError:
+            continue
+    import getpass
+    password = getpass.getpass('🔑 请输入映射表解密密码（不显示）：')
+    if not password:
+        sys.exit('❌ 密码不能为空')
+    return password
+
+
 def _run_mask_file(args, d, ner, text, audit=None) -> dict:
     """单文件 mask 全流程：规则层（可选列感知/NER）→ 映射表 → 输出 → 审阅清单。
 
@@ -4850,15 +4947,26 @@ def _run_mask_file(args, d, ner, text, audit=None) -> dict:
 
         if hasattr(args, 'encrypt_mapping') and args.encrypt_mapping:
             # AES-256-GCM + PBKDF2 加密保存（v2.1 零信任方案）
+            # v5.2：非交互环境自动把随机密码写入本地 0600 文件，绝不打印到终端
+            password_file = getattr(args, 'mapping_password_file', None)
+            if not password_file \
+                    and not os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '') \
+                    and not sys.stdin.isatty():
+                password_file = mapping_path + '.password.txt'
             try:
-                save_mapping_encrypted(mapping_content, mapping_path)
+                save_mapping_encrypted(mapping_content, mapping_path,
+                                       password_file=password_file)
             except ImportError:
                 sys.exit('❌ 需要安装 cryptography: pip3 install cryptography')
             print(f'🔐 映射表已 AES-256-GCM 加密保存: {mapping_path}')
             if audit is not None:
                 audit['mapping'] = {'path': mapping_path, 'encrypted': True}
-            print(f'🔑 解密时需要输入相同的密码')
-            print(f'   💡 设置环境变量 DESENSITIZER_MAPPING_PASSWORD 可跳过交互式输入')
+            if password_file:
+                print(f'🔑 映射表密码已保存在本地文件'
+                      f'（请妥善保管，勿上传）: {password_file}')
+            else:
+                print(f'🔑 解密时需要输入相同的密码')
+                print(f'   💡 设置环境变量 DESENSITIZER_MAPPING_PASSWORD 可跳过交互式输入')
         else:
             # 明文保存（默认行为，发出警告）
             with open(mapping_path, 'w', encoding='utf-8') as f:
@@ -4961,13 +5069,15 @@ def _run_mask_file(args, d, ner, text, audit=None) -> dict:
                         and in_pages != out_pages:
                     print(f'⚠️  页数核对：输入 {in_pages} 页 → 输出 {out_pages} 页'
                           '（不一致，请检查！）')
-            if report['skipped']:
-                print(f'⚠️  跳过 {len(report["skipped"])} 个过短值'
-                      f'（<2 个汉字/字母数字，全文搜索会误涂），仍留在原样：'
-                      f'{sorted(set(report["skipped"]))[:8]}')
-            if report['not_found']:
-                print(f'⚠️  以下占位符在 PDF 文本层未找到任何出现'
-                      f'（可能在图片/扫描层）：{sorted(set(report["not_found"]))[:8]}')
+            if report['skipped'] or report['not_found']:
+                _raw = bool(getattr(args, 'show_raw_warnings', False))
+                _sidecar = os.path.splitext(output_path)[0] + '_警告明细.txt'
+                _print_warning_detail(
+                    '以下过短值未涂黑（<2 个汉字/字母数字，全文搜索会误涂）',
+                    report['skipped'], _raw, _sidecar)
+                _print_warning_detail(
+                    '以下占位符在 PDF 文本层未找到任何出现（可能在图片/扫描层）',
+                    report['not_found'], _raw, _sidecar)
             print('✅ residual 零残留校验通过（输出中已读不到任何原文）')
             # v4.1：涂黑 PDF 文本层重排后与掩码文本不一致（占位符折行/漏字），
             # 阶段二（semantic）与还原校验需要精确文本 → 额外落一份掩码文本侧车
@@ -5015,13 +5125,15 @@ def _run_mask_file(args, d, ner, text, audit=None) -> dict:
                         and in_pages != out_pages:
                     print(f'⚠️  页数核对：输入 {in_pages} 页 → 输出 {out_pages} 页'
                           '（不一致，请检查！）')
-            if report['not_found']:
-                print(f'⚠️  以下敏感值在图片中未定位到坐标'
-                      f'（OCR 未识别或错字）：{sorted(set(report["not_found"]))[:8]}')
-            if report.get('ocr_leak'):
-                print(f'⚠️  OCR 复查对 {len(set(report["ocr_leak"]))} 个值有'
-                      f'补全猜测（像素已确认涂黑，仅提示，人工可忽略）：'
-                      f'{sorted(set(report["ocr_leak"]))[:6]}')
+            if report['not_found'] or report.get('ocr_leak'):
+                _raw = bool(getattr(args, 'show_raw_warnings', False))
+                _sidecar = os.path.splitext(output_path)[0] + '_警告明细.txt'
+                _print_warning_detail(
+                    '以下敏感值在图片中未定位到坐标（OCR 未识别或错字）',
+                    report['not_found'], _raw, _sidecar)
+                _print_warning_detail(
+                    'OCR 复查对以下值有补全猜测（像素已确认涂黑，仅提示）',
+                    report.get('ocr_leak') or [], _raw, _sidecar)
             print('✅ residual 校验通过（涂黑矩形像素全黑，原文已覆盖）')
             sidecar = os.path.splitext(output_path)[0] + '_掩码文本.txt'
             try:
@@ -5132,11 +5244,7 @@ def run_finalize(args) -> str:
         try:
             ext = os.path.splitext(mapping)[1].lower()
             if ext == '.enc':
-                password = (getattr(args, 'password', None)
-                            or os.environ.get('DESENSITIZER_MAPPING_PASSWORD', ''))
-                if not password:
-                    import getpass
-                    password = getpass.getpass('🔑 请输入映射表解密密码（不显示）：')
+                password = _resolve_mapping_decrypt_password(args, mapping)
                 content = decrypt_mapping_encrypted(mapping, password)
                 password = ''
             else:
@@ -5330,6 +5438,14 @@ def main():
                                   'macOS Vision 带坐标 OCR 定位敏感值 → 在原图对应'
                                   '区域涂黑 → 输出 PDF；带 residual 零残留校验。'
                                   '支持 .png/.jpg 等图片；-o 指定 .pdf 时自动启用')
+    mask_parser.add_argument('--show-raw-warnings', action='store_true', default=False,
+                             help='v5.2：把未定位/未涂黑的敏感原值打印到终端'
+                                  '（默认只打印数量，原值写本地 *_警告明细.txt，'
+                                  '避免原值进入终端/对话）')
+    mask_parser.add_argument('--mapping-password-file', default=None,
+                             help='v5.2：映射表加密密码自动生成并保存到该文件（0600），'
+                                  '不打印到终端；非交互环境未指定时默认存到'
+                                  ' 映射表.password.txt')
 
     # scan 命令
     scan_parser = subparsers.add_parser('scan', help='扫描敏感信息（不替换）')
@@ -5347,6 +5463,7 @@ def main():
     decrypt_parser.add_argument('-f', '--file', required=True, help='加密的映射表文件路径')
     decrypt_parser.add_argument('-k', '--key', help='Fernet 解密密钥（v2.0 旧格式兼容，不推荐）')
     decrypt_parser.add_argument('-p', '--password', help='AES-GCM 解密密码（v2.1+，优先使用。也可通过环境变量 DESENSITIZER_MAPPING_PASSWORD 设置）')
+    decrypt_parser.add_argument('--password-file', help='v5.2：从本地密码文件读取解密密码（不打印/不回显）')
     decrypt_parser.add_argument('-o', '--output', help='输出路径（默认输出到 stdout）')
 
     # restore 命令
@@ -5354,6 +5471,7 @@ def main():
     restore_parser.add_argument('-f', '--file', required=True, help='脱敏后的文件路径（.txt / .docx）')
     restore_parser.add_argument('-m', '--mapping', required=True, help='映射表文件（.md 表格 / .json / 加密 .enc）')
     restore_parser.add_argument('-p', '--password', help='加密映射表密码（也可用环境变量 DESENSITIZER_MAPPING_PASSWORD）')
+    restore_parser.add_argument('--password-file', help='v5.2：从本地密码文件读取解密密码（不打印/不回显）')
     restore_parser.add_argument('-o', '--output', help='还原后的输出路径（默认输出到 stdout）')
 
     # full 命令（规则层 + LLM 层）
@@ -5365,6 +5483,9 @@ def main():
     full_parser.add_argument('--save-mapping', help='合并映射表另存为文件（含 LLM 层条目）')
     full_parser.add_argument('--encrypt-mapping', action='store_true',
                              help='对映射表进行 AES-256 加密保存（需配合 --save-mapping）')
+    full_parser.add_argument('--mapping-password-file', default=None,
+                             help='v5.2：映射表加密密码自动生成并保存到该文件（0600），'
+                                  '不打印到终端')
     full_parser.add_argument('--secure', action='store_true', default=False,
                              help='启用内存安全增强模式')
     full_parser.add_argument('--all-dates', action='store_true', default=False,
@@ -5394,6 +5515,8 @@ def main():
                                  help='阶段一映射表（.md 表格 / .json / 加密 .enc）')
     semantic_parser.add_argument('-p', '--password',
                                  help='加密映射表密码（也可用环境变量 DESENSITIZER_MAPPING_PASSWORD）')
+    semantic_parser.add_argument('--password-file',
+                                 help='v5.2：从本地密码文件读取解密密码（不打印/不回显）')
     semantic_parser.add_argument('-o', '--output', help='输出文件路径（默认 原文件_语义层.ext）')
     semantic_parser.add_argument('--save-mapping', help='合并映射表另存为文件')
     semantic_parser.add_argument('--original', help='原始未脱敏文件路径，用于完整还原校验')
@@ -5412,6 +5535,8 @@ def main():
     finalize_parser.add_argument('-p', '--password',
                                  help='加密映射表密码（也可用环境变量 '
                                       'DESENSITIZER_MAPPING_PASSWORD）')
+    finalize_parser.add_argument('--password-file',
+                                 help='v5.2：从本地密码文件读取解密密码（不打印/不回显）')
     finalize_parser.add_argument('--audit', help='审计单 JSON（自动探测同目录 '
                                                  '*_审计单.json 时省略）')
     finalize_parser.add_argument('--original',
@@ -5552,12 +5677,7 @@ def main():
             print('⚠️  使用旧版 Fernet 格式解密成功。建议用 v2.1 的 AES-GCM 重新加密。', file=sys.stderr)
         else:
             # 新版 AES-GCM 解密
-            password = args.password or os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '')
-            if not password:
-                import getpass
-                password = getpass.getpass('🔑 请输入映射表解密密码（不显示）：')
-                if not password:
-                    sys.exit('❌ 密码不能为空')
+            password = _resolve_mapping_decrypt_password(args, args.file)
             decrypted = decrypt_mapping_encrypted(args.file, password).encode('utf-8')
             password = ''
 
@@ -5575,12 +5695,7 @@ def main():
         # 读取映射表：加密 .enc 需要解密，其余按文本解析
         ext = os.path.splitext(args.mapping)[1].lower()
         if ext == '.enc':
-            password = args.password or os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '')
-            if not password:
-                import getpass
-                password = getpass.getpass('🔑 请输入映射表解密密码（不显示）：')
-                if not password:
-                    sys.exit('❌ 密码不能为空')
+            password = _resolve_mapping_decrypt_password(args, args.mapping)
             content = decrypt_mapping_encrypted(args.mapping, password)
             password = ''
         else:
@@ -5627,11 +5742,19 @@ def main():
         if args.save_mapping:
             mapping_content = result.to_markdown()
             if args.encrypt_mapping:
+                password_file = getattr(args, 'mapping_password_file', None)
+                if not password_file \
+                        and not os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '') \
+                        and not sys.stdin.isatty():
+                    password_file = args.save_mapping + '.password.txt'
                 try:
-                    save_mapping_encrypted(mapping_content, args.save_mapping)
+                    save_mapping_encrypted(mapping_content, args.save_mapping,
+                                           password_file=password_file)
                 except ImportError:
                     sys.exit('❌ 需要安装 cryptography: pip3 install cryptography')
                 print(f'🔐 合并映射表已 AES-256-GCM 加密保存: {args.save_mapping}')
+                if password_file:
+                    print(f'🔑 密码已保存在本地文件（请妥善保管，勿上传）: {password_file}')
             else:
                 with open(args.save_mapping, 'w', encoding='utf-8') as f:
                     f.write(mapping_content)
@@ -5654,13 +5777,7 @@ def main():
         masked_text = read_text_from_file(args.file)
         ext = os.path.splitext(args.mapping)[1].lower()
         if ext == '.enc':
-            password = args.password or os.environ.get(
-                'DESENSITIZER_MAPPING_PASSWORD', '')
-            if not password:
-                import getpass
-                password = getpass.getpass('🔑 请输入映射表解密密码（不显示）：')
-                if not password:
-                    sys.exit('❌ 密码不能为空')
+            password = _resolve_mapping_decrypt_password(args, args.mapping)
             content = decrypt_mapping_encrypted(args.mapping, password)
             password = ''
         else:

@@ -2969,12 +2969,25 @@ def _write_private_file(path: str, content: str) -> None:
         pass
 
 
+def _default_key_dir() -> str:
+    """v5.3 默认密钥目录：~/.desensitizer/keys/（与密文分离存放）。"""
+    d = os.path.expanduser('~/.desensitizer/keys')
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
 def _get_mapping_password(password_file: str = None) -> str:
     """获取映射表加密密码。优先级：环境变量 > 密码文件 > 交互式输入。
 
     环境变量：DESENSITIZER_MAPPING_PASSWORD（推荐用于自动化）
-    密码文件（v5.2）：非交互环境自动生成随机密码并写入本地 0600 文件，
-      密码本身绝不打印到终端，仅提示文件路径——避免密码进入终端/对话。
+    密码文件（v5.2/v5.3）：
+      - 显式传 password_file 参数（--mapping-password-file）→ 使用用户指定路径；
+      - password_file 为 None 且非交互时，由调用方按 v5.3 默认推导到
+        ~/.desensitizer/keys/（与密文不同目录，本机失窃时密码不全在同盘同路径）；
+      - 密码本身绝不打印到终端，仅提示文件路径——避免密码进入终端/对话。
     交互式输入：使用 getpass（不回显）
     """
     password = os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '')
@@ -3023,7 +3036,8 @@ def save_mapping_encrypted(mapping_content: str, filepath: str,
 
     密码来源：
     - 环境变量 DESENSITIZER_MAPPING_PASSWORD（推荐用于自动化）
-    - 本地密码文件（v5.2，--mapping-password-file / 非交互默认生成）
+    - 本地密码文件（v5.2 --mapping-password-file 指定路径；
+      v5.3 起非交互自动生成默认写入 ~/.desensitizer/keys/，与密文分离存放）
     - 或交互式 getpass 输入（不 echo）
     """
     try:
@@ -3070,7 +3084,8 @@ def decrypt_mapping_encrypted(filepath: str, password: str) -> str:
 
     Args:
         filepath: 加密文件路径
-        password: 解密密码（明文字符串，使用后立即清零）
+        password: 解密密码（明文字符串，使用后尽力释放引用——
+                  Python 字符串不可变，无法真正清零，仅置空引用）
 
     Returns:
         解密后的映射表内容（字符串）
@@ -4473,7 +4488,7 @@ def _fresh_desensitizer(args, resolver=None) -> 'Desensitizer':
 
 
 def _is_local_endpoint(endpoint: str) -> bool:
-    """判断 LLM 端点是否为本机（--offline 严格模式白名单）。"""
+    """判断 LLM 端点是否为本机（本地白名单：localhost / 127.0.0.1 / ::1）。"""
     if not endpoint:
         return True
     try:
@@ -4482,25 +4497,57 @@ def _is_local_endpoint(endpoint: str) -> bool:
                         else 'http://' + endpoint).hostname or ''
     except Exception:
         return False
-    return host in ('localhost', '127.0.0.1', '::1', '[::1]')
+    # urlparse 对 'http://[::1]:11434' 返回的 hostname 已不含方括号（'::1'），
+    # 但裸 '[::1]:11434' 形式可能带括号，统一剥掉再比较
+    host = host.strip('[]').lower()
+    return host in ('localhost', '127.0.0.1', '::1')
 
 
-def _check_offline(args) -> None:
-    """v5.0 --offline 严格模式：只允许本机处理，非本机端点直接中止（Fail Closed）。"""
-    if not getattr(args, 'offline', False):
+def _check_endpoint_policy(args) -> None:
+    """v5.3 端点策略：本地为默认，远程端点需显式 --allow-remote-llm（Fail Closed）。
+
+    - --offline（v5.0 语义不变）：只允许本地 Ollama，禁一切云端 API 与非本机端点；
+    - 默认（v5.3 起）：非本机 LLM/NER 端点直接中止，须显式传 --allow-remote-llm
+      才放行——"默认只允许本地"由代码保证，不再只靠文档提醒。
+    """
+    allow_remote = bool(getattr(args, 'allow_remote_llm', False))
+    if getattr(args, 'offline', False):
+        if allow_remote:
+            sys.exit('❌ --offline 与 --allow-remote-llm 互斥：严格本地模式'
+                     '不允许任何远程端点')
+        if getattr(args, 'command', None) == 'full':
+            if getattr(args, 'llm_api', 'ollama') != 'ollama':
+                sys.exit('❌ --offline 严格模式：云端 API（非 ollama）被禁止，'
+                         '请使用本地 Ollama（数据不出本机）')
+            if not _is_local_endpoint(
+                    getattr(args, 'llm_endpoint', 'http://localhost:11434')):
+                sys.exit('❌ --offline 严格模式：LLM 端点不是本机地址，已中止')
+        if getattr(args, 'ner_backend', None) == 'llm':
+            ep = (getattr(args, 'ner_endpoint', None)
+                  or 'http://localhost:11434/api/generate')
+            if not _is_local_endpoint(ep):
+                sys.exit('❌ --offline 严格模式：NER LLM 端点不是本机地址，已中止')
         return
+
+    def _gate(kind: str, endpoint: str) -> None:
+        if _is_local_endpoint(endpoint) or allow_remote:
+            return
+        sys.exit(
+            f'❌ {kind}端点不是本机地址：{endpoint}\n'
+            '   v5.3 起默认仅允许本地端点（数据不出本机）。\n'
+            '   确需把（规则层处理后的）文本发送到该远程服务时，'
+            '请显式加 --allow-remote-llm。')
+
     if getattr(args, 'command', None) == 'full':
-        if getattr(args, 'llm_api', 'ollama') != 'ollama':
-            sys.exit('❌ --offline 严格模式：云端 API（非 ollama）被禁止，'
-                     '请使用本地 Ollama（数据不出本机）')
-        if not _is_local_endpoint(
-                getattr(args, 'llm_endpoint', 'http://localhost:11434')):
-            sys.exit('❌ --offline 严格模式：LLM 端点不是本机地址，已中止')
+        _gate('LLM', getattr(args, 'llm_endpoint', 'http://localhost:11434'))
     if getattr(args, 'ner_backend', None) == 'llm':
-        ep = (getattr(args, 'ner_endpoint', None)
+        _gate('NER LLM',
+              getattr(args, 'ner_endpoint', None)
               or 'http://localhost:11434/api/generate')
-        if not _is_local_endpoint(ep):
-            sys.exit('❌ --offline 严格模式：NER LLM 端点不是本机地址，已中止')
+
+
+# 兼容旧测试/外部调用：保留旧名
+_check_offline = _check_endpoint_policy
 
 
 def _pdf_page_count(path: str):
@@ -4566,6 +4613,9 @@ def _new_audit(args, input_path=None) -> dict:
         'tool_version': 'v5.0',
         'command': getattr(args, 'command', ''),
         'offline': bool(getattr(args, 'offline', False)),
+        'allow_remote_llm': bool(getattr(args, 'allow_remote_llm', False)),
+        'llm_endpoint': (getattr(args, 'llm_endpoint', None)
+                         or getattr(args, 'ner_endpoint', None)),
         'input': {'path': input_path, 'sha256': None, 'size': None,
                   'pages': None},
         'output': {'path': None, 'pages': None, 'page_match': None},
@@ -4748,6 +4798,8 @@ def run_batch(batch_dir: str, args, ner=None) -> int:
                    'started_at': cp.get('started_at', ''),
                    'finished_at': time.strftime('%Y-%m-%d %H:%M:%S'),
                    'offline': bool(getattr(args, 'offline', False)),
+                   'allow_remote_llm': bool(getattr(args, 'allow_remote_llm',
+                                                   False)),
                    'network_calls': [c for rec in batch_audit
                                      for c in rec.get('audit', {})
                                      .get('network_calls', [])],
@@ -4835,7 +4887,7 @@ def _print_warning_detail(label: str, values, raw: bool,
 
 def _resolve_mapping_decrypt_password(args, mapping_path: str) -> str:
     """解析映射表解密密码：-p/--password > 环境变量 > --password-file >
-    默认密码文件（映射表.password.txt）> 交互式 getpass。"""
+    v5.3 独立密钥目录 > v5.2 同目录密码文件（旧版兼容）> 交互式 getpass。"""
     p = getattr(args, 'password', None)
     if p:
         return p
@@ -4847,6 +4899,11 @@ def _resolve_mapping_decrypt_password(args, mapping_path: str) -> str:
     if pf:
         candidates.append(pf)
     if mapping_path:
+        # v5.3 独立密钥目录优先（与密文分离）
+        key_dir = _default_key_dir()
+        pw_name = os.path.basename(mapping_path) + '.password'
+        candidates.append(os.path.join(key_dir, pw_name))
+        # v5.2 兼容：同目录密码文件（已生成的旧文件仍能解密）
         candidates.append(mapping_path + '.password.txt')
     for c in candidates:
         try:
@@ -4910,12 +4967,14 @@ def _run_mask_file(args, d, ner, text, audit=None) -> dict:
 
         if hasattr(args, 'encrypt_mapping') and args.encrypt_mapping:
             # AES-256-GCM + PBKDF2 加密保存（v2.1 零信任方案）
-            # v5.2：非交互环境自动把随机密码写入本地 0600 文件，绝不打印到终端
+            # v5.3：非交互环境自动把随机密码写入独立密钥目录（与密文分离）
             password_file = getattr(args, 'mapping_password_file', None)
             if not password_file \
                     and not os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '') \
                     and not sys.stdin.isatty():
-                password_file = mapping_path + '.password.txt'
+                key_dir = _default_key_dir()
+                pw_name = os.path.basename(mapping_path) + '.password'
+                password_file = os.path.join(key_dir, pw_name)
             try:
                 save_mapping_encrypted(mapping_content, mapping_path,
                                        password_file=password_file)
@@ -5373,6 +5432,11 @@ def main():
     mask_parser.add_argument('--offline', action='store_true', default=False,
                              help='v5.0：严格本地模式（可验证本地）——只允许本机'
                                   '处理；LLM 端点非本机时直接中止（Fail Closed）')
+    mask_parser.add_argument('--allow-remote-llm', action='store_true',
+                             default=False,
+                             help='v5.3：显式放行非本机 LLM/NER 端点（默认 Fail Closed，'
+                                  '远程端点不加此开关直接中止）。加此开关即确认：'
+                                  '规则层处理后的文本将被发送到该远程服务')
     mask_parser.add_argument('--audit', action='store_true', default=False,
                              help='v5.0：生成审计单 JSON（输入/输出/映射表/hash/'
                                   'OCR与网络调用记录），供律师验证"本地是否真的本地"')
@@ -5423,7 +5487,8 @@ def main():
     mask_parser.add_argument('--mapping-password-file', default=None,
                              help='v5.2：映射表加密密码自动生成并保存到该文件（0600），'
                                   '不打印到终端；非交互环境未指定时默认存到'
-                                  ' 映射表.password.txt')
+                                  ' ~/.desensitizer/keys/（与密文分离，旧版同目录'
+                                  ' 映射表.password.txt 仍可解密）')
     mask_parser.add_argument('--pack', action='store_true', default=False,
                              help='v5.2：脱敏完成后自动把全部交付物装进一个文件夹'
                                   '（01_脱敏稿/02_映射表/03_审计单/04_审阅清单/'
@@ -5491,6 +5556,15 @@ def main():
     full_parser.add_argument('--offline', action='store_true', default=False,
                              help='v5.0：严格本地模式——仅允许本地 Ollama'
                                   '（端点须为本机），云端 API 直接中止')
+    full_parser.add_argument('--allow-remote-llm', action='store_true',
+                             default=False,
+                             help='v5.3：显式放行非本机 LLM 端点（默认 Fail Closed）。'
+                                  '加此开关即确认：规则层处理后的文本（人名/地址/'
+                                  '案情细节仍在）将被发送到该远程服务')
+    full_parser.add_argument('--no-restore-check', action='store_true',
+                             default=False,
+                             help='跳过输出前的还原往返校验（默认校验：restore 后'
+                                  '须与原文逐字节一致，不一致则中止不产出）')
 
     # semantic 命令（阶段二：语义层，默认本机执行；云端仅限脱敏稿）
     semantic_parser = subparsers.add_parser(
@@ -5534,7 +5608,7 @@ def main():
     args = parser.parse_args()
 
     is_batch = bool(getattr(args, 'batch', None))
-    _check_offline(args)
+    _check_endpoint_policy(args)
 
     # 读取输入（支持 .txt / .docx / .pdf / .xlsx / 图片；--batch 逐文件读取）
     if is_batch:
@@ -5741,6 +5815,20 @@ def main():
         for w in warnings:
             print(f'⚠️  {w}', file=sys.stderr)
 
+        # v5.3：还原往返校验（对齐 semantic 命令，默认执行）
+        if not getattr(args, 'no_restore_check', False):
+            try:
+                restored = restore_text(result.text, result.mapping)
+                if restored != text:
+                    print('❌ 还原往返校验失败：restore 后与原文不一致，'
+                          '已中止（不产出脱敏文档）。映射表可能有错位。',
+                          file=sys.stderr)
+                    sys.exit('❌ 还原往返校验失败')
+                print('✅ 还原往返校验：restore 后与原文逐字节一致')
+            except Exception as e:
+                print(f'⚠️  还原往返校验异常：{e}', file=sys.stderr)
+                sys.exit(f'❌ 还原往返校验异常：{e}')
+
         # 保存合并映射表
         if args.save_mapping:
             mapping_content = result.to_markdown()
@@ -5749,7 +5837,10 @@ def main():
                 if not password_file \
                         and not os.environ.get('DESENSITIZER_MAPPING_PASSWORD', '') \
                         and not sys.stdin.isatty():
-                    password_file = args.save_mapping + '.password.txt'
+                    # v5.3：自动生成密码放到独立密钥目录（与密文分离）
+                    key_dir = _default_key_dir()
+                    pw_name = os.path.basename(args.save_mapping) + '.password'
+                    password_file = os.path.join(key_dir, pw_name)
                 try:
                     save_mapping_encrypted(mapping_content, args.save_mapping,
                                            password_file=password_file)

@@ -1,8 +1,8 @@
 ---
-name: legal-document-desensitization
+name: legal-document-desensitizer
 description: 法律文书涉密脱敏工具 — 规则+本地NER+LLM混合引擎，对合同/协议/沟通记录/证据材料中的敏感信息进行语义替换脱敏，生成映射表并可一键还原、红队评测。
 runAs: subagent
-allowed-tools: bash, read_file, write_file, grep, ls, glob
+allowed-tools: Bash, Read, Write, Grep, Glob
 ---
 
 > **本地副本同步规则**：本文件由项目
@@ -32,6 +32,8 @@ allowed-tools: bash, read_file, write_file, grep, ls, glob
 desensitize scan -f 文书.docx
 desensitize mask -f 文书.docx --review --audit --encrypt-mapping
 desensitize mask -f 文书.docx --review --offline   # 严格本地（非本机端点直接中止）
+desensitize full -f 文书.docx --llm-api openai --llm-endpoint https://api.deepseek.com \
+  --allow-remote-llm   # v5.3：默认只允许本地端点；远程端点必须显式加此开关
 
 # 批量卷宗 + 跨文件身份归一
 desensitize mask --batch ./卷宗 --review --shared-entities --output-dir ./脱敏输出
@@ -46,6 +48,7 @@ desensitize mask -f 判决书.pdf --pdf-redact -o 判决书_redacted.pdf
 # 语义层 / 完整流水线
 desensitize semantic -f 脱敏稿.docx -m 映射表.md --original 原文.docx
 desensitize full -f 文书.docx --llm-api ollama --llm-model qwen2.5
+desensitize full -f 文书.docx --no-restore-check    # 跳过输出前还原往返校验
 
 # 一键交付包 / 律师签发材料包
 desensitize mask -f 文书.docx --review --audit --encrypt-mapping --pack
@@ -108,26 +111,10 @@ desensitize restore -f 判决书_desensitized.docx -m 映射表.enc -o 还原.do
    禁止把映射表内容贴进对话。
 3. 审阅清单中的"剩余低优先级信息"须由律师逐条确认后，才决定是否做语义层。
 
-## 推送到 GitHub（本机网络受限时的标准方式）
+## 开发与发布（git-push 等）
 
-本机 `git push` 直连 github.com:443 常被网络阻断，**统一改用 GitHub REST API
-推送**（api.github.com 可通过 curl 访问）：
-
-```bash
-# 1. 本地正常提交
-git add -A && git commit -m "feat: xxx"
-
-# 2. 用 API 推送（推荐加 --sync-local：推送后本地 main 与远程 SHA 完全一致）
-python3 git-push-api.py --sync-local
-
-# 3. 预览不推送
-python3 git-push-api.py -n
-```
-
-`git-push-api.py` 会把本地领先的提交通过 GitHub Git API 逐个重建到远程，
-blob 与本地 `git hash-object` 逐字节核对，并在 `--sync-local` 时把远程提交
-对象重建回本地（消息换行 × 时区偏移组合还原 SHA），保证本地与远程历史完全一致。
-Token 自动读取 `~/.config/gh/hosts.yml`（gh CLI）。
+> 代码提交、GitHub API 推送（`git-push-api.py`）、api-push、打包与发布相关
+> 流程见 [`docs/开发与发布.md`](docs/开发与发布.md)。
 
 ## 输入
 
@@ -217,7 +204,7 @@ python3 desensitize.py restore -f 银行流水_desensitized.xlsx -m 映射表.md
 | 银行卡号（带上下文） | `(账号\|账户\|卡号...)` + `\d{12,24}` | `[银行账号]` | 标签权威，无条件替换 |
 | 统一社会信用代码 | 带"信用代码"上下文：`[0-9A-Z]{18}`；无标签：`9[0-9A-Z]{17}`（9开头18位） | `[统一社会信用代码]` |
 | 律师执业证号 | `(执业证号\|执业许可证号\|律师执业证号\|律师执业证\|执业证)` + `[0-9A-Z]{17,18}` | `[律师执业证号]` | 优先于身份证号/信用代码，避免律所执业许可证被误判 |
-| 组织机构代码 | `[0-9A-Z]{8}-[0-9A-Z]`（8-1位老格式） | `[组织机构代码]` | 常见于旧合同与备案材料 |
+| 组织机构代码 | `[0-9A-Z]{8}-[0-9A-Z]`（8-1位老格式） | `[组织机构代码]` | 常见于旧合同与备案材料（已纳入规则层） |
 | 其他证件 | `护照/港澳通行证/台胞证/驾驶证/军官证/营业执照/税务登记号` + 号码 | `[护照号]` 等对应占位符 | 优先于身份证/微信号规则，避免"护照：E12345678"被当微信号 |
 
 #### 案件程序信息类
@@ -229,8 +216,6 @@ python3 desensitize.py restore -f 银行流水_desensitized.xlsx -m 映射表.md
 | 车牌号 | 中文省份简称 + 字母 + 5-6位字母数字（如粤B88888） | `[车牌号]` |
 | 金额 | 中文大写金额 / 带元美元等单位的金额 / 口语化 `X万` | `[金额]` |
 | 项目名称 | 专名 + `项目/小区/大厦/花园/公寓/家园/新村/广场/商城/一期/二期/三期/一标段/二标段/三标段/项目部` | `[项目名称]` | 避开"本项目/工程项目"等泛化词组；在公司名规则之后执行 |
-
-> 组织机构代码（8-1位格式）未纳入规则层，如需处理由 LLM 层识别。
 
 ### 第2层：LLM识别（规则层处理完后，对剩下的内容做语义识别）
 
@@ -563,6 +548,11 @@ python3 desensitize.py mask -f 合同.docx --security-level strict
 
 v2.1 采用 AES-256-GCM + PBKDF2 密码派生加密，**不再将密钥打印到终端**：
 
+**v5.3 密码文件新默认位置**：非交互环境自动生成的密码默认写入
+`~/.desensitizer/keys/<映射表文件名>.password`（目录 0700、文件 0600），
+与密文分离存放；仅显式传 `--mapping-password-file` 才用用户指定路径。
+旧版同目录 `映射表.enc.password.txt` 仍可解密（v5.2 兼容回退）。
+
 ```bash
 # 方式 1：环境变量（推荐用于自动化）
 export DESENSITIZER_MAPPING_PASSWORD="your-strong-password"
@@ -615,6 +605,15 @@ python3 desensitize.py decrypt -f 映射表.enc -p "your-strong-password"
 **核心提醒**：
 > **零上传模式（v4.2 默认）= 本地终端规则层（关键信息清零）→ 律师审阅 →
 > 本地 Ollama 语义层**；原文与映射表永远不进入 AI 对话。
+>
+> **v5.3 本地性默认 Fail-Closed**：`full` 命令与 `mask --ner-backend llm` 默认
+> 只允许本机端点（localhost / 127.0.0.1 / ::1），远程端点不加
+> `--allow-remote-llm` 直接中止；加开关后会把规则层处理后的文本发送到该端点，
+> 并在审计单中留痕（`allow_remote_llm` / `llm_endpoint`）。`--offline` 仍为
+> 最严格模式（禁一切非 ollama API + 禁非本机端点），与 `--allow-remote-llm` 互斥。
+>
+> **v5.3 `full` 自动还原往返校验**：写输出文件前用合并映射做
+> `restore_text == 原文` 校验，不一致则中止不产出；`--no-restore-check` 可跳过。
 >
 > 若确实需要云端 AI 帮忙做语义层，**只能上传脱敏稿 + 审阅清单**，并确认
 > 法院名/案情细节残留风险可接受；否则一律走本地 Ollama。

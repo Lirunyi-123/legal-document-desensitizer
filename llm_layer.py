@@ -166,7 +166,11 @@ def parse_full_response(response: str) -> Tuple[str, List[dict]]:
     masked_text = m_text.group(1).strip('\n')
 
     items = []
-    m_arr = re.search(r'\[\s*\{.*\}\s*\]', response, re.S)
+    # v5.3 修复：仅在 "### 补充映射表" 之后搜索 JSON 数组，
+    # 避免贪婪正则跨小节匹配"脱敏后文本"部分内的 [{...}] 形态
+    m_table = re.search(r'###\s*补充映射表\s*\n(.*)', response, re.S)
+    table_tail = m_table.group(1) if m_table else ''
+    m_arr = re.search(r'\[\s*\{.*\}\s*\]', table_tail, re.S)
     if m_arr:
         try:
             raw = json.loads(m_arr.group(0))
@@ -232,7 +236,11 @@ def validate_llm_output(rule_masked_text: str, llm_masked_text: str,
 
 def reorder_merged_mapping(mappings: List[Mapping],
                            original_text: str) -> List[Mapping]:
-    """按原文首次出现顺序重新编号（分组内），保证 restore 按顺序配对。"""
+    """按原文出现顺序重新编号（分组内），保证 restore 按顺序配对。
+
+    v5.3 修复：同一原始值多次出现时，逐次推进扫描取第 n 次出现位置，
+    避免 find() 只取首次位置导致排序退化。
+    """
     groups = {}
     for m in mappings:
         groups.setdefault(m.replacement, []).append(m)
@@ -240,10 +248,35 @@ def reorder_merged_mapping(mappings: List[Mapping],
     result = []
     for group in groups.values():
         positioned = []
+        consumed = {}  # original → 已消费的出现次数
         for m in group:
-            pos = original_text.find(m.original)
-            if pos == -1 and m.original != m.original.replace(' ', ''):
-                pos = original_text.find(m.original.replace(' ', ''))
+            orig = m.original
+            n = consumed.get(orig, 0)
+            pos = -1
+            # 逐次推进：从上一次找到的位置之后继续搜索
+            start = 0
+            for _ in range(n + 1):
+                pos = original_text.find(orig, start)
+                if pos == -1:
+                    break
+                start = pos + len(orig)
+            # 空格容忍（首尾空格变体）
+            if pos == -1 and orig != orig.replace(' ', ''):
+                stripped = orig.replace(' ', '')
+                n2 = consumed.get(stripped, 0)
+                start = 0
+                for _ in range(n2 + 1):
+                    pos = original_text.find(stripped, start)
+                    if pos == -1:
+                        break
+                    start = pos + len(stripped)
+                    n2 += 1
+                # 实际命中的是空格变体时，按变体推进（避免与未命中 orig 的计数混用）
+                consumed[orig] = n + 1
+                if pos != -1:
+                    consumed[stripped] = n2
+            else:
+                consumed[orig] = n + 1
             positioned.append((pos if pos != -1 else 10 ** 9, m.order, m))
         positioned.sort(key=lambda x: (x[0], x[1]))
         for rank, (_, _, m) in enumerate(positioned, 1):
@@ -275,18 +308,22 @@ def full_desensitize(text: str, config: LLMConfig,
 
     merged = list(rule_result.mapping)
     for it in valid_items:
+        # v5.3 修复：count 取原始值在规则层文本中的出现次数，
+        # 而非占位符在 LLM 输出中的次数（后者会把规则层同占位符也算进去）
+        item_count = rule_result.text.count(it['original'])
         merged.append(Mapping(
             original=it['original'],
             replacement=it['replacement'],
             type=it['type'],
-            count=llm_masked.count(it['replacement']),
+            count=item_count,
             order=len(merged) + 1,
         ))
     merged = reorder_merged_mapping(merged, text)
 
     stats = dict(rule_result.stats)
     for it in valid_items:
-        stats[it['type']] = stats.get(it['type'], 0) + llm_masked.count(it['replacement'])
+        stats[it['type']] = stats.get(it['type'], 0) + rule_result.text.count(
+            it['original'])
     stats['LLM层补充项'] = len(valid_items)
     stats['总脱敏项数'] = len(merged)
     stats['总替换次数'] = sum(m.count for m in merged)

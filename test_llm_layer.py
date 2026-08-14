@@ -213,5 +213,93 @@ class TestCloudAPI(unittest.TestCase):
         self.assertIn('### 脱敏后文本', out)
 
 
+class TestV53LLMFixes(unittest.TestCase):
+    """v5.3：LLM 合并映射 count/排序修复、补充映射表贪婪正则修复、往返校验。"""
+
+    def setUp(self):
+        self.config = LLMConfig(api='ollama', model='mock',
+                                endpoint='http://127.0.0.1:11434')
+
+    def _fake(self, mapping_rules):
+        """构造一个确定性 mock LLM：按 mapping_rules 替换并输出 JSON 映射表。"""
+        def respond(prompt, config=None):
+            text = prompt.split('### 待处理文本\n', 1)[1]
+            items = []
+            for original, replacement, typ in mapping_rules:
+                if original in text:
+                    text = text.replace(original, replacement)
+                    items.append({'original': original,
+                                  'replacement': replacement, 'type': typ})
+            return ('### 脱敏后文本\n' + text + '\n\n'
+                    '### 补充映射表\n' + json.dumps(items, ensure_ascii=False))
+        return respond
+
+    def test_shared_placeholder_count_not_inflated(self):
+        """规则层与 LLM 层共用 [地址]：LLM 条目 count 只取规则层文本中
+        original 的出现次数，不是占位符在 LLM 输出中的总数。"""
+        text = ('住所地浙江省杭州市西湖区文一西路1号。\n'
+                '另有约见地点为村口老槐树旁。')
+        with mock.patch('llm_layer.call_llm',
+                        side_effect=self._fake(
+                            [('村口老槐树旁', '[地址]', '地址')])):
+            result, warnings = full_desensitize(text, self.config)
+        self.assertEqual(warnings, [])
+        llm_item = [m for m in result.mapping
+                    if m.original == '村口老槐树旁']
+        self.assertEqual(len(llm_item), 1)
+        self.assertEqual(llm_item[0].count, 1)  # 修复前会误计为 2
+        self.assertEqual(sum(m.count for m in result.mapping),
+                         result.stats['总替换次数'])
+        restored = restore_text(result.text,
+                                parse_mapping_text(result.to_json()))
+        self.assertEqual(restored, text)
+
+    def test_reorder_repeated_original_interleaved(self):
+        """同一原始值多次出现且与其它条目交错：逐次推进扫描取第 n 次位置。"""
+        from desensitize import Mapping
+        text = '甲方住所：A地址。乙方住所：B地址。丙方住所：A地址。'
+        mappings = [
+            Mapping(original='A地址', replacement='[地址]', type='地址',
+                    count=1, order=1),
+            Mapping(original='B地址', replacement='[地址]', type='地址',
+                    count=1, order=2),
+            Mapping(original='A地址', replacement='[地址]', type='地址',
+                    count=1, order=3),
+        ]
+        out = reorder_merged_mapping(mappings, text)
+        self.assertEqual([m.original for m in out],
+                         ['A地址', 'B地址', 'A地址'])
+        self.assertEqual([m.order for m in out], [1, 2, 3])
+
+    def test_repeated_original_full_roundtrip(self):
+        """同一 LLM 原始值多次出现：count=2，合并映射还原逐字节一致。"""
+        text = '原告自述曾因婚外情与配偶争吵，婚外情对象为同事。'
+        with mock.patch('llm_layer.call_llm',
+                        side_effect=self._fake(
+                            [('婚外情', '[案情细节]', '案情细节')])):
+            result, warnings = full_desensitize(text, self.config)
+        self.assertEqual(warnings, [])
+        item = [m for m in result.mapping if m.original == '婚外情']
+        self.assertEqual(len(item), 1)
+        self.assertEqual(item[0].count, 2)
+        self.assertEqual(result.stats['总替换次数'], 2)
+        restored = restore_text(result.text,
+                                parse_mapping_text(result.to_json()))
+        self.assertEqual(restored, text)
+
+    def test_parse_full_response_json_only_after_marker(self):
+        """脱敏后文本小节里出现 [{...}] 形态时，JSON 数组只在
+        '### 补充映射表' 标记之后搜索，避免贪婪正则跨小节错配。"""
+        response = ('### 脱敏后文本\n'
+                    '正文包含疑似数组形态：[{"x": 1}] 但属于正文，不得误匹配。\n\n'
+                    '### 补充映射表\n'
+                    '[{"original": "张三", "replacement": "[当事人丙]", '
+                    '"type": "人名"}]')
+        masked, items = parse_full_response(response)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['original'], '张三')
+        self.assertIn('不得误匹配', masked)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -20,6 +20,43 @@
 - **skill 工具声明**：`allowed-tools` 增加 `bash`，支持代为执行本机命令。
 - 新增 9 项回归测试（全量 206 项通过，红队 105 项命中、误报 0）。
 
+## v5.3 安全加固续篇（2026-08-14）
+
+按上轮审查结论，把"默认只允许本地"从文档承诺升级为代码强制（Fail-Closed）：
+
+- **本地性默认 Fail-Closed**（`_check_offline` 改名 `_check_endpoint_policy`）：
+  `full` 命令与 `mask --ner-backend llm` 的端点非本机时默认直接中止，须显式加
+  `--allow-remote-llm` 才放行（打印警告：规则层处理后的文本将被发送至该端点）；
+  `--offline` 老语义不变（禁一切非 ollama API + 禁非本机端点），且与
+  `--allow-remote-llm` 互斥（同时给出时中止并报错）。
+- **审计单留痕**：单文件与批量审计单 JSON 新增 `allow_remote_llm` 与
+  实际 `llm_endpoint` 字段。
+- **IPv6 端点判断修复**：`urlparse('http://[::1]:11434').hostname` 返回
+  `::1`（无方括号），统一剥离方括号后再比较，localhost / 127.0.0.1 / ::1
+  白名单不变。
+- **LLM 合并映射修复**：LLM 条目 `count` 改取规则层文本中 original 的出现次数
+  （修复规则层与 LLM 层共用占位符时 count 被放大）；`reorder_merged_mapping`
+  改为逐次推进扫描，同一原始值多次出现时取第 n 次位置，"一行 = 一次出现"
+  的配对语义不再退化。
+- **`parse_full_response` 贪婪正则修复**：补充映射表 JSON 数组只在
+  `### 补充映射表` 标记之后搜索，避免"脱敏后文本"小节内的 `[{...}]` 形态
+  跨小节错配导致解析失败。
+- **密码文件隔离**：非交互自动生成的映射表密码默认写入
+  `~/.desensitizer/keys/<映射表文件名>.password`（目录 0700、文件 0600），
+  与密文分离存放；解密侧新增该路径查找，并保留同目录
+  `映射表.enc.password.txt` 作为 v5.2 旧版兼容回退。
+- **`full` 输出前自动还原往返校验**：用合并映射做 `restore_text == 原文`
+  校验，不一致则中止不产出；新增 `--no-restore-check` 跳过开关
+  （与 `semantic` 同名同义）。
+- **文档修正**：SKILL.md frontmatter（`name` 与目录统一为
+  `legal-document-desensitizer`，`allowed-tools` 改为 `Bash, Read, Write,
+  Grep, Glob`）；删除"组织机构代码未纳入规则层"自相矛盾句（表格已含该规则）；
+  命令速查与安全等级表补充 `--allow-remote-llm`、`full` 还原校验、密码文件
+  新默认位置；git-push 等开发发布章节移到 `docs/开发与发布.md`；
+  `decrypt_mapping_encrypted` 等 docstring 改为"尽力释放引用（Python 字符串
+  不可变，非真清零）"。
+- 新增 11 项回归测试（全量 217 项通过；红队 105 项命中、误报 0）。
+
 ## v5.0 可验证本地闭环 · AI 安全出口（2026-08-11，安全交付升级）
 
 在 v4.2 零上传本地模式基础上，对照"300 问"补齐**可验证本地 + AI 安全出口**

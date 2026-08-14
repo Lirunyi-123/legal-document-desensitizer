@@ -2436,5 +2436,121 @@ class TestV52Bugfixes(unittest.TestCase):
             _parse_fernet_key("b'x' + __import__('os').system('id')")
 
 
+class TestV53FailClosed(unittest.TestCase):
+    """v5.3：本地性默认 Fail-Closed、IPv6 端点判断、密码文件独立密钥目录。"""
+
+    def _endpoint_args(self, command, **overrides):
+        import argparse
+        base = dict(command=command, offline=False, allow_remote_llm=False,
+                    llm_api='ollama', llm_endpoint='http://localhost:11434',
+                    ner_backend=None, ner_endpoint=None)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_is_local_endpoint_ipv6(self):
+        from desensitize import _is_local_endpoint
+        # urlparse 对 http://[::1]:11434 返回 hostname='::1'（无方括号），
+        # 裸 [::1]:11434 形式可能带括号，统一剥离后比较
+        self.assertTrue(_is_local_endpoint('http://[::1]:11434'))
+        self.assertTrue(_is_local_endpoint('[::1]:11434'))
+        self.assertTrue(_is_local_endpoint('http://[::1]:11434/api/generate'))
+        self.assertTrue(_is_local_endpoint('http://localhost:11434'))
+        self.assertTrue(_is_local_endpoint('http://127.0.0.1:11434'))
+        self.assertFalse(_is_local_endpoint('https://api.deepseek.com'))
+        self.assertFalse(
+            _is_local_endpoint('https://dashscope.aliyuncs.com/compatible-mode'))
+
+    def test_remote_endpoint_fail_closed_without_flag(self):
+        from desensitize import _check_endpoint_policy
+        # full：非本机 LLM 端点，未加 --allow-remote-llm → 直接中止
+        full = self._endpoint_args(
+            'full', llm_api='openai', llm_endpoint='https://api.deepseek.com')
+        with self.assertRaises(SystemExit):
+            _check_endpoint_policy(full)
+        # mask --ner-backend llm：非本机 NER 端点同样默认中止
+        mask_ner = self._endpoint_args(
+            'mask', ner_backend='llm', ner_endpoint='https://api.deepseek.com')
+        with self.assertRaises(SystemExit):
+            _check_endpoint_policy(mask_ner)
+
+    def test_remote_endpoint_allowed_with_flag(self):
+        from desensitize import _check_endpoint_policy
+        full = self._endpoint_args(
+            'full', llm_api='openai', llm_endpoint='https://api.deepseek.com',
+            allow_remote_llm=True)
+        _check_endpoint_policy(full)  # 显式 opt-in 后放行，不抛错
+        mask_ner = self._endpoint_args(
+            'mask', ner_backend='llm', ner_endpoint='https://api.deepseek.com',
+            allow_remote_llm=True)
+        _check_endpoint_policy(mask_ner)
+
+    def test_offline_blocks_remote_and_flag_conflict(self):
+        from desensitize import _check_endpoint_policy
+        # --offline + 远程端点 → 中止
+        offline_remote = self._endpoint_args(
+            'full', offline=True, llm_api='openai',
+            llm_endpoint='https://api.deepseek.com')
+        with self.assertRaises(SystemExit):
+            _check_endpoint_policy(offline_remote)
+        # --offline 与 --allow-remote-llm 互斥 → 中止
+        conflict = self._endpoint_args(
+            'full', offline=True, allow_remote_llm=True,
+            llm_endpoint='http://localhost:11434')
+        with self.assertRaises(SystemExit):
+            _check_endpoint_policy(conflict)
+        # --offline + 本机端点仍放行（老语义不变）
+        local = self._endpoint_args(
+            'full', offline=True, llm_api='ollama',
+            llm_endpoint='http://localhost:11434')
+        _check_endpoint_policy(local)
+
+    def test_audit_records_remote_policy(self):
+        from desensitize import _new_audit
+        args = self._endpoint_args(
+            'full', llm_api='openai', llm_endpoint='https://api.deepseek.com',
+            allow_remote_llm=True)
+        audit = _new_audit(args, None)
+        self.assertIs(audit['allow_remote_llm'], True)
+        self.assertEqual(audit['llm_endpoint'], 'https://api.deepseek.com')
+
+    def test_default_key_dir_creates_0700(self):
+        import os
+        import tempfile
+        from unittest import mock
+        from desensitize import _default_key_dir
+        tmp = tempfile.mkdtemp(prefix='deid_v53_keydir_')
+        with mock.patch('os.path.expanduser', return_value=tmp):
+            d = _default_key_dir()
+        self.assertEqual(d, tmp)
+        self.assertTrue(os.path.isdir(d))
+        self.assertEqual(os.stat(d).st_mode & 0o777, 0o700)
+
+    def test_password_key_dir_priority_and_v52_fallback(self):
+        import argparse
+        import os
+        import tempfile
+        from unittest import mock
+        from desensitize import _resolve_mapping_decrypt_password
+
+        tmp = tempfile.mkdtemp(prefix='deid_v53_keys_')
+        mapping = os.path.join(tmp, '映射表.enc')
+        key_dir = os.path.join(tmp, 'keys')
+        os.makedirs(key_dir)
+        with open(os.path.join(key_dir, '映射表.enc.password'),
+                  'w', encoding='utf-8') as f:
+            f.write('new-key\n')
+        with open(mapping + '.password.txt', 'w', encoding='utf-8') as f:
+            f.write('old-key\n')
+        args = argparse.Namespace(password=None, password_file=None)
+        with mock.patch('desensitize._default_key_dir', return_value=key_dir):
+            self.assertEqual(
+                _resolve_mapping_decrypt_password(args, mapping), 'new-key')
+        # 旧版兼容：删除新密钥目录文件后，同目录 .password.txt 仍能解密
+        os.remove(os.path.join(key_dir, '映射表.enc.password'))
+        with mock.patch('desensitize._default_key_dir', return_value=key_dir):
+            self.assertEqual(
+                _resolve_mapping_decrypt_password(args, mapping), 'old-key')
+
+
 if __name__ == '__main__':
     unittest.main()
